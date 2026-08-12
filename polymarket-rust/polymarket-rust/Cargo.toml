@@ -1,0 +1,74 @@
+[package]
+name = "polymarket-rust"
+version = "0.2.0"
+edition = "2021"
+description = "Rust 端：钱包管理、Polymarket CLOB API、基础下单流程、gRPC 执行层"
+license = "MIT"
+
+[dependencies]
+# 加密 / 安全
+aes-gcm = "0.10"          # AES-256-GCM 加密
+sha2 = "0.10"             # SHA-256
+hmac = "0.12"             # HMAC-SHA256（L2 签名）
+pbkdf2 = "0.12"           # 密码派生密钥
+rand = "0.8"              # 随机数生成
+base64 = "0.22"            # base64 编解码
+hex = "0.4"               # 十六进制编解码
+
+# 以太坊 / EIP-712 签名
+ethers = { version = "2.0", features = ["rustls"] }
+
+# 序列化
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# HTTP 客户端
+# 注意：default-features=false 会一并关掉 http2，必须显式启用。
+# 缺少 http2 时每笔订单都要重新走 HTTP/1.1 队头阻塞路径，
+# 无法做多路复用，直接影响下单延迟。
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "json",
+    "http2",
+] }
+
+# 异步运行时
+tokio = { version = "1.0", features = ["full"] }
+
+# 错误处理
+thiserror = "1.0"
+
+# 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# 时间
+chrono = "0.4"
+
+# 大数运算
+num-bigint = "0.4"
+
+# gRPC (tonic + prost)
+tonic = "0.12"
+prost = "0.13"
+tokio-stream = "0.1"
+async-stream = "0.3"
+
+[dev-dependencies]
+tokio = { version = "1.0", features = ["full", "test-util"] }
+tempfile = "3.10"
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1   # 牺牲编译速度换取跨模块内联，热路径受益明显
+# 不设 panic="abort"：会破坏 `cargo test --release` 与 catch_unwind，
+# 而它对下单延迟的收益微乎其微，不值得。
+
+# 基准测试用：带调试符号的 release，便于 perf 火焰图定位延迟热点
+[profile.bench]
+inherits = "release"
+debug = true

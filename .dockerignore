@@ -1,0 +1,36 @@
+# ── 安全 ──
+.env
+
+# ── Git ──
+.git/
+.gitignore
+
+# ── Python ──
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
+*.egg-info/
+
+# ── Rust (Docker 内编译, 排除本地产物) ──
+polymarket-rust/**/target/
+polymarket-rust/**/*.rs.bk
+
+# ── IDE & OS ──
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# ── WorkBuddy ──
+.workbuddy/
+
+# ── 测试 & 临时 ──
+test_*.py
+verify_*.py
+*.log
+*.tmp
+
+# ── 文档 ──
+*.md
+!README.md

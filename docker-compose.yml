@@ -1,0 +1,89 @@
+# ============================================================================
+# docker-compose.yml — Polymarket AI Weather 部署编排
+#
+# 服务:
+#   app          — Python 策略引擎 + 市场发现 + GUI (可选)
+#   polymorph    — Rust 执行层 gRPC 服务
+#
+# 常用命令:
+#   docker compose up -d                 # 启动全套服务
+#   docker compose logs -f               # 查看日志
+#   docker compose logs -f polymorph     # 只看 Rust 执行层
+#   docker compose run paper-trading     # 纸面交易
+#   docker compose run dashboard         # GUI (需要 xvfb)
+#   docker compose down                  # 停止
+#   docker compose build --no-cache      # 完全重编
+# ============================================================================
+
+version: "3.8"
+
+services:
+  # ── Python 策略大脑 ──
+  app:
+    build: .
+    image: ai-weather:latest
+    container_name: ai-weather-app
+    restart: unless-stopped
+    volumes:
+      # 持久化数据: 注册表 / 信号 / 资产历史 / 回测
+      - ./data:/app/data:rw
+      # 钱包配置
+      - ./data/wallets.json:/app/data/wallets.json:rw
+    environment:
+      - TZ=Asia/Shanghai
+      - PYTHONUNBUFFERED=1
+      # gRPC 连接 Rust 执行层
+      - GRPC_ADDR=${GRPC_ADDR:-polymorph:50051}
+      # 聚合器参数 (可通过环境变量覆盖)
+      - AGG_BASE_CAPITAL=${AGG_BASE_CAPITAL:-1000.0}
+      - AGG_KELLY_FRACTION=${AGG_KELLY_FRACTION:-0.25}
+      - AGG_MAX_POSITION=${AGG_MAX_POSITION:-1000.0}
+      - AGG_MAX_GLOBAL_EXPOSURE=${AGG_MAX_GLOBAL_EXPOSURE:-5000.0}
+    networks:
+      - weather-net
+    depends_on:
+      polymorph:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ── Rust 执行层 ──
+  polymorph:
+    build:
+      context: .
+      dockerfile: polymarket-rust/Dockerfile
+    image: ai-weather-polymorph:latest
+    container_name: ai-weather-polymorph
+    restart: unless-stopped
+    ports:
+      - "${GRPC_PORT:-50051}:50051"
+    volumes:
+      # 密钥库持久化
+      - ./polymarket-rust/keystore.json:/app/keystore.json:ro
+      # 钱包文件（可选）
+      - ./data/wallets:/app/wallets:ro
+    environment:
+      - TZ=Asia/Shanghai
+      - RUST_LOG=${RUST_LOG:-info}
+      - GRPC_ADDR=0.0.0.0:50051
+      - CHAIN_ID=${CHAIN_ID:-137}
+      - CLOB_HOST=${CLOB_HOST:-https://clob.polymarket.com}
+      # 钱包凭证（从 .env 或环境变量注入）
+      - WALLET_ADDRESS=${WALLET_ADDRESS:-}
+      - WALLET_PASSWORD=${WALLET_PASSWORD:-}
+      - KEYSTORE_PATH=${KEYSTORE_PATH:-/app/keystore.json}
+    networks:
+      - weather-net
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "50051"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+networks:
+  weather-net:
+    driver: bridge

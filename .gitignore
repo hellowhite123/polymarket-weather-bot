@@ -1,0 +1,45 @@
+# ── 编译产物 ──
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.dll
+*.exe
+*.pdb
+*.lib
+*.exp
+*.iobj
+*.ipdb
+
+# ── Rust 构建产物 ──
+polymarket-rust/**/target/
+polymarket-rust/**/target-alt/
+polymarket-rust/**/*.rs.bk
+polymarket-rust/**/incremental/
+
+# ── 运行时数据 ──
+data/
+*.log
+*.tmp
+
+# ── 密钥与环境 ──
+.env
+*.key
+wallets/
+
+# ── IDE / 工具 ──
+.vscode/
+.idea/
+*.swp
+*.swo
+*.zip
+*.7z
+*.tar.gz
+
+# ── WorkBuddy ──
+.workbuddy/
+
+# ── 其他 ──
+.DS_Store
+Thumbs.db

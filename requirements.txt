@@ -1,0 +1,18 @@
+# Polymarket Weather Trading System — 完整依赖
+# Python 3.10+
+
+# ── 核心 ──
+aiohttp>=3.9.0
+pandas>=2.0.0
+python-dotenv>=1.0.0
+
+# ── GUI (可选，服务器部署可省略 PyQt6) ──
+PyQt6>=6.5.0
+matplotlib>=3.7.0
+
+# ── gRPC 桥接 ──
+grpcio>=1.60.0
+grpcio-tools>=1.60.0
+
+# ── 工具 ──
+protobuf>=4.25.0

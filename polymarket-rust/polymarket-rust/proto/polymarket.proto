@@ -1,0 +1,232 @@
+syntax = "proto3";
+
+package polymarket;
+
+// ============================================================
+// Polymarket 天气预测市场交易系统 -- gRPC 接口契约
+//
+// 架构: Python 策略大脑 (client) --> Rust 执行手脚 (server)
+// 传输: gRPC over UDS (Unix Domain Socket) / TCP 回退
+//
+// Python 聚合器输出 AggregatedOrder --> gRPC --> Rust 下单
+// Rust 执行后回传 OrderResult + RiskState --> gRPC --> Python
+// ============================================================
+
+// ===== 枚举 =====
+
+// 信号方向 (对应 Python SignalDirection)
+enum Direction {
+  DIRECTION_UNSPECIFIED = 0;
+  BUY_YES = 1;   // 买入 YES token (看涨事件发生)
+  BUY_NO = 2;    // 买入 NO token (看跌事件不发生)
+}
+
+// 聚合指令状态 (对应 Python OrderStatus)
+enum OrderStatus {
+  ORDER_STATUS_UNSPECIFIED = 0;
+  OPEN = 1;            // 通过风控, 可下单
+  BLOCKED = 2;         // 被风控拦截
+  CONFLICT_VOID = 3;   // 方向冲突相消, 不交易
+  NO_SIGNAL = 4;       // 无有效信号输入
+}
+
+// 事件类型
+enum EventType {
+  EVENT_TYPE_UNSPECIFIED = 0;
+  RAIN = 1;
+  SNOW = 2;
+  TEMPERATURE = 3;
+  WIND = 4;
+}
+
+// 订单执行状态 (Rust 侧返回)
+enum ExecutionStatus {
+  EXECUTION_STATUS_UNSPECIFIED = 0;
+  PENDING = 1;     // 已提交, 等待成交
+  FILLED = 2;      // 完全成交
+  PARTIAL = 3;     // 部分成交
+  REJECTED = 4;    // 被拒绝
+  CANCELLED = 5;   // 已取消
+  EXPIRED = 6;     // 已过期
+}
+
+// ===== 消息 =====
+
+// 单项风控检查结果
+message RiskCheckResult {
+  string rule = 1;      // 规则名: position_limit / settlement_window / daily_loss / global_exposure
+  bool passed = 2;
+  string reason = 3;    // 不通过时的原因
+}
+
+// 聚合后的最终交易指令 (Python --> Rust)
+// 对应 Python strategy_engine.aggregator.models.AggregatedOrder
+message AggregatedOrder {
+  string order_id = 1;
+  string token_id = 2;
+  Direction direction = 3;
+  EventType event_type = 4;
+  string location = 5;
+
+  // 定价与数量
+  double target_price = 6;    // 聚合加权后的目标价
+  double market_price = 7;    // 当前市场价
+  double quantity = 8;        // 下单数量
+
+  // 置信度
+  double confidence = 9;
+
+  // 来源追溯
+  repeated string contributing_strategies = 10;
+  int32 input_signal_count = 11;
+
+  // 状态
+  OrderStatus status = 12;
+  string block_reason = 13;
+  repeated RiskCheckResult risk_checks = 14;
+
+  // 时间戳 (ISO 8601 UTC)
+  string timestamp = 15;
+
+  // 扩展元数据
+  map<string, string> metadata = 16;
+
+  // 纸面交易模式（不真正下单，返回模拟成交）
+  bool paper_trading = 17;
+}
+
+// 持仓条目
+message PositionEntry {
+  string token_id = 1;
+  double quantity = 2;    // 正数=多头, 负数=空头
+}
+
+// 结算时间条目
+message SettlementTimeEntry {
+  string token_id = 1;
+  string settlement_time = 2;   // ISO 8601
+}
+
+// 风控状态快照 (Rust --> Python)
+// 对应 Python strategy_engine.aggregator.models.RiskState
+message RiskState {
+  repeated PositionEntry positions = 1;
+  repeated SettlementTimeEntry settlement_times = 2;
+  double daily_pnl = 3;                // 当日盈亏 (USDC)
+  bool daily_circuit_breaker = 4;      // 每日亏损熔断
+  bool manual_halt = 5;                // 手动熔断
+  string last_reset_date = 6;          // 上次重置日期
+}
+
+// 订单执行结果 (Rust --> Python)
+message OrderResult {
+  string order_id = 1;             // 对应 AggregatedOrder.order_id
+  bool success = 2;
+  string exchange_order_id = 3;    // Polymarket 交易所返回的订单 ID
+  string error_message = 4;
+  string timestamp = 5;            // ISO 8601
+
+  // 成交详情
+  double filled_price = 6;         // 实际成交价
+  double filled_size = 7;          // 实际成交数量
+  ExecutionStatus status = 8;
+}
+
+// 取消订单请求
+message CancelOrderRequest {
+  string order_id = 1;
+  string wallet_address = 2;
+}
+
+// 取消全部订单请求
+message CancelAllRequest {
+  string wallet_address = 1;
+}
+
+// 取消结果
+message CancelResult {
+  bool success = 1;
+  string message = 2;
+  int32 cancelled_count = 3;
+}
+
+// 空消息
+message Empty {}
+
+// 健康检查响应
+message HealthCheckResponse {
+  bool healthy = 1;
+  string version = 2;
+  string uptime = 3;           // 运行时长 (人类可读)
+  bool wallet_loaded = 4;      // 钱包是否已加载
+  bool api_creds_set = 5;      // API 凭证是否已设置
+}
+
+// 风控状态更新 (流式推送)
+message RiskStateUpdate {
+  RiskState risk_state = 1;
+  string update_reason = 2;    // "order_filled" / "position_changed" / "settlement" / "manual"
+  string timestamp = 3;
+}
+
+// 批量下单请求
+message PlaceOrdersRequest {
+  repeated AggregatedOrder orders = 1;
+}
+
+// 批量下单结果
+message PlaceOrdersResponse {
+  repeated OrderResult results = 1;
+}
+
+// 钱包管理
+message AddWalletRequest {
+  string private_key = 1;   // 私钥（hex）
+  string password = 2;      // 加密密码
+}
+
+message RemoveWalletRequest {
+  string address = 1;
+}
+
+message WalletListResponse {
+  repeated string addresses = 1;
+}
+
+message WalletResult {
+  bool success = 1;
+  string address = 2;       // 返回钱包地址
+  string message = 3;
+}
+
+// ===== 服务 =====
+
+// Rust 执行层 gRPC 服务
+// Rust 端实现此服务, Python 端调用
+service ExecutionService {
+  // 下单 -- Python 推送一条 AggregatedOrder, Rust 执行后返回结果
+  rpc PlaceOrder(AggregatedOrder) returns (OrderResult);
+
+  // 批量下单 -- 一次性推送多条指令
+  rpc PlaceOrders(PlaceOrdersRequest) returns (PlaceOrdersResponse);
+
+  // 取消指定订单
+  rpc CancelOrder(CancelOrderRequest) returns (CancelResult);
+
+  // 取消所有订单
+  rpc CancelAll(CancelAllRequest) returns (CancelResult);
+
+  // 查询当前风控状态
+  rpc GetRiskState(Empty) returns (RiskState);
+
+  // 流式订阅风控状态更新 (持仓变化、PnL、熔断等)
+  rpc StreamRiskStateUpdates(Empty) returns (stream RiskStateUpdate);
+
+  // 健康检查
+  rpc HealthCheck(Empty) returns (HealthCheckResponse);
+
+  // 钱包管理
+  rpc AddWallet(AddWalletRequest) returns (WalletResult);
+  rpc RemoveWallet(RemoveWalletRequest) returns (WalletResult);
+  rpc ListWallets(Empty) returns (WalletListResponse);
+}
