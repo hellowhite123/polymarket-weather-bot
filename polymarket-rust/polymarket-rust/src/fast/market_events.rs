@@ -19,11 +19,12 @@
 //!                                      └──→ EventsSnapshot
 //! ```
 
+use crate::fast::fill_records::FillLedger;
 use crate::types::clob_types::OrderBookSummary;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::broadcast;
 
@@ -58,6 +59,8 @@ pub enum MarketEvent {
 pub struct TradeEvent {
     pub token_id: String,
     pub trade_id: String,
+    /// 统一订单 ID（taker 侧订单 ID，主动成交方）
+    pub order_id: String,
     pub side: String, // BUY / SELL
     pub price: f64,
     pub size: f64,
@@ -171,6 +174,8 @@ pub struct MarketEventPoller {
     event_count: AtomicU64,
     /// 已知结算的市场
     settled_markets: RwLock<HashSet<String>>,
+    /// 成交记录账簿（可选）。挂载后 `mark_settled` 会自动回填盈亏。
+    fill_ledger: Option<Arc<FillLedger>>,
 }
 
 impl MarketEventPoller {
@@ -193,7 +198,14 @@ impl MarketEventPoller {
             poll_count: AtomicU64::new(0),
             event_count: AtomicU64::new(0),
             settled_markets: RwLock::new(HashSet::new()),
+            fill_ledger: None,
         }
+    }
+
+    /// 挂载成交记录账簿。此后 `mark_settled` 会自动回填该市场所有成交的盈亏。
+    pub fn with_fill_ledger(mut self, ledger: Arc<FillLedger>) -> Self {
+        self.fill_ledger = Some(ledger);
+        self
     }
 
     /// 获取事件订阅者 (broadcast receiver)
@@ -226,6 +238,7 @@ impl MarketEventPoller {
             let event = TradeEvent {
                 token_id: token_id.to_string(),
                 trade_id: t.id.clone(),
+                order_id: t.taker_order_id.clone(),
                 side: t.side,
                 price,
                 size,
@@ -348,6 +361,17 @@ impl MarketEventPoller {
     pub fn mark_settled(&self, token_id: &str, outcome: f64) {
         let mut settled = self.settled_markets.write().unwrap();
         if settled.insert(token_id.to_string()) {
+            // 自动回填成交记录的盈亏（若已挂载账簿）
+            if let Some(ref ledger) = self.fill_ledger {
+                let n = ledger.settle_by_token(token_id, outcome);
+                if n > 0 {
+                    tracing::info!(
+                        "market_events: 市场 {} 结算 outcome={}, 回填 {} 条成交盈亏",
+                        token_id, outcome, n
+                    );
+                }
+            }
+
             let event = SettlementEvent {
                 token_id: token_id.to_string(),
                 outcome,

@@ -19,9 +19,11 @@
 //! - [`risk_engine`] —— RiskEngine：仓位限制 + 时间窗口 + 日亏损熔断 + UMA争议 + Gas保护
 //! - [`market_events`] —— MarketEvents：实时市场事件抓取（成交/订单簿/结算）
 //! - [`state_sync`] —— StateSync：本地账簿与链上定期对账，断线自动恢复
+//! - [`fill_records`] —— FillLedger：成交记录账簿（下单/成交/结算完整生命周期字段）
 
 pub mod daemon;
 pub mod executor;
+pub mod fill_records;
 pub mod hot_wallet;
 pub mod http_fast;
 pub mod latency;

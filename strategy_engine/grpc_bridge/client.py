@@ -32,6 +32,7 @@ from strategy_engine.grpc_bridge.converter import (
     order_to_proto,
     risk_state_from_proto,
     order_result_from_proto,
+    fill_record_from_proto,
 )
 
 logger = logging.getLogger(__name__)
@@ -322,6 +323,32 @@ class GrpcExecutionClient:
         except grpc.RpcError as e:
             logger.error("gRPC 健康检查失败: %s", e)
             raise GrpcBridgeError(f"健康检查 RPC 失败: {e}") from e
+
+    async def get_fills(self) -> dict:
+        """查询成交记录列表（完整字段：下单/成交/结算时间 + 滑点 + 手续费 + 盈亏）。
+
+        Returns:
+            dict, 包含:
+              - fills: List[dict]  每笔成交记录
+              - total / total_fee / total_slippage / total_pnl: 汇总统计
+        """
+        self._ensure_connected()
+
+        try:
+            response: pb.FillListResponse = await self._stub.GetFills(
+                pb.Empty(),
+                timeout=self.timeout,
+            )
+            return {
+                "fills": [fill_record_from_proto(f) for f in response.fills],
+                "total": response.total,
+                "total_fee": response.total_fee,
+                "total_slippage": response.total_slippage,
+                "total_pnl": response.total_pnl,
+            }
+        except grpc.RpcError as e:
+            logger.error("gRPC 查询成交记录失败: %s", e)
+            raise GrpcBridgeError(f"查询成交记录 RPC 失败: {e}") from e
 
     async def stream_risk_state_updates(self, callback=None):
         """流式订阅风控状态更新。

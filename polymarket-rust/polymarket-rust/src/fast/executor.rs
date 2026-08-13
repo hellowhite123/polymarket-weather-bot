@@ -26,6 +26,7 @@ use crate::clob::client::{ClobClient, ClobConfig};
 use crate::clob::constants::get_exchange_address;
 use crate::clob::error::{ClobError, ClobResult};
 use crate::clob::signing::sign_order;
+use crate::fast::fill_records::{FillLedger, FillRecord};
 use crate::fast::hot_wallet::HotWalletCache;
 use crate::fast::http_fast::warmup;
 use crate::fast::latency::{LatencyTracker, OrderLatency, Stage, StageTimer};
@@ -160,6 +161,8 @@ pub struct FastExecutor {
     rpc_pool: Option<Arc<RpcPool>>,
     nonce_mgr: Option<Arc<NonceManager>>,
     tx_tracker: Option<Arc<TxTracker>>,
+    /// 成交记录账簿（可选）。挂载后每次成交自动记录完整字段。
+    fill_ledger: Option<Arc<FillLedger>>,
     tracker: LatencyTracker,
     chain: Chain,
 }
@@ -180,6 +183,7 @@ impl FastExecutor {
             rpc_pool: None,
             nonce_mgr: None,
             tx_tracker: None,
+            fill_ledger: None,
             tracker,
             chain: config.chain,
         })
@@ -218,6 +222,12 @@ impl FastExecutor {
     /// 挂载交易生命周期追踪器
     pub fn with_tx_tracker(mut self, tt: Arc<TxTracker>) -> Self {
         self.tx_tracker = Some(tt);
+        self
+    }
+
+    /// 挂载成交记录账簿。此后 `execute_fast` 成交成功会自动写入完整成交记录。
+    pub fn with_fill_ledger(mut self, ledger: Arc<FillLedger>) -> Self {
+        self.fill_ledger = Some(ledger);
         self
     }
 
@@ -505,6 +515,28 @@ impl FastExecutor {
                 Some(order_id),
             );
             tt.register(entry);
+        }
+
+        // --- ★ FillLedger: 记录完整成交记录（下单时间/成交时间/价格/数量/滑点/手续费）---
+        if let Some(ref ledger) = self.fill_ledger {
+            if resp.success && !resp.orderID.is_empty() {
+                let filled_price = if !resp.makingAmount.is_empty() && !resp.takingAmount.is_empty() {
+                    resp.makingAmount.parse::<f64>().unwrap_or(0.0)
+                        / resp.takingAmount.parse::<f64>().unwrap_or(1.0)
+                } else {
+                    params.price
+                };
+                let mut rec = FillRecord::new(
+                    resp.orderID.clone(),
+                    params.token_id.clone(),
+                    params.side.as_str().to_string(),
+                    params.price,
+                    params.size,
+                );
+                // 手续费：fee_rate_bps 默认 0（Polymarket 天气盘 0 fee）
+                rec.mark_filled(filled_price, 0.0);
+                ledger.record(rec);
+            }
         }
 
         lat.set_total(root.elapsed());

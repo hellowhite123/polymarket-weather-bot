@@ -48,6 +48,7 @@ class MockExecutionService(pb_grpc.ExecutionServiceServicer):
         self._positions: Dict[str, float] = {}
         self._daily_pnl: float = 0.0
         self._order_count: int = 0
+        self._fills: list = []  # 成交记录（供 GetFills）
         self._start_time = datetime.now(timezone.utc)
         self._risk_state_update_queue: asyncio.Queue = asyncio.Queue()
 
@@ -70,20 +71,45 @@ class MockExecutionService(pb_grpc.ExecutionServiceServicer):
         filled_price = max(0.01, min(0.99, request.target_price + slippage))
         filled_size = request.quantity
 
+        # 计算滑点（金额 + 百分比）
+        slip_amt = abs(filled_price - request.target_price) * filled_size
+        slip_pct = abs(filled_price - request.target_price) / request.target_price * 100.0 if request.target_price > 0 else 0.0
+
         # 更新内部持仓
         self._positions[request.token_id] = (
             self._positions.get(request.token_id, 0.0) + filled_size
         )
         self._order_count += 1
+        ex_id = f"ex_{self._order_count:08d}"
+
+        # 记录成交
+        now_iso = datetime.now(timezone.utc).isoformat()
+        self._fills.append(pb.FillRecord(
+            order_id=ex_id,
+            token_id=request.token_id,
+            side=pb.Direction.Name(request.direction),
+            placed_at=now_iso,
+            filled_at=now_iso,
+            settled_at="",
+            limit_price=request.target_price,
+            filled_price=filled_price,
+            size=filled_size,
+            fee=0.0,
+            slippage=slip_amt,
+            slippage_pct=slip_pct,
+            pnl=0.0,
+            status="filled",
+        ))
 
         logger.info(
-            "Mock 下单: %s %s qty=%.2f @ %.4f -> filled=%.2f @ %.4f",
+            "Mock 下单: %s %s qty=%.2f @ %.4f -> filled=%.2f @ %.4f (slip=%.4f%%)",
             request.order_id,
             pb.Direction.Name(request.direction),
             request.quantity,
             request.target_price,
             filled_size,
             filled_price,
+            slip_pct,
         )
 
         # 推送风控状态更新
@@ -92,11 +118,17 @@ class MockExecutionService(pb_grpc.ExecutionServiceServicer):
         return pb.OrderResult(
             order_id=request.order_id,
             success=True,
-            exchange_order_id=f"ex_{self._order_count:08d}",
-            timestamp=datetime.now(timezone.utc).isoformat(),
+            exchange_order_id=ex_id,
+            timestamp=now_iso,
             filled_price=filled_price,
             filled_size=filled_size,
             status=pb.ExecutionStatus.FILLED,
+            filled_at=now_iso,
+            settled_at="",
+            slippage=slip_amt,
+            slippage_pct=slip_pct,
+            fee=0.0,
+            pnl=0.0,
         )
 
     async def PlaceOrders(self, request, context):
@@ -166,6 +198,19 @@ class MockExecutionService(pb_grpc.ExecutionServiceServicer):
             uptime=str(uptime_delta).split(".")[0],
             wallet_loaded=self.wallet_loaded,
             api_creds_set=self.api_creds_set,
+        )
+
+    async def GetFills(self, request, context):
+        """返回成交记录列表。"""
+        total_fee = sum(f.fee for f in self._fills)
+        total_slippage = sum(f.slippage for f in self._fills)
+        total_pnl = sum(f.pnl for f in self._fills)
+        return pb.FillListResponse(
+            fills=list(self._fills),
+            total=len(self._fills),
+            total_fee=total_fee,
+            total_slippage=total_slippage,
+            total_pnl=total_pnl,
         )
 
     # ================================================================

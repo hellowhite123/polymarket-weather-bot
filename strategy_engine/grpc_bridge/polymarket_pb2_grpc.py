@@ -3,7 +3,7 @@
 import grpc
 import warnings
 
-from strategy_engine.grpc_bridge import polymarket_pb2 as polymarket__pb2
+from . import polymarket_pb2 as polymarket__pb2
 
 GRPC_GENERATED_VERSION = '1.83.0'
 GRPC_VERSION = grpc.__version__
@@ -73,6 +73,26 @@ class ExecutionServiceStub:
                 request_serializer=polymarket__pb2.Empty.SerializeToString,
                 response_deserializer=polymarket__pb2.HealthCheckResponse.FromString,
                 _registered_method=True)
+        self.GetFills = channel.unary_unary(
+                '/polymarket.ExecutionService/GetFills',
+                request_serializer=polymarket__pb2.Empty.SerializeToString,
+                response_deserializer=polymarket__pb2.FillListResponse.FromString,
+                _registered_method=True)
+        self.AddWallet = channel.unary_unary(
+                '/polymarket.ExecutionService/AddWallet',
+                request_serializer=polymarket__pb2.AddWalletRequest.SerializeToString,
+                response_deserializer=polymarket__pb2.WalletResult.FromString,
+                _registered_method=True)
+        self.RemoveWallet = channel.unary_unary(
+                '/polymarket.ExecutionService/RemoveWallet',
+                request_serializer=polymarket__pb2.RemoveWalletRequest.SerializeToString,
+                response_deserializer=polymarket__pb2.WalletResult.FromString,
+                _registered_method=True)
+        self.ListWallets = channel.unary_unary(
+                '/polymarket.ExecutionService/ListWallets',
+                request_serializer=polymarket__pb2.Empty.SerializeToString,
+                response_deserializer=polymarket__pb2.WalletListResponse.FromString,
+                _registered_method=True)
 
 
 class ExecutionServiceServicer:
@@ -131,6 +151,32 @@ class ExecutionServiceServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def GetFills(self, request, context):
+        """查询成交记录列表（完整字段：下单/成交/结算时间 + 滑点 + 手续费 + 盈亏）
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def AddWallet(self, request, context):
+        """钱包管理
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def RemoveWallet(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ListWallets(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_ExecutionServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -168,6 +214,26 @@ def add_ExecutionServiceServicer_to_server(servicer, server):
                     servicer.HealthCheck,
                     request_deserializer=polymarket__pb2.Empty.FromString,
                     response_serializer=polymarket__pb2.HealthCheckResponse.SerializeToString,
+            ),
+            'GetFills': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetFills,
+                    request_deserializer=polymarket__pb2.Empty.FromString,
+                    response_serializer=polymarket__pb2.FillListResponse.SerializeToString,
+            ),
+            'AddWallet': grpc.unary_unary_rpc_method_handler(
+                    servicer.AddWallet,
+                    request_deserializer=polymarket__pb2.AddWalletRequest.FromString,
+                    response_serializer=polymarket__pb2.WalletResult.SerializeToString,
+            ),
+            'RemoveWallet': grpc.unary_unary_rpc_method_handler(
+                    servicer.RemoveWallet,
+                    request_deserializer=polymarket__pb2.RemoveWalletRequest.FromString,
+                    response_serializer=polymarket__pb2.WalletResult.SerializeToString,
+            ),
+            'ListWallets': grpc.unary_unary_rpc_method_handler(
+                    servicer.ListWallets,
+                    request_deserializer=polymarket__pb2.Empty.FromString,
+                    response_serializer=polymarket__pb2.WalletListResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -363,6 +429,114 @@ class ExecutionService:
             '/polymarket.ExecutionService/HealthCheck',
             polymarket__pb2.Empty.SerializeToString,
             polymarket__pb2.HealthCheckResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetFills(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/polymarket.ExecutionService/GetFills',
+            polymarket__pb2.Empty.SerializeToString,
+            polymarket__pb2.FillListResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def AddWallet(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/polymarket.ExecutionService/AddWallet',
+            polymarket__pb2.AddWalletRequest.SerializeToString,
+            polymarket__pb2.WalletResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def RemoveWallet(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/polymarket.ExecutionService/RemoveWallet',
+            polymarket__pb2.RemoveWalletRequest.SerializeToString,
+            polymarket__pb2.WalletResult.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ListWallets(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/polymarket.ExecutionService/ListWallets',
+            polymarket__pb2.Empty.SerializeToString,
+            polymarket__pb2.WalletListResponse.FromString,
             options,
             channel_credentials,
             insecure,

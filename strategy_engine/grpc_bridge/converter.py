@@ -182,4 +182,31 @@ def order_result_from_proto(msg) -> dict:
         "filled_size": msg.filled_size,
         "status": msg.status,  # int enum value
         "status_name": pb.ExecutionStatus.Name(msg.status),
+        # 成交记录完整字段
+        "filled_at": msg.filled_at,
+        "settled_at": msg.settled_at,
+        "slippage": msg.slippage,
+        "slippage_pct": msg.slippage_pct,
+        "fee": msg.fee,
+        "pnl": msg.pnl,
+    }
+
+
+def fill_record_from_proto(msg) -> dict:
+    """将 proto FillRecord 转换为 Python dict。"""
+    return {
+        "order_id": msg.order_id,
+        "token_id": msg.token_id,
+        "side": msg.side,
+        "placed_at": msg.placed_at,
+        "filled_at": msg.filled_at,
+        "settled_at": msg.settled_at,
+        "limit_price": msg.limit_price,
+        "filled_price": msg.filled_price,
+        "size": msg.size,
+        "fee": msg.fee,
+        "slippage": msg.slippage,
+        "slippage_pct": msg.slippage_pct,
+        "pnl": msg.pnl,
+        "status": msg.status,
     }

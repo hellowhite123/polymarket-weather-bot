@@ -15,6 +15,7 @@ use tonic::{Request, Response, Status};
 
 use crate::clob::client::ClobConfig;
 use crate::fast::executor::FastExecutor;
+use crate::fast::fill_records::{compute_slippage, FillLedger, FillRecord};
 use crate::order::{OrderFlow, PlaceOrderParams};
 use crate::types::enums::{OrderType, Side};
 use crate::wallet::WalletManager;
@@ -38,6 +39,13 @@ fn direction_to_side(direction: i32) -> Result<Side, Status> {
             direction
         ))),
     }
+}
+
+/// unix 秒 → ISO 8601 字符串。
+fn format_unix(secs: u64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(secs as i64, 0)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_default()
 }
 
 /// 执行服务实现。
@@ -69,6 +77,9 @@ pub struct ExecutionServiceImpl {
     /// 亚秒级执行器（可选）。设置后 `place_order` 走 fast path，
     /// 消除 PBKDF2 与 tick 往返，本地计算压进 100ms 预算。
     fast_executor: Option<Arc<FastExecutor>>,
+
+    /// 成交记录账簿 —— 统一记录每笔订单的下单/成交/结算完整字段。
+    fill_ledger: Arc<FillLedger>,
 }
 
 /// 内部风控状态 (对应 proto RiskState)。
@@ -142,6 +153,7 @@ impl ExecutionServiceImpl {
                 ..Default::default()
             })),
             fast_executor: None,
+            fill_ledger: Arc::new(FillLedger::new()),
         }
     }
 
@@ -162,6 +174,7 @@ impl ExecutionServiceImpl {
                 ..Default::default()
             })),
             fast_executor: None,
+            fill_ledger: Arc::new(FillLedger::new()),
         }
     }
 
@@ -171,6 +184,27 @@ impl ExecutionServiceImpl {
     /// 连接/域分隔符），否则首笔单会付出一次 PBKDF2 代价。
     pub fn set_fast_executor(&mut self, fe: Arc<FastExecutor>) {
         self.fast_executor = Some(fe);
+    }
+
+    /// 获取成交记录账簿引用。
+    pub fn fill_ledger(&self) -> &Arc<FillLedger> {
+        &self.fill_ledger
+    }
+
+    /// 列出全部成交记录（JSON 字符串）。
+    pub fn list_fills_json(&self) -> String {
+        self.fill_ledger.to_json()
+    }
+
+    /// 结算某笔订单（更新盈亏，返回是否命中）。
+    pub fn settle_fill(&self, order_id: &str, pnl: f64) -> bool {
+        self.fill_ledger.settle(order_id, pnl)
+    }
+
+    /// 按市场结算：给定 token_id 与结算结果 outcome（0.0 或 1.0），
+    /// 自动结算该市场下所有未结算成交，回填盈亏。返回结算条数。
+    pub fn settle_token(&self, token_id: &str, outcome: f64) -> usize {
+        self.fill_ledger.settle_by_token(token_id, outcome)
     }
 }
 
@@ -194,6 +228,7 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
                 filled_price: 0.0,
                 filled_size: 0.0,
                 status: pb::ExecutionStatus::Rejected as i32,
+                ..Default::default()
             }));
         }
 
@@ -204,15 +239,38 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
                 order.order_id, order.token_id, order.target_price,
                 order.quantity, order.confidence,
             );
+            let ex_id = format!("paper_{}", order.order_id);
+            let side_str = match order.direction {
+                x if x == pb::Direction::BuyYes as i32 => "BUY",
+                x if x == pb::Direction::BuyNo as i32 => "SELL",
+                _ => "BUY",
+            };
+            // 记录成交（纸面成交也纳入账簿）
+            let mut rec = FillRecord::new(
+                ex_id.clone(),
+                order.token_id.clone(),
+                side_str.to_string(),
+                order.target_price,
+                order.quantity,
+            );
+            rec.mark_filled(order.target_price, 0.0);
+            self.fill_ledger.record(rec);
+
             return Ok(Response::new(pb::OrderResult {
                 order_id: order.order_id.clone(),
                 success: true,
-                exchange_order_id: format!("paper_{}", order.order_id),
+                exchange_order_id: ex_id,
                 error_message: String::new(),
                 timestamp: Utc::now().to_rfc3339(),
                 filled_price: order.target_price,
                 filled_size: order.quantity,
                 status: pb::ExecutionStatus::Filled as i32,
+                filled_at: Utc::now().to_rfc3339(),
+                settled_at: String::new(),
+                slippage: 0.0,
+                slippage_pct: 0.0,
+                fee: 0.0,
+                pnl: 0.0,
             }));
         }
 
@@ -229,6 +287,7 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
                     filled_price: 0.0,
                     filled_size: 0.0,
                     status: pb::ExecutionStatus::Rejected as i32,
+                    ..Default::default()
                 }));
             }
         }
@@ -260,19 +319,45 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
                         let mut rs = self.risk_state.lock().await;
                         *rs.positions.entry(order.token_id.clone()).or_insert(0.0) += order.quantity;
                     }
+                    // 成交价 + 滑点
+                    let filled_price = if !result.response.makingAmount.is_empty() && !result.response.takingAmount.is_empty() {
+                        result.response.makingAmount.parse::<f64>().unwrap_or(0.0)
+                            / result.response.takingAmount.parse::<f64>().unwrap_or(1.0)
+                    } else {
+                        order.target_price
+                    };
+                    let (slippage, slippage_pct) = compute_slippage(order.target_price, filled_price, order.quantity);
+                    // 记录成交（含滑点）
+                    if success && !exchange_order_id.is_empty() {
+                        let mut rec = FillRecord::new(
+                            exchange_order_id.clone(),
+                            order.token_id.clone(),
+                            side.as_str().to_string(),
+                            order.target_price,
+                            order.quantity,
+                        );
+                        rec.mark_filled(filled_price, 0.0);
+                        self.fill_ledger.record(rec);
+                    }
                     return Ok(Response::new(pb::OrderResult {
                         order_id: order.order_id.clone(),
                         success,
                         exchange_order_id,
                         error_message,
                         timestamp: Utc::now().to_rfc3339(),
-                        filled_price: order.target_price,
+                        filled_price,
                         filled_size: order.quantity,
                         status: if success {
                             pb::ExecutionStatus::Filled as i32
                         } else {
                             pb::ExecutionStatus::Rejected as i32
                         },
+                        filled_at: Utc::now().to_rfc3339(),
+                        settled_at: String::new(),
+                        slippage,
+                        slippage_pct,
+                        fee: 0.0,
+                        pnl: 0.0,
                     }));
                 }
                 Err(e) => {
@@ -286,6 +371,7 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
                         filled_price: 0.0,
                         filled_size: 0.0,
                         status: pb::ExecutionStatus::Rejected as i32,
+                        ..Default::default()
                     }));
                 }
             }
@@ -333,6 +419,21 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
                     order.target_price
                 };
 
+                // 滑点计算
+                let (slippage, slippage_pct) = compute_slippage(order.target_price, filled_price, order.quantity);
+                // 记录成交（含滑点）
+                if response.success && !response.orderID.is_empty() {
+                    let mut rec = FillRecord::new(
+                        response.orderID.clone(),
+                        order.token_id.clone(),
+                        side.as_str().to_string(),
+                        order.target_price,
+                        order.quantity,
+                    );
+                    rec.mark_filled(filled_price, 0.0);
+                    self.fill_ledger.record(rec);
+                }
+
                 Ok(Response::new(pb::OrderResult {
                     order_id: order.order_id.clone(),
                     success: response.success,
@@ -346,6 +447,12 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
                     } else {
                         pb::ExecutionStatus::Rejected as i32
                     },
+                    filled_at: Utc::now().to_rfc3339(),
+                    settled_at: String::new(),
+                    slippage,
+                    slippage_pct,
+                    fee: 0.0,
+                    pnl: 0.0,
                 }))
             }
             Err(e) => {
@@ -359,6 +466,7 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
                     filled_price: 0.0,
                     filled_size: 0.0,
                     status: pb::ExecutionStatus::Rejected as i32,
+                    ..Default::default()
                 }))
             }
         }
@@ -498,6 +606,43 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
             uptime: format!("{}h {}m {}s", hours, mins, secs),
             wallet_loaded: self.wallet_loaded,
             api_creds_set: self.api_creds_set,
+        }))
+    }
+
+    /// 查询成交记录列表（完整字段：下单/成交/结算时间 + 滑点 + 手续费 + 盈亏）。
+    async fn get_fills(
+        &self,
+        _request: Request<pb::Empty>,
+    ) -> Result<Response<pb::FillListResponse>, Status> {
+        let fills = self.fill_ledger.list();
+        let stats = self.fill_ledger.stats();
+
+        let fill_msgs: Vec<pb::FillRecord> = fills
+            .iter()
+            .map(|r| pb::FillRecord {
+                order_id: r.order_id.clone(),
+                token_id: r.token_id.clone(),
+                side: r.side.clone(),
+                placed_at: format_unix(r.placed_at),
+                filled_at: format_unix(r.filled_at),
+                settled_at: r.settled_at.map(format_unix).unwrap_or_default(),
+                limit_price: r.limit_price,
+                filled_price: r.filled_price,
+                size: r.size,
+                fee: r.fee,
+                slippage: r.slippage,
+                slippage_pct: r.slippage_pct,
+                pnl: r.pnl.unwrap_or(0.0),
+                status: r.status.to_string(),
+            })
+            .collect();
+
+        Ok(Response::new(pb::FillListResponse {
+            fills: fill_msgs,
+            total: stats.total as i32,
+            total_fee: stats.total_fee,
+            total_slippage: stats.total_slippage,
+            total_pnl: stats.total_pnl,
         }))
     }
 

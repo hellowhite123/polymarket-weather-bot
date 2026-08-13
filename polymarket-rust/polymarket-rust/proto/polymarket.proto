@@ -124,12 +124,48 @@ message OrderResult {
   bool success = 2;
   string exchange_order_id = 3;    // Polymarket 交易所返回的订单 ID
   string error_message = 4;
-  string timestamp = 5;            // ISO 8601
+  string timestamp = 5;            // 下单时间 (ISO 8601)
 
   // 成交详情
   double filled_price = 6;         // 实际成交价
   double filled_size = 7;          // 实际成交数量
   ExecutionStatus status = 8;
+
+  // 成交记录完整字段（下单/成交/结算时间拆分 + 滑点 + 手续费 + 盈亏）
+  string filled_at = 9;            // 成交时间 (ISO 8601)
+  string settled_at = 10;          // 结算时间 (ISO 8601, 空=未结算)
+  double slippage = 11;            // 滑点金额 (USDC)
+  double slippage_pct = 12;        // 滑点百分比 (%)
+  double fee = 13;                 // 手续费 (USDC)
+  double pnl = 14;                 // 盈亏 (USDC, 结算后才有)
+}
+
+// 成交记录（完整字段，Rust --> Python）
+// 对应 Rust fast::fill_records::FillRecord
+message FillRecord {
+  string order_id = 1;      // 统一订单 ID
+  string token_id = 2;      // 市场 token id
+  string side = 3;          // BUY / SELL
+  string placed_at = 4;     // 下单时间 (ISO 8601)
+  string filled_at = 5;     // 成交时间 (ISO 8601)
+  string settled_at = 6;    // 结算时间 (ISO 8601, 空=未结算)
+  double limit_price = 7;   // 下单价（预期价）
+  double filled_price = 8;  // 实际成交价
+  double size = 9;          // 成交数量
+  double fee = 10;          // 手续费 (USDC)
+  double slippage = 11;     // 滑点金额 (USDC)
+  double slippage_pct = 12; // 滑点百分比 (%)
+  double pnl = 13;          // 盈亏 (USDC, 结算后才有)
+  string status = 14;       // filled / settled / cancelled
+}
+
+// 成交记录列表响应
+message FillListResponse {
+  repeated FillRecord fills = 1;
+  int32 total = 2;
+  double total_fee = 3;
+  double total_slippage = 4;
+  double total_pnl = 5;
 }
 
 // 取消订单请求
@@ -224,6 +260,9 @@ service ExecutionService {
 
   // 健康检查
   rpc HealthCheck(Empty) returns (HealthCheckResponse);
+
+  // 查询成交记录列表（完整字段：下单/成交/结算时间 + 滑点 + 手续费 + 盈亏）
+  rpc GetFills(Empty) returns (FillListResponse);
 
   // 钱包管理
   rpc AddWallet(AddWalletRequest) returns (WalletResult);
