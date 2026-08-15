@@ -113,8 +113,39 @@ class HistoricalEvent:
     # 市场快照时间序列 [(timestamp, yes_price, no_price, volume, spread)]
     market_history: List[dict] = field(default_factory=list)
 
-    # 真实气象数据 (用于判定 outcome)
+    # as-of 预报概率时间序列 [(timestamp, prob)]
+    # 每个点代表「在该时刻可获得的模型预报概率」，用于回测信号生成。
+    # 禁止用 actual_data 直接作为模型概率（那会造成 oracle / future leakage）。
+    forecast_history: List[dict] = field(default_factory=list)
+
+    # 真实气象数据 (仅用于最终结算 / PnL 计算，不得用于信号生成)
     actual_data: dict = field(default_factory=dict)
+
+    def get_forecast_probability_at(self, at_time: datetime) -> Optional[float]:
+        """返回 <= at_time 的最后一个 as-of 预报概率（禁止未来数据）。
+
+        Args:
+            at_time: 当前回测时间点
+
+        Returns:
+            预报概率 (0~1)，若无可用预报返回 None
+        """
+        if at_time.tzinfo is None:
+            at_time = at_time.replace(tzinfo=timezone.utc)
+
+        best: Optional[tuple] = None  # (snap_time, prob)
+        for f in self.forecast_history:
+            ts = datetime.fromisoformat(f["timestamp"])
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            # 跳过未来预报
+            if ts > at_time:
+                continue
+            prob = float(f.get("prob", 0.5))
+            if best is None or ts > best[0]:
+                best = (ts, prob)
+
+        return best[1] if best is not None else None
 
     def to_dict(self) -> dict:
         d = asdict(self)

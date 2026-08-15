@@ -42,29 +42,30 @@ class ConflictResolver:
     def resolve(
         self, signals: List[TradingSignal]
     ) -> Dict[str, ConflictResolution]:
-        """对一批信号按 token_id 分组并做方向仲裁。
+        """对一批信号按 condition_id 分组并做方向仲裁（R2-P1-13）。
 
         Returns:
-            {token_id: ConflictResolution} -- 每个 token 的仲裁结果
+            {condition_id: ConflictResolution} -- 每个 condition 的仲裁结果
         """
-        # 1. 按 token_id 分组
+        # 1. 按 condition_id 分组（fallback 到 token_id 兼容旧信号）
         groups: Dict[str, List[TradingSignal]] = {}
         for s in signals:
-            groups.setdefault(s.token_id, []).append(s)
+            key = s.condition_id or s.token_id
+            groups.setdefault(key, []).append(s)
 
         results: Dict[str, ConflictResolution] = {}
 
-        for token_id, group_signals in groups.items():
-            resolution = self._resolve_group(token_id, group_signals)
+        for key, group_signals in groups.items():
+            resolution = self._resolve_group(key, group_signals)
             if resolution is not None:
-                results[token_id] = resolution
+                results[key] = resolution
 
         return results
 
     def _resolve_group(
-        self, token_id: str, signals: List[TradingSignal]
+        self, key: str, signals: List[TradingSignal]
     ) -> ConflictResolution:
-        """对单个 token 的信号做方向仲裁。"""
+        """对单个 condition 的信号做方向仲裁（YES vs NO 才是真冲突）。"""
 
         yes_signals = [
             s for s in signals if s.direction == SignalDirection.BUY_YES
@@ -79,13 +80,13 @@ class ConflictResolver:
         # 只有一个方向 -- 无冲突
         if not no_signals:
             return ConflictResolution(
-                token_id=token_id,
+                token_id=yes_signals[0].token_id,
                 direction=SignalDirection.BUY_YES,
                 contributing_signals=yes_signals,
             )
         if not yes_signals:
             return ConflictResolution(
-                token_id=token_id,
+                token_id=no_signals[0].token_id,
                 direction=SignalDirection.BUY_NO,
                 contributing_signals=no_signals,
             )
@@ -101,12 +102,12 @@ class ConflictResolver:
 
         if diff < self.conflict_threshold:
             logger.info(
-                "token=%s 双向冲突相消: YES_score=%.4f NO_score=%.4f "
+                "condition=%s 双向冲突相消: YES_score=%.4f NO_score=%.4f "
                 "diff=%.4f < 阈值 %.4f",
-                token_id, yes_score, no_score, diff, self.conflict_threshold,
+                key, yes_score, no_score, diff, self.conflict_threshold,
             )
             return ConflictResolution(
-                token_id=token_id,
+                token_id=key,
                 direction=None,
                 contributing_signals=signals,
                 void_reason=(
@@ -125,12 +126,12 @@ class ConflictResolver:
             loser_score = yes_score
 
         logger.info(
-            "token=%s 方向冲突仲裁: %s 胜 (score=%.4f vs %.4f, diff=%.4f)",
-            token_id, winner.value,
+            "condition=%s 方向冲突仲裁: %s 胜 (score=%.4f vs %.4f, diff=%.4f)",
+            key, winner.value,
             max(yes_score, no_score), loser_score, diff,
         )
         return ConflictResolution(
-            token_id=token_id,
+            token_id=contributing[0].token_id,
             direction=winner,
             contributing_signals=contributing,
         )

@@ -48,6 +48,7 @@ enum ExecutionStatus {
   REJECTED = 4;    // 被拒绝
   CANCELLED = 5;   // 已取消
   EXPIRED = 6;     // 已过期
+  LIVE = 7;        // 已挂单到订单簿, 尚未成交 (accepted != filled)
 }
 
 // ===== 消息 =====

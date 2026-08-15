@@ -127,6 +127,9 @@ class DataLoader:
                 deadline, prob, base_bias=0.02, noise=0.05
             )
 
+            # 生成 as-of 预报概率序列 (截止前 48h~1h, 每 6h 一个预报)
+            forecast_history = self._generate_forecast_series(deadline, prob)
+
             event = HistoricalEvent(
                 token_id=token_id,
                 location=loc,
@@ -135,6 +138,7 @@ class DataLoader:
                 outcome=outcome,
                 forecast_files=[],  # 回测时用 Mock 预报
                 market_history=market_history,
+                forecast_history=forecast_history,
                 actual_data={
                     "prob": prob,
                     "temperature_c": round(self._rng.gauss(20, 8), 1),
@@ -196,6 +200,38 @@ class DataLoader:
                 "volume": round(volume, 2),
                 "spread": round(spread, 4),
                 "hours_to_deadline": round(hours_to_deadline, 1),
+            })
+
+        return series
+
+    def _generate_forecast_series(
+        self,
+        deadline: datetime,
+        true_prob: float,
+        noise: float = 0.08,
+        n_points: int = 8,
+        step_hours: float = 6.0,
+    ) -> List[dict]:
+        """为单个事件生成 as-of 预报概率序列。
+
+        每个点代表「在该时刻可获得的模型预报概率」，与真实结果相关但含噪声，
+        临近截止时预报更准（噪声收敛）。禁止用真实结果直接作为预报（oracle）。
+        """
+        series = []
+        for i in range(n_points):
+            ts = deadline - timedelta(hours=48 - i * step_hours)
+            if ts >= deadline:
+                break
+
+            hours_to_deadline = (deadline - ts).total_seconds() / 3600
+            convergence = max(0.3, min(1.0, hours_to_deadline / 48.0))
+
+            forecast_prob = true_prob + self._rng.gauss(0, noise * convergence)
+            forecast_prob = max(0.01, min(0.99, forecast_prob))
+
+            series.append({
+                "timestamp": ts.isoformat(),
+                "prob": round(forecast_prob, 4),
             })
 
         return series

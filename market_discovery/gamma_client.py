@@ -169,7 +169,8 @@ class GammaClient:
                 )
             return MarketInfo(
                 condition_id=f"mock-{event}-{city.lower().replace(' ', '-')}-{idx}",
-                token_id=f"mock-token-{idx}",
+                yes_token_id=f"mock-yes-token-{idx}",
+                no_token_id=f"mock-no-token-{idx}",
                 question=question,
                 end_date_utc=end.timestamp(),
                 outcome_prices=[

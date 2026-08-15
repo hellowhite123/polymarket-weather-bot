@@ -296,9 +296,12 @@ class SignalAggregator:
             return order
 
         # -- Step 4: 仓位计算 --
+        # P0-08 修复：Kelly 使用 model_probability（= target_price），
+        # confidence 仅作保守缩放因子，不作为概率本身。
         quantity, sizing_detail = self.position_sizer.size(
-            confidence=confidence,
+            model_probability=target_price,
             market_price=market_price,
+            confidence=confidence,
             direction=resolution.direction,
         )
 

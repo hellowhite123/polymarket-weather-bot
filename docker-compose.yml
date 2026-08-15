@@ -58,8 +58,10 @@ services:
     image: ai-weather-polymorph:latest
     container_name: ai-weather-polymorph
     restart: unless-stopped
-    ports:
-      - "${GRPC_PORT:-50051}:50051"
+    # R2-P0 安全修复：gRPC 只在 Docker 内部网络暴露，不映射到宿主机公网。
+    # Python app 通过 weather-net 内部访问 polymorph:50051。
+    expose:
+      - "50051"
     volumes:
       # 密钥库持久化
       - ./polymarket-rust/keystore.json:/app/keystore.json:ro
@@ -71,10 +73,15 @@ services:
       - GRPC_ADDR=0.0.0.0:50051
       - CHAIN_ID=${CHAIN_ID:-137}
       - CLOB_HOST=${CLOB_HOST:-https://clob.polymarket.com}
-      # 钱包凭证（从 .env 或环境变量注入）
+      # 钱包地址
       - WALLET_ADDRESS=${WALLET_ADDRESS:-}
-      - WALLET_PASSWORD=${WALLET_PASSWORD:-}
+      # R2-P0 安全修复：钱包密码不要通过普通 environment 注入
+      # （会进入 process env / container metadata / debug tooling）。
+      # 生产应改用 Docker secret 或 host-mounted protected file。
+      - WALLET_PASSWORD_FILE=/run/secrets/wallet_password
       - KEYSTORE_PATH=${KEYSTORE_PATH:-/app/keystore.json}
+    secrets:
+      - wallet_password
     networks:
       - weather-net
     healthcheck:
@@ -83,6 +90,10 @@ services:
       timeout: 5s
       retries: 3
       start_period: 30s
+
+secrets:
+  wallet_password:
+    file: ./secrets/wallet_password.txt
 
 networks:
   weather-net:

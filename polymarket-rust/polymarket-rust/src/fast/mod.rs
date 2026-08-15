@@ -31,6 +31,7 @@ pub mod market_cache;
 pub mod market_events;
 pub mod mempool;
 pub mod nonce_manager;
+pub mod order_state;
 pub mod presign;
 pub mod rpc_pool;
 pub mod state_sync;

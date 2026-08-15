@@ -11,8 +11,10 @@ PyQt6>=6.5.0
 matplotlib>=3.7.0
 
 # ── gRPC 桥接 ──
-grpcio>=1.60.0
-grpcio-tools>=1.60.0
+# R2-P0 修复：锁定版本，避免 gencode/runtime 不兼容导致 import 失败。
+# 生成代码（polymarket_pb2.py）的 protoc 版本必须与 runtime 一致。
+grpcio==1.83.0
+grpcio-tools==1.83.0
 
 # ── 工具 ──
-protobuf>=4.25.0
+protobuf==7.35.1

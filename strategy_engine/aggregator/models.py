@@ -165,6 +165,10 @@ class RiskState:
     # 当前持仓 {token_id: 数量} (正数=多头, 负数=空头)
     positions: Dict[str, float] = field(default_factory=dict)
 
+    # 持仓名义价值 {token_id: USDC}（R2-P0-09：数量 ≠ 暴露）
+    # notional = quantity * avg_price，用于正确的 USDC 暴露计算
+    position_notionals: Dict[str, float] = field(default_factory=dict)
+
     # 各市场结算时间 {token_id: datetime}
     settlement_times: Dict[str, datetime] = field(default_factory=dict)
 
@@ -187,7 +191,14 @@ class RiskState:
         return self.positions.get(token_id, 0.0)
 
     def get_global_exposure(self) -> float:
-        """全局暴露 = 所有持仓绝对值之和。"""
+        """全局暴露 = 所有持仓名义 USDC 之和（R2-P0-09 修复）。
+
+        不能把 token 数量直接当暴露：100 shares @ $0.10 = $10，
+        100 shares @ $0.90 = $90，风险完全不同。
+        """
+        if self.position_notionals:
+            return sum(abs(v) for v in self.position_notionals.values())
+        # 兼容旧数据：无 notionals 时退回数量之和（不精确，但保持可用）
         return sum(abs(v) for v in self.positions.values())
 
     def is_trading_halted(self) -> bool:
@@ -205,6 +216,7 @@ class RiskState:
     def from_dict(cls, data: dict) -> "RiskState":
         return cls(
             positions=data.get("positions", {}),
+            position_notionals=data.get("position_notionals", {}),
             settlement_times={
                 k: datetime.fromisoformat(v)
                 for k, v in data.get("settlement_times", {}).items()

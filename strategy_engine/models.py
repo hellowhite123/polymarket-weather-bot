@@ -71,22 +71,55 @@ class DeviationRecord:
 
 @dataclass
 class MarketSnapshot:
-    """市场快照 — 策略输入的行情数据。"""
+    """市场快照 — 策略输入的行情数据。
 
-    token_id: str
-    yes_price: float               # YES token 当前价格（二分市场：YES+NO≈1.0）
-    no_price: float                # NO token 当前价格
-    market_volume: float = 0.0     # 24h 成交量
-    spread: float = 0.0            # 买卖价差
+    R2-P0-01 修复：同时携带 condition_id + YES/NO 两个 outcome token，
+    并区分「市场身份」与「outcome 身份」。`token_id` 保留为兼容字段，
+    新代码必须使用 `token_for(direction)` 选择正确的 outcome token。
+    """
+
+    token_id: str = ""               # deprecated: 兼容旧代码，等价 yes_token_id
+    yes_price: float = 0.0           # YES token 当前价格
+    no_price: float = 0.0            # NO token 当前价格
+    market_volume: float = 0.0       # 24h 成交量
+    spread: float = 0.0              # 买卖价差
     timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    # 新增（R2-P0-01）
+    condition_id: str = ""           # 市场唯一标识
+    yes_token_id: str = ""           # YES outcome token id
+    no_token_id: str = ""            # NO outcome token id
+    yes_bid: float = 0.0
+    yes_ask: float = 0.0
+    no_bid: float = 0.0
+    no_ask: float = 0.0
+
+    def __post_init__(self):
+        # 双向兼容：token_id 与 yes_token_id 保持同步
+        if self.yes_token_id and not self.token_id:
+            self.token_id = self.yes_token_id
+        elif self.token_id and not self.yes_token_id:
+            self.yes_token_id = self.token_id
 
     @property
     def implied_probability(self) -> float:
-        """市场隐含概率 = YES token 价格。
-
-        在二分市场中，YES 价格直接反映市场对该事件发生的概率估计。
-        """
+        """市场隐含概率 = YES token 价格。"""
         return max(0.0, min(1.0, self.yes_price))
+
+    def token_for(self, direction: "SignalDirection") -> str:
+        """根据方向返回正确的 outcome token id（R2-P0-01 核心）。"""
+        if direction == SignalDirection.BUY_YES:
+            return self.yes_token_id or self.token_id
+        if direction == SignalDirection.BUY_NO:
+            return self.no_token_id
+        raise ValueError(f"未知方向: {direction}")
+
+    def price_for(self, direction: "SignalDirection") -> float:
+        """根据方向返回对应的市场价（YES 用 yes_price，NO 用 no_price）。"""
+        if direction == SignalDirection.BUY_YES:
+            return self.yes_price
+        if direction == SignalDirection.BUY_NO:
+            return self.no_price
+        raise ValueError(f"未知方向: {direction}")
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -104,9 +137,14 @@ class TradingSignal:
     signal_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     strategy: str = ""                 # 策略名称
     direction: SignalDirection = SignalDirection.BUY_YES
-    token_id: str = ""
+    token_id: str = ""                 # 实际执行 token（= 方向对应的 outcome token）
     event_type: EventType = EventType.RAIN
     location: str = ""
+
+    # R2-P0-01 新增：市场与 outcome 身份分离
+    condition_id: str = ""
+    yes_token_id: str = ""
+    no_token_id: str = ""
 
     # 定价
     target_price: float = 0.0          # 策略认为的合理价格
@@ -150,6 +188,9 @@ class TradingSignal:
             token_id=data.get("token_id", ""),
             event_type=EventType(data.get("event_type", "rain")),
             location=data.get("location", ""),
+            condition_id=data.get("condition_id", ""),
+            yes_token_id=data.get("yes_token_id", ""),
+            no_token_id=data.get("no_token_id", ""),
             target_price=data.get("target_price", 0.0),
             market_price=data.get("market_price", 0.0),
             quantity=data.get("quantity", 0.0),

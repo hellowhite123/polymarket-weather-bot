@@ -286,11 +286,13 @@ class BacktestEngine:
                 timestamp=current_time,
             )
 
-            # 简单信号: 基于市场隐含概率 vs 真实概率的偏差
-            # (在回测中我们用 actual_data 中的概率作为 "模型概率")
-            true_prob = event.actual_data.get("prob", 0.5)
+            # 模型概率：as-of 预报概率（禁止用 actual_data 当 oracle，P0-06）
+            model_prob = event.get_forecast_probability_at(current_time)
+            if model_prob is None:
+                continue
+
             implied = market.implied_probability
-            deviation = true_prob - implied
+            deviation = model_prob - implied
 
             # 只在偏差足够大时生成信号
             if abs(deviation) < 0.05:
@@ -305,13 +307,13 @@ class BacktestEngine:
                 token_id=event.token_id,
                 event_type=EventType(event.event_type),
                 location=event.location,
-                target_price=max(0.01, min(0.99, true_prob)),
+                target_price=max(0.01, min(0.99, model_prob)),
                 market_price=yes_price,
                 confidence=confidence,
                 deviation=deviation,
                 sigma_level=abs(deviation) / 0.1,  # 简化 sigma
                 metadata={
-                    "true_prob": true_prob,
+                    "model_prob": model_prob,
                     "implied_prob": implied,
                     "hours_to_deadline": (
                         event.deadline - current_time

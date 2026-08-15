@@ -68,7 +68,8 @@ class MarketInfo:
     """
 
     condition_id: str            # 唯一标识（Gamma API 的 conditionId / mock 生成）
-    token_id: str                # YES token id（下单用）
+    yes_token_id: str            # YES outcome token id（下单用）
+    no_token_id: str             # NO outcome token id
     question: str                # 市场问题，如 "Will it rain in New York on 2026-08-11?"
     outcomes: List[str] = field(default_factory=lambda: ["Yes", "No"])
     outcome_prices: List[float] = field(default_factory=list)  # 与 outcomes 对应（gamma outcomePrices）
@@ -94,6 +95,15 @@ class MarketInfo:
             )
 
     @property
+    def token_id(self) -> str:
+        """兼容旧代码：默认返回 YES token。
+
+        新交易代码禁止依赖此属性作为「整个市场」的唯一 outcome 标识，
+        必须显式使用 yes_token_id / no_token_id。
+        """
+        return self.yes_token_id
+
+    @property
     def is_expired(self) -> bool:
         """是否已过截止时间。"""
         return self.end_date_utc is not None and self.end_date_utc < _utc_now().timestamp()
@@ -113,10 +123,16 @@ class MarketInfo:
 
         返回 dict 而非直接依赖 strategy_engine 类型，避免循环依赖；
         调用方用 MarketSnapshot(**d) 构造。
+
+        R2-P0-01：同时输出 condition_id + yes_token_id/no_token_id，
+        让策略层能按方向选择正确的 outcome token。
         """
         yes = self.yes_price
         return {
-            "token_id": self.token_id,
+            "condition_id": self.condition_id,
+            "token_id": self.token_id,  # 兼容旧代码（= yes_token_id）
+            "yes_token_id": self.yes_token_id,
+            "no_token_id": self.no_token_id,
             "yes_price": yes,
             "no_price": round(1.0 - yes, 6),
             "market_volume": self.volume,
@@ -130,12 +146,22 @@ class MarketInfo:
     def from_dict(cls, data: Dict) -> "MarketInfo":
         """从 to_dict() 生成的字典还原（兼容 registry 持久化记录）。"""
         fields = (
-            "condition_id", "token_id", "question", "outcomes",
+            "condition_id", "yes_token_id", "no_token_id", "question", "outcomes",
             "outcome_prices", "end_date_utc", "start_date_utc", "active",
             "closed", "category", "tags", "volume", "liquidity",
             "location", "event_type",
         )
         kwargs = {k: data[k] for k in fields if k in data}
+        # 兼容旧数据：只有 token_id（无 yes/no 拆分）时映射到 yes_token_id
+        if "yes_token_id" not in kwargs and "token_id" in data:
+            kwargs["yes_token_id"] = data["token_id"]
+            kwargs.setdefault("no_token_id", "")
+        # R2-P0-02：生产交易路径必须 fail closed，
+        # 缺完整 YES/NO token 映射时直接报错，不允许空 token 继续运行。
+        if not kwargs.get("yes_token_id") or not kwargs.get("no_token_id"):
+            raise ValueError(
+                f"market {data.get('condition_id')} 缺少完整 YES/NO token mapping"
+            )
         return cls(**kwargs)
 
     @classmethod
@@ -143,22 +169,29 @@ class MarketInfo:
         """从 Gamma API 市场对象构造。
 
         Gamma market 对象关键字段:
-          id / question / conditionId / tokenIds / outcomes /
+          id / question / conditionId / clobTokenIds / outcomes /
           endDate / startDate / active / closed / category / tags /
-          volume / liquidity / clobTokenIds
+          volume / liquidity
         """
-        token_ids = raw.get("tokenIds") or raw.get("clobTokenIds") or []
-        token_id = token_ids[0] if token_ids else raw.get("id", "")
-        outcomes = raw.get("outcomes") or ["Yes", "No"]
+        token_ids = raw.get("clobTokenIds") or raw.get("tokenIds") or []
+        if len(token_ids) < 2:
+            raise ValueError(
+                f"二元市场缺少 YES/NO token: "
+                f"condition_id={raw.get('conditionId') or raw.get('id')}"
+            )
+        outcomes = [str(o) for o in (raw.get("outcomes") or ["Yes", "No"])]
+        if len(outcomes) != 2:
+            raise ValueError(f"目前只支持二元市场 outcomes={outcomes}")
         tags = [
             t.get("label") if isinstance(t, dict) else str(t)
             for t in (raw.get("tags") or [])
         ]
         return cls(
             condition_id=str(raw.get("conditionId") or raw.get("id") or ""),
-            token_id=str(token_id),
+            yes_token_id=str(token_ids[0]),
+            no_token_id=str(token_ids[1]),
             question=str(raw.get("question") or ""),
-            outcomes=[str(o) for o in outcomes],
+            outcomes=outcomes,
             outcome_prices=_parse_prices(raw.get("outcomePrices")),
             end_date_utc=_iso_to_ts(raw.get("endDate")),
             start_date_utc=_iso_to_ts(raw.get("startDate")),

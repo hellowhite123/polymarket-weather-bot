@@ -48,11 +48,19 @@ class PositionSizer:
 
     def size(
         self,
-        confidence: float,
+        model_probability: float,
         market_price: float,
-        direction: SignalDirection,
+        confidence: float = 1.0,
+        direction: SignalDirection = SignalDirection.BUY_YES,
     ) -> Tuple[float, dict]:
-        """根据置信度和市场价格计算下单数量。
+        """根据模型概率和市场价格计算下单数量。
+
+        Args:
+            model_probability: 模型预测概率 P(YES)（0~1）
+            market_price: 市场隐含价格（YES token）
+            confidence: 模型可靠程度/仓位缩放因子（0~1），仅作保守缩放，
+                        不作为概率本身（P0-08 修复）
+            direction: 交易方向
 
         Returns:
             (quantity, details) -- details 含计算过程, 供审计
@@ -64,12 +72,15 @@ class PositionSizer:
             return 0.0, {"reason": f"无效市场价格 {market_price}"}
 
         if self.method == "kelly":
-            qty, detail = self._kelly(confidence, market_price, direction)
+            qty, detail = self._kelly(model_probability, market_price, direction)
+            # confidence 仅作为额外的 conservative scaler，不是概率本身
+            qty *= confidence
         else:
-            qty, detail = self._fixed(confidence, market_price)
+            qty, detail = self._fixed(confidence, market_price, direction)
 
         qty = max(0.0, qty)
         detail["method"] = self.method
+        detail["model_probability"] = model_probability
         detail["confidence"] = confidence
         detail["market_price"] = market_price
         detail["quantity"] = qty
@@ -114,15 +125,29 @@ class PositionSizer:
             "f_applied": f, "cost": cost,
         }
 
-    def _fixed(self, confidence: float, price: float) -> Tuple[float, dict]:
-        """固定比例仓位计算。"""
+    def _fixed(
+        self,
+        confidence: float,
+        price: float,
+        direction: SignalDirection,
+    ) -> Tuple[float, dict]:
+        """固定比例仓位计算。
+
+        R2-P1-12 修复：BUY_NO 的单位成本是 (1 - price)，不能都用 YES price。
+        """
+        cost = (
+            price
+            if direction == SignalDirection.BUY_YES
+            else (1.0 - price)
+        )
         quantity = (
             self.base_capital
             * self.fixed_fraction
             * confidence
-            / price
+            / cost
         )
         return quantity, {
             "fixed_fraction": self.fixed_fraction,
             "base_capital": self.base_capital,
+            "unit_cost": cost,
         }

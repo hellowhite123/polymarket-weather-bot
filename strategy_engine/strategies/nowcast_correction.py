@@ -34,6 +34,7 @@ from ..models import (
     SignalDirection,
     TradingSignal,
 )
+from ..probability import probability_above, probability_below
 from .base import BaseStrategy
 from .forecast_utils import extract_probability, get_location
 
@@ -183,11 +184,14 @@ class NowcastCorrectionStrategy(BaseStrategy):
         signal = TradingSignal(
             strategy=self.name,
             direction=direction,
-            token_id=market.token_id,
+            token_id=market.token_for(direction),
             event_type=event_type,
             location=location,
+            condition_id=market.condition_id,
+            yes_token_id=market.yes_token_id,
+            no_token_id=market.no_token_id,
             target_price=round(corrected_prob, 4),
-            market_price=round(market_prob, 4),
+            market_price=round(market.price_for(direction), 4),
             quantity=quantity,
             confidence=confidence,
             deviation=round(deviation, 4),
@@ -347,44 +351,27 @@ class NowcastCorrectionStrategy(BaseStrategy):
 
     @staticmethod
     def _temp_signal(observation) -> Optional[float]:
-        """温度实况信号（0.0~1.0）。
+        """温度实况信号（0.0~1.0）= P(温度 < 0°C) 降雪/结冰概率。
 
-        将观测温度映射为概率信号：
-          - 温度 < 0°C: 0.9（容易降雪/结冰）
-          - 温度 0~10°C: 0.5~0.7
-          - 温度 10~25°C: 0.3
-          - 温度 > 25°C: 0.1
+        P0-07 修复：不再用硬编码启发式分数，而是基于正态分布把
+        观测温度转为「低于阈值」的概率（假设观测不确定性 std=1.5°C）。
         """
         if observation.temperature_c is None:
             return None
         t = observation.temperature_c
-        if t < 0:
-            return 0.9
-        elif t < 10:
-            return 0.5 + (10 - t) / 10.0 * 0.2  # 0.5~0.7
-        elif t < 25:
-            return 0.3
-        else:
-            return 0.1
+        return probability_below(mean=t, std=1.5, threshold=0.0)
 
     @staticmethod
     def _wind_signal(observation) -> Optional[float]:
-        """风速实况信号（0.0~1.0）。
+        """风速实况信号（0.0~1.0）= P(风速 > 30 km/h) 大风概率。
 
-        将观测风速映射为概率信号：
-          - 风速 > 60 km/h: 1.0（大风事件几乎确定）
-          - 风速 30~60 km/h: 0.5~1.0
-          - 风速 < 30 km/h: 0.0~0.5
+        P0-07 修复：基于正态分布把观测风速转为「超过阈值」的概率
+        （假设观测不确定性 std=5 km/h）。
         """
         if observation.wind_speed_kph is None:
             return None
         w = observation.wind_speed_kph
-        if w >= 60:
-            return 1.0
-        elif w >= 30:
-            return 0.5 + (w - 30) / 30.0 * 0.5  # 0.5~1.0
-        else:
-            return w / 30.0 * 0.5  # 0.0~0.5
+        return probability_above(mean=w, std=5.0, threshold=30.0)
 
     # ================================================================
     # 置信度与仓位

@@ -20,6 +20,8 @@ use std::sync::Arc;
 use tracing_subscriber::EnvFilter;
 
 use polymarket_rust::clob::client::ClobConfig;
+use polymarket_rust::fast::executor::FastExecutor;
+use polymarket_rust::fast::risk_engine::{RiskConfig, RiskEngine};
 use polymarket_rust::grpc::{serve, ExecutionServiceImpl};
 use polymarket_rust::order::OrderFlow;
 use polymarket_rust::types::Chain;
@@ -62,7 +64,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // 创建下单流程
-    let mut order_flow = OrderFlow::new(wallet_mgr.clone(), clob_config);
+    let mut order_flow = OrderFlow::new(wallet_mgr.clone(), clob_config.clone());
 
     // 初始化 API Key (如果有钱包地址和密码)
     if !address.is_empty() && !password.is_empty() {
@@ -75,7 +77,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 创建执行服务
-    let service = ExecutionServiceImpl::new(order_flow, wallet_mgr, address, password);
+    let mut service = ExecutionServiceImpl::new(order_flow, wallet_mgr.clone(), address, password);
+
+    // ★ R2-P0-08 接入风控引擎：place_order 强制走 RiskEngine.pre_check
+    let risk_engine = Arc::new(RiskEngine::new(RiskConfig::default()));
+    service.set_risk_engine(risk_engine);
+    tracing::info!("RiskEngine 已接入 place_order pre-check");
+
+    // ★ R2-P0-07 接入 FastExecutor（亚秒级执行路径）
+    match FastExecutor::new(wallet_mgr.clone(), clob_config.clone()) {
+        Ok(fe) => {
+            service.set_fast_executor(Arc::new(fe));
+            tracing::info!("FastExecutor 已接入（亚秒级执行路径）");
+        }
+        Err(e) => tracing::warn!("FastExecutor 初始化失败，降级为普通路径: {}", e),
+    }
 
     // 启动 gRPC server
     serve(service, &addr).await?;

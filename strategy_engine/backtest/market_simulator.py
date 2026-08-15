@@ -57,15 +57,27 @@ class MarketSimulator:
         if not event.market_history:
             return None
 
-        # 找到时间戳 <= current_time 的最后一个快照
+        # 找到时间戳 <= current_time 的最后一个快照（禁止未来数据，P0-05）
         best_snapshot = None
-        best_diff = float("inf")
-
         for snap in event.market_history:
             snap_time = datetime.fromisoformat(snap["timestamp"])
-            diff = abs((snap_time - current_time).total_seconds())
-            if diff < best_diff:
-                best_diff = diff
+            if snap_time.tzinfo is None:
+                snap_time = snap_time.replace(tzinfo=timezone.utc)
+            if current_time.tzinfo is None:
+                current_time = current_time.replace(tzinfo=timezone.utc)
+
+            # 跳过未来快照（look-ahead 防护）
+            if snap_time > current_time:
+                continue
+
+            if best_snapshot is None:
+                best_snapshot = snap
+                continue
+
+            best_time = datetime.fromisoformat(best_snapshot["timestamp"])
+            if best_time.tzinfo is None:
+                best_time = best_time.replace(tzinfo=timezone.utc)
+            if snap_time > best_time:
                 best_snapshot = snap
 
         if best_snapshot is None:
