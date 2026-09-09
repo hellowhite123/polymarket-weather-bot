@@ -45,6 +45,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # 时间
 chrono = "0.4"
 
+# 环境变量加载
+dotenvy = "0.15"
+
 # 大数运算
 num-bigint = "0.4"
 
@@ -57,6 +60,8 @@ async-stream = "0.3"
 [dev-dependencies]
 tokio = { version = "1.0", features = ["full", "test-util"] }
 tempfile = "3.10"
+# 本地 mock HTTP server，用于 CLOB 客户端 / 启动链路的离线验收测试
+wiremock = "0.6"
 
 [build-dependencies]
 tonic-build = "0.12"
