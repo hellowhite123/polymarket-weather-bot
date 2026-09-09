@@ -94,7 +94,7 @@
 
 #### P0-02 Docker Secret 与环境变量一致性
 
-- **Status**: IN_PROGRESS（09-09 Human 授权：`server.rs` 加入 Allowed Files）
+- **Status**: DONE（09-09 修复 + 4 测试全绿 + commit a963231）
 - **Owner**: Work Buddy
 - **Allowed Files**:
   - `Dockerfile`
