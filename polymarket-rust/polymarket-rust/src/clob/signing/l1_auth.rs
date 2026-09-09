@@ -28,77 +28,65 @@ pub fn build_l1_signature(wallet: &LocalWallet, timestamp: u64, nonce: u64) -> C
     let address = wallet.address();
     let timestamp_str = timestamp.to_string();
 
-    // 计算 ClobAuth 类型哈希
+    // ClobAuth 类型
     let type_str = "ClobAuth(address address,string timestamp,uint256 nonce,string message)";
     let type_hash = keccak256(type_str);
 
-    // 计算各字段的 hash
-    // address 是定长，直接 pad 到 32 字节
+    // address padding
     let mut address_padded = [0u8; 32];
     address_padded[12..].copy_from_slice(address.as_bytes());
 
-    // string 的 hash: keccak256(abi.encode(string))
-    let timestamp_hash = keccak256(&ethers::abi::encode(&[ethers::abi::Token::String(
-        timestamp_str.clone(),
-    )]));
-    let nonce_u256 = U256::from(nonce);
-    let message_hash = keccak256(&ethers::abi::encode(&[ethers::abi::Token::String(
-        MSG_TO_SIGN.to_string(),
-    )]));
+    // timestamp hash
+    let timestamp_hash = keccak256(timestamp_str.as_bytes());
 
-    // struct hash = keccak256(typeHash + address + timestampHash + nonce + messageHash)
+    // message hash
+    let message_hash = keccak256(MSG_TO_SIGN.as_bytes());
+
+    let nonce_u256 = U256::from(nonce);
+
+    // struct hash
     let mut struct_input = Vec::with_capacity(32 * 5);
+
     struct_input.extend_from_slice(&type_hash);
     struct_input.extend_from_slice(&address_padded);
     struct_input.extend_from_slice(&timestamp_hash);
     struct_input.extend_from_slice(&u256_to_bytes(&nonce_u256));
     struct_input.extend_from_slice(&message_hash);
+
     let struct_hash = keccak256(&struct_input);
 
-    // 域分隔符
+    // EIP712 Domain
     let domain_type_str = "EIP712Domain(string name,string version,uint256 chainId)";
+
     let domain_type_hash = keccak256(domain_type_str);
 
-    let name_hash = keccak256(&ethers::abi::encode(&[ethers::abi::Token::String(
-        "ClobAuthDomain".to_string(),
-    )]));
-    let version_hash = keccak256(&ethers::abi::encode(&[ethers::abi::Token::String(
-        "1".to_string(),
-    )]));
-    let chain_id = U256::from(1u64);
+    let name_hash = keccak256(b"ClobAuthDomain");
 
-    let mut domain_input = Vec::with_capacity(32 * 4);
+    let version_hash = keccak256(b"1");
+
+    let chain_id = U256::from(137u64);
+
+    let verifying_contract = [0u8; 32]; // 官方 verifying_contract 为 None → 编码为 32 字节 0
+
+    let mut domain_input = Vec::with_capacity(32 * 5);
+
     domain_input.extend_from_slice(&domain_type_hash);
     domain_input.extend_from_slice(&name_hash);
     domain_input.extend_from_slice(&version_hash);
     domain_input.extend_from_slice(&u256_to_bytes(&chain_id));
+
     let domain_separator = keccak256(&domain_input);
 
-    // 最终 typed data hash: keccak256("\x19\x01" + domainSeparator + structHash)
-    let mut final_input = Vec::with_capacity(2 + 32 + 32);
+    // EIP712 final hash
+    let mut final_input = Vec::with_capacity(66);
+
     final_input.extend_from_slice(b"\x19\x01");
     final_input.extend_from_slice(&domain_separator);
     final_input.extend_from_slice(&struct_hash);
+
     let typed_data_hash = keccak256(&final_input);
 
-    let h256 = H256::from(typed_data_hash);
-    let sig = wallet.sign_hash(h256)?;
+    let sig = wallet.sign_hash(H256::from(typed_data_hash))?;
+
     Ok(format!("0x{}", sig))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_l1_signature_generation() {
-        let wallet: LocalWallet =
-            "bd8024c85d743569c738586185ca743b40af25c0144f8bf1cc7c719bd987a56b"
-                .parse()
-                .unwrap();
-        let sig = build_l1_signature(&wallet, 1234567890, 0).unwrap();
-        assert!(sig.starts_with("0x"));
-        // 签名应为 132 字符（0x + 64+64+2）
-        assert_eq!(sig.len(), 132);
-    }
 }

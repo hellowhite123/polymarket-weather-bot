@@ -233,7 +233,10 @@ pub fn fast_order_digest(order: &Order, chain_id: u64, verifying_contract: &str)
 /// 解析 20 字节地址
 pub fn parse_address_20(addr: &str) -> [u8; 20] {
     let s = addr.trim();
-    let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+    let s = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .unwrap_or(s);
     let mut out = [0u8; 20];
     // hex::decode_to_slice 要求长度精确匹配，先做长度校验
     if s.len() == 40 {
@@ -256,7 +259,10 @@ pub fn parse_uint256(s: &str) -> U256 {
     if let Ok(u) = t.parse::<u64>() {
         return U256::from(u);
     }
-    let h = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
+    let h = t
+        .strip_prefix("0x")
+        .or_else(|| t.strip_prefix("0X"))
+        .unwrap_or(t);
     U256::from_str_radix(h, 16).unwrap_or_default()
 }
 
@@ -353,7 +359,11 @@ mod tests {
             let _ = domain_separator(137, addr);
         }
         let (h1, _) = domain_cache_stats();
-        assert!(h1 >= 100, "100 次调用应至少命中缓存 100 次（实际 {}，可能受并行测试影响）", h1);
+        assert!(
+            h1 >= 100,
+            "100 次调用应至少命中缓存 100 次（实际 {}，可能受并行测试影响）",
+            h1
+        );
     }
 
     #[test]

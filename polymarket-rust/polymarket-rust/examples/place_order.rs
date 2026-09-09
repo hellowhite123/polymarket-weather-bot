@@ -8,21 +8,20 @@
 //! 5. 提交限价单
 //! 6. 查询和取消订单
 
-use polymarket_rust::{
-    ClobConfig, OrderFlow, PlaceOrderParams, Side, WalletManager,
-};
+use polymarket_rust::{ClobConfig, OrderFlow, PlaceOrderParams, Side, WalletManager};
 use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ===== 配置 =====
     // 实际使用时请从环境变量或安全存储中读取
-    let private_key = std::env::var("POLYMARKET_PRIVATE_KEY")
-        .unwrap_or_else(|_| "0x0000000000000000000000000000000000000000000000000000000000000001".to_string());
-    let password = std::env::var("KEYSTORE_PASSWORD")
-        .unwrap_or_else(|_| "default-password".to_string());
-    let keystore_path = std::env::var("KEYSTORE_PATH")
-        .unwrap_or_else(|_| "keystore.json".to_string());
+    let private_key = std::env::var("POLYMARKET_PRIVATE_KEY").unwrap_or_else(|_| {
+        "0x0000000000000000000000000000000000000000000000000000000000000001".to_string()
+    });
+    let password =
+        std::env::var("KEYSTORE_PASSWORD").unwrap_or_else(|_| "default-password".to_string());
+    let keystore_path =
+        std::env::var("KEYSTORE_PATH").unwrap_or_else(|_| "keystore.json".to_string());
 
     // ===== 1. 初始化钱包管理器 =====
     let mut wallet_mgr = WalletManager::load(&keystore_path)?;
@@ -60,8 +59,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ===== 4. 查询市场数据 =====
     // 使用一个示例 token ID（实际使用时从 Gamma API 获取）
-    let token_id = std::env::var("TOKEN_ID")
-        .unwrap_or_else(|_| "48904718272642917209051062443697282654580972539858010698118450913067240868353".to_string());
+    let token_id = std::env::var("TOKEN_ID").unwrap_or_else(|_| {
+        "48904718272642917209051062443697282654580972539858010698118450913067240868353".to_string()
+    });
 
     println!("\n查询市场数据...");
     if let Ok(price) = flow.client().get_price(&token_id, Side::Buy).await {
@@ -71,7 +71,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("中间价: {mid}");
     }
     if let Ok(book) = flow.client().get_order_book(&token_id).await {
-        println!("订单簿 - 买单数: {}, 卖单数: {}", book.bids.len(), book.asks.len());
+        println!(
+            "订单簿 - 买单数: {}, 卖单数: {}",
+            book.bids.len(),
+            book.asks.len()
+        );
     }
 
     // ===== 5. 提交限价单 =====
@@ -88,7 +92,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // ===== 6. 取消订单 =====
             if !response.orderID.is_empty() {
                 println!("\n取消订单 {}...", response.orderID);
-                if let Err(e) = flow.cancel_order(&address, &password, &response.orderID).await {
+                if let Err(e) = flow
+                    .cancel_order(&address, &password, &response.orderID)
+                    .await
+                {
                     eprintln!("取消失败: {e}");
                 }
             }

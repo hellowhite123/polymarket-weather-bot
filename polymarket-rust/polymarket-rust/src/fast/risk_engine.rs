@@ -158,14 +158,22 @@ pub struct PositionLimits {
 
 impl PositionLimits {
     pub fn new(config: RiskConfig) -> Self {
-        Self { config, positions: RwLock::new(HashMap::new()) }
+        Self {
+            config,
+            positions: RwLock::new(HashMap::new()),
+        }
     }
 
     /// 预检：新开仓是否超限
     ///
     /// `side`: Buy = 增加暴露, Sell = 减少暴露
     /// `notional`: 名义价值 (USDC)
-    pub fn pre_check(&self, token_id: &str, side: crate::types::enums::Side, notional: f64) -> ClobResult<()> {
+    pub fn pre_check(
+        &self,
+        token_id: &str,
+        side: crate::types::enums::Side,
+        notional: f64,
+    ) -> ClobResult<()> {
         let positions = self.positions.read().unwrap();
         let current_pos = positions.get(token_id).map(|(_, v)| *v).unwrap_or(0.0);
 
@@ -193,7 +201,13 @@ impl PositionLimits {
     }
 
     /// 后检：更新持仓
-    pub fn post_check(&self, token_id: &str, side: crate::types::enums::Side, qty: f64, notional: f64) {
+    pub fn post_check(
+        &self,
+        token_id: &str,
+        side: crate::types::enums::Side,
+        qty: f64,
+        notional: f64,
+    ) {
         let mut positions = self.positions.write().unwrap();
         let entry = positions.entry(token_id.to_string()).or_insert((0.0, 0.0));
         match side {
@@ -210,12 +224,29 @@ impl PositionLimits {
 
     /// 当前全局暴露
     pub fn global_exposure(&self) -> f64 {
-        self.positions.read().unwrap().values().map(|(_, v)| *v).sum()
+        self.positions
+            .read()
+            .unwrap()
+            .values()
+            .map(|(_, v)| *v)
+            .sum()
     }
 
     /// 获取指定市场仓位
     pub fn market_position(&self, token_id: &str) -> Option<(f64, f64)> {
         self.positions.read().unwrap().get(token_id).copied()
+    }
+    /// 返回当前所有市场的仓位数量快照。
+    ///
+    /// key: token_id
+    /// value: token quantity
+    pub fn snapshot_positions(&self) -> HashMap<String, f64> {
+        self.positions
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(token_id, (quantity, _notional_usdc))| (token_id.clone(), *quantity))
+            .collect()
     }
 }
 
@@ -240,12 +271,18 @@ pub struct TimeWindowGuard {
 
 impl TimeWindowGuard {
     pub fn new(freeze_window: Duration) -> Self {
-        Self { freeze_window, settlements: RwLock::new(HashMap::new()) }
+        Self {
+            freeze_window,
+            settlements: RwLock::new(HashMap::new()),
+        }
     }
 
     /// 注册市场的结算时间
     pub fn set_settlement(&self, token_id: &str, unix_timestamp: u64) {
-        self.settlements.write().unwrap().insert(token_id.to_string(), unix_timestamp);
+        self.settlements
+            .write()
+            .unwrap()
+            .insert(token_id.to_string(), unix_timestamp);
     }
 
     /// 批量注册结算时间
@@ -266,7 +303,10 @@ impl TimeWindowGuard {
 
         let settlements = self.settlements.read().unwrap();
         if let Some(&settlement_ts) = settlements.get(token_id) {
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
             let time_until = settlement_ts.saturating_sub(now);
 
             if time_until <= self.freeze_window.as_secs() {
@@ -282,7 +322,10 @@ impl TimeWindowGuard {
 
     /// 列出即将结算的市场
     pub fn upcoming_settlements(&self) -> Vec<(String, u64)> {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         let threshold = now + self.freeze_window.as_secs();
         self.settlements
             .read()
@@ -402,7 +445,9 @@ impl DailyLossLimit {
     pub fn daily_drawdown(&self) -> f64 {
         let daily = *self.daily_pnl.read().unwrap();
         let peak = *self.daily_peak.read().unwrap();
-        if peak <= 0.0 { return 0.0; }
+        if peak <= 0.0 {
+            return 0.0;
+        }
         (peak - daily) / peak
     }
 }
@@ -453,13 +498,22 @@ impl OracleDisputeMonitor {
 
     /// 注入气象数据源的预期结果 (由 Python 策略引擎推送)
     pub fn set_expected_outcome(&self, token_id: &str, expected: f64) {
-        self.expected_outcomes.write().unwrap().insert(token_id.to_string(), expected);
+        self.expected_outcomes
+            .write()
+            .unwrap()
+            .insert(token_id.to_string(), expected);
     }
 
     /// 注入 UMA 结算结果 (由链上事件或 API 获取)
     pub fn set_uma_result(&self, token_id: &str, price: f64) {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        self.uma_results.write().unwrap().insert(token_id.to_string(), (price, now));
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.uma_results
+            .write()
+            .unwrap()
+            .insert(token_id.to_string(), (price, now));
     }
 
     /// 检测单个市场的预言机偏差
@@ -595,7 +649,11 @@ impl DrawdownTracker {
             *peak = equity;
         }
 
-        let drawdown = if *peak > 0.0 { (*peak - equity) / *peak } else { 0.0 };
+        let drawdown = if *peak > 0.0 {
+            (*peak - equity) / *peak
+        } else {
+            0.0
+        };
         let mut max_dd = self.max_drawdown.write().unwrap();
         if drawdown > *max_dd {
             *max_dd = drawdown;
@@ -734,7 +792,11 @@ impl RiskEngine {
         self.position_limits.pre_check(token_id, side, notional)?;
 
         // 4. 集中度检查 (仅在总暴露 > 2 倍单市场上限时生效，避免空仓第一笔被拦截)
-        let market_pos = self.position_limits.market_position(token_id).map(|(_, v)| v).unwrap_or(0.0);
+        let market_pos = self
+            .position_limits
+            .market_position(token_id)
+            .map(|(_, v)| v)
+            .unwrap_or(0.0);
         let new_market = if matches!(side, crate::types::enums::Side::Buy) {
             market_pos + notional
         } else {
@@ -767,7 +829,8 @@ impl RiskEngine {
         equity: f64,
     ) {
         // 更新持仓
-        self.position_limits.post_check(token_id, side, qty, notional);
+        self.position_limits
+            .post_check(token_id, side, qty, notional);
 
         // 更新日盈亏和熔断
         let level = self.daily_loss.report_pnl(pnl);
@@ -783,7 +846,28 @@ impl RiskEngine {
         // 更新回撤
         self.drawdown_tracker.update(equity);
     }
-
+    // ========================================================================
+    // 钩子 C: 真实成交后更新持仓
+    // ========================================================================
+    /// 真实成交后更新 RiskEngine 的仓位暴露。
+    ///
+    /// 与 post_check() 不同：
+    /// - 只更新 PositionLimits
+    /// - 不修改日 PnL
+    /// - 不修改 Equity / Drawdown
+    ///
+    /// 用于实时成交路径，避免在缺少可靠 PnL / Equity 数据时
+    /// 错误污染风控状态。
+    pub fn on_fill(
+        &self,
+        token_id: &str,
+        side: crate::types::enums::Side,
+        qty: f64,
+        notional: f64,
+    ) {
+        self.position_limits
+            .post_check(token_id, side, qty, notional);
+    }
     // ========================================================================
     // 辅助方法
     // ========================================================================
@@ -834,7 +918,12 @@ impl RiskEngine {
             peak_equity: self.drawdown_tracker.peak_equity(),
             gas_rejected: self.gas_protector.rejected_count(),
             upcoming_settlements: self.time_window.upcoming_settlements(),
-            oracle_alerts: self.oracle_monitor.check_all().into_iter().filter(|s| s.alert).count(),
+            oracle_alerts: self
+                .oracle_monitor
+                .check_all()
+                .into_iter()
+                .filter(|s| s.alert)
+                .count(),
         }
     }
 }
@@ -905,10 +994,14 @@ mod tests {
     fn test_position_limit_per_market() {
         let engine = make_engine();
         // 开仓 400 USDC (上限 500)
-        assert!(engine.pre_check("market-1", Side::Buy, 400.0, 400.0, 50).is_ok());
+        assert!(engine
+            .pre_check("market-1", Side::Buy, 400.0, 400.0, 50)
+            .is_ok());
         engine.post_check("market-1", Side::Buy, 400.0, 400.0, 0.0, 10000.0);
         // 再开 200 → 600 > 500 上限
-        assert!(engine.pre_check("market-1", Side::Buy, 200.0, 200.0, 50).is_err());
+        assert!(engine
+            .pre_check("market-1", Side::Buy, 200.0, 200.0, 50)
+            .is_err());
     }
 
     #[test]
@@ -935,7 +1028,10 @@ mod tests {
     #[test]
     fn test_settlement_freeze_new_buy() {
         let guard = TimeWindowGuard::new(Duration::from_secs(3600)); // 1h
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         // 30 分钟后结算 → 在冻结窗口内
         guard.set_settlement("near", now + 1800);
         assert!(guard.pre_check("near", Side::Buy).is_err());
@@ -944,16 +1040,22 @@ mod tests {
     #[test]
     fn test_settlement_freeze_sell_ok() {
         let guard = TimeWindowGuard::new(Duration::from_secs(3600));
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         guard.set_settlement("near", now + 600); // 10 分钟后结算
-        // Sell 始终允许
+                                                 // Sell 始终允许
         assert!(guard.pre_check("near", Side::Sell).is_ok());
     }
 
     #[test]
     fn test_settlement_far_future_ok() {
         let guard = TimeWindowGuard::new(Duration::from_secs(3600));
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         guard.set_settlement("far", now + 86400 * 7); // 7 天后
         assert!(guard.pre_check("far", Side::Buy).is_ok());
     }
@@ -1019,8 +1121,8 @@ mod tests {
     fn test_drawdown_tracking() {
         let dt = DrawdownTracker::new(0.05);
         dt.update(10000.0); // peak=10000
-        dt.update(9500.0);  // dd=5%
-        dt.update(9000.0);  // dd=10%
+        dt.update(9500.0); // dd=5%
+        dt.update(9000.0); // dd=10%
         dt.update(10500.0); // new peak
         let dd = dt.current_drawdown();
         assert!(dd >= 0.05);

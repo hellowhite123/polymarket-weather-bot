@@ -113,8 +113,7 @@ impl NonceTracker {
         self.pending_nonces.write().unwrap().remove(&nonce);
         // 推进 onchain nonce 到已确认的 nonce+1
         let new_onchain = nonce + 1;
-        self.onchain_nonce
-            .fetch_max(new_onchain, Ordering::AcqRel);
+        self.onchain_nonce.fetch_max(new_onchain, Ordering::AcqRel);
     }
 
     /// 标记 nonce 为失败（例如 tx reverted）
@@ -129,7 +128,13 @@ impl NonceTracker {
 
     /// 获取所有 pending nonce
     pub fn pending_nonces(&self) -> Vec<u64> {
-        let mut v: Vec<u64> = self.pending_nonces.read().unwrap().iter().copied().collect();
+        let mut v: Vec<u64> = self
+            .pending_nonces
+            .read()
+            .unwrap()
+            .iter()
+            .copied()
+            .collect();
         v.sort_unstable();
         v
     }
@@ -148,16 +153,13 @@ impl NonceTracker {
         self.onchain_nonce.store(max_nonce, Ordering::Release);
         *self.cache_expires_at.write().unwrap() = Instant::now() + self.cache_ttl;
         *self.last_sync.write().unwrap() = Instant::now();
-        tracing::info!(
-            "nonce_manager: 同步链上 nonce {} → {}",
-            old,
-            max_nonce
-        );
+        tracing::info!("nonce_manager: 同步链上 nonce {} → {}", old, max_nonce);
     }
 
     /// 重置追踪器状态（紧急恢复用）
     pub fn reset(&self, new_onchain_nonce: u64) {
-        self.onchain_nonce.store(new_onchain_nonce, Ordering::Release);
+        self.onchain_nonce
+            .store(new_onchain_nonce, Ordering::Release);
         self.pending_nonces.write().unwrap().clear();
         *self.cache_expires_at.write().unwrap() = Instant::now() + self.cache_ttl;
         *self.last_sync.write().unwrap() = Instant::now();
@@ -342,21 +344,18 @@ impl NonceManager {
         // 收集需要标记为 stuck 的条目
         let stuck_keys: Vec<u64> = stuck
             .iter()
-            .filter(|(_, entry)| {
-                now.duration_since(entry.sent_at) > self.stuck_timeout
-            })
+            .filter(|(_, entry)| now.duration_since(entry.sent_at) > self.stuck_timeout)
             .map(|(k, _)| *k)
             .collect();
 
         for nonce in stuck_keys {
             // 先检查是否已耗尽（用不可变借用）
-            let is_exhausted = stuck.get(&nonce).map_or(true, |e| e.exhausted(self.max_retries));
+            let is_exhausted = stuck
+                .get(&nonce)
+                .map_or(true, |e| e.exhausted(self.max_retries));
             if is_exhausted {
                 stuck.remove(&nonce);
-                tracing::warn!(
-                    "nonce_manager: 放弃 nonce={} (已重试达上限)",
-                    nonce,
-                );
+                tracing::warn!("nonce_manager: 放弃 nonce={} (已重试达上限)", nonce,);
             } else if let Some(entry) = stuck.get(&nonce) {
                 result.push(entry.clone());
             }
@@ -444,10 +443,7 @@ impl NonceManager {
             onchain_nonce: self.tracker.onchain_nonce(),
             pending_count: self.tracker.pending_count(),
             stuck_count: stuck.len(),
-            stuck_entries: stuck
-                .values()
-                .map(|e| (e.nonce, e.rbf_retries))
-                .collect(),
+            stuck_entries: stuck.values().map(|e| (e.nonce, e.rbf_retries)).collect(),
         }
     }
 }

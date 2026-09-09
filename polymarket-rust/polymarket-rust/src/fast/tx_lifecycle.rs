@@ -80,7 +80,10 @@ impl TxState {
     }
 
     pub fn is_active(&self) -> bool {
-        matches!(self, TxState::Submitted | TxState::Accepted | TxState::Pending)
+        matches!(
+            self,
+            TxState::Submitted | TxState::Accepted | TxState::Pending
+        )
     }
 }
 
@@ -240,16 +243,19 @@ impl TxTracker {
     /// 注册一笔新交易
     pub fn register(&self, entry: TxEntry) {
         tracing::debug!("tx_lifecycle: 注册交易 {}", entry.tx_hash);
-        self.entries.write().unwrap().insert(entry.tx_hash.clone(), entry);
+        self.entries
+            .write()
+            .unwrap()
+            .insert(entry.tx_hash.clone(), entry);
         self.total_registered.fetch_add(1, Ordering::Relaxed);
     }
 
     /// 手动更新交易状态（内部或外部驱动）
     pub fn update_state(&self, tx_hash: &str, new_state: TxState) -> ClobResult<()> {
         let mut entries = self.entries.write().unwrap();
-        let entry = entries.get_mut(tx_hash).ok_or_else(|| {
-            ClobError::OrderFailed(format!("交易 {} 未在追踪器中", tx_hash))
-        })?;
+        let entry = entries
+            .get_mut(tx_hash)
+            .ok_or_else(|| ClobError::OrderFailed(format!("交易 {} 未在追踪器中", tx_hash)))?;
 
         let old_state = entry.state;
         if old_state == new_state {
@@ -261,9 +267,15 @@ impl TxTracker {
 
         // 统计（忽略返回值）
         match new_state {
-            TxState::Confirmed => { self.total_confirmed.fetch_add(1, Ordering::Relaxed); }
-            TxState::Failed | TxState::Reverted => { self.total_failed.fetch_add(1, Ordering::Relaxed); }
-            TxState::Stale => { self.total_stale.fetch_add(1, Ordering::Relaxed); }
+            TxState::Confirmed => {
+                self.total_confirmed.fetch_add(1, Ordering::Relaxed);
+            }
+            TxState::Failed | TxState::Reverted => {
+                self.total_failed.fetch_add(1, Ordering::Relaxed);
+            }
+            TxState::Stale => {
+                self.total_stale.fetch_add(1, Ordering::Relaxed);
+            }
             _ => {}
         };
 

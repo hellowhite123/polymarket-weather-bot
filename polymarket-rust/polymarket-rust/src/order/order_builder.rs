@@ -7,9 +7,7 @@ use crate::clob::error::ClobResult;
 use crate::clob::signing::{generate_order_salt, sign_order};
 use crate::types::clob_types::{Order, SignedOrder, UserOrder};
 use crate::types::enums::{Side, SignatureType};
-use crate::types::order::{
-    round_config_for, CreateOrderOptions, RoundConfig, COLLATERAL_DECIMALS,
-};
+use crate::types::order::{round_config_for, CreateOrderOptions, RoundConfig, COLLATERAL_DECIMALS};
 use ethers::signers::{LocalWallet, Signer};
 use ethers::utils::parse_units;
 
@@ -22,7 +20,11 @@ pub struct OrderBuilder {
 
 impl OrderBuilder {
     /// 创建订单构建器
-    pub fn new(chain_id: u64, signature_type: SignatureType, funder_address: Option<String>) -> Self {
+    pub fn new(
+        chain_id: u64,
+        signature_type: SignatureType,
+        funder_address: Option<String>,
+    ) -> Self {
         Self {
             chain_id,
             signature_type,
@@ -39,8 +41,12 @@ impl OrderBuilder {
     ) -> ClobResult<SignedOrder> {
         let round_config = round_config_for(options.tick_size);
 
-        let (side_u8, raw_maker_amt, raw_taker_amt) =
-            get_order_raw_amounts(user_order.side, user_order.size, user_order.price, round_config);
+        let (side_u8, raw_maker_amt, raw_taker_amt) = get_order_raw_amounts(
+            user_order.side,
+            user_order.size,
+            user_order.price,
+            round_config,
+        );
 
         let maker_amount = to_wei_string(raw_maker_amt, COLLATERAL_DECIMALS);
         let taker_amount = to_wei_string(raw_taker_amt, COLLATERAL_DECIMALS);
@@ -88,12 +94,7 @@ impl OrderBuilder {
 }
 
 /// 计算限价单的原始金额
-fn get_order_raw_amounts(
-    side: Side,
-    size: f64,
-    price: f64,
-    config: RoundConfig,
-) -> (u8, f64, f64) {
+fn get_order_raw_amounts(side: Side, size: f64, price: f64, config: RoundConfig) -> (u8, f64, f64) {
     let raw_price = round_normal(price, config.price);
 
     match side {

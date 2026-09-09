@@ -118,8 +118,10 @@ mod tests {
             side: 0,
             signature_type: 0,
         };
-        let hash1 = order_typed_data_hash(&order, 137, "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E");
-        let hash2 = order_typed_data_hash(&order, 137, "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E");
+        let hash1 =
+            order_typed_data_hash(&order, 137, "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E");
+        let hash2 =
+            order_typed_data_hash(&order, 137, "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E");
         assert_eq!(hash1, hash2);
     }
 
@@ -143,7 +145,13 @@ mod tests {
             side: 0,
             signature_type: 0,
         };
-        let sig = sign_order(&wallet, &order, 137, "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E").unwrap();
+        let sig = sign_order(
+            &wallet,
+            &order,
+            137,
+            "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E",
+        )
+        .unwrap();
         assert!(sig.starts_with("0x"));
         assert_eq!(sig.len(), 132);
     }

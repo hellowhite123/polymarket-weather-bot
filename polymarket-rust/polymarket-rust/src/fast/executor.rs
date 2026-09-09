@@ -289,13 +289,12 @@ impl FastExecutor {
     /// - 1 次 HTTP/2 连接建立（DNS + TCP + TLS 三连击）
     ///
     /// 把它们全部挡在交易时段之外。
-    pub async fn init_api_key(
-        &mut self,
-        address: &str,
-        password: &str,
-    ) -> ClobResult<ApiKeyCreds> {
+    pub async fn init_api_key(&mut self, address: &str, password: &str) -> ClobResult<ApiKeyCreds> {
         // 1. L1 认证：创建/派生 API Key
-        let creds = self.client.create_or_derive_api_key(address, password).await?;
+        let creds = self
+            .client
+            .create_or_derive_api_key(address, password)
+            .await?;
         self.client.set_api_creds(creds.clone());
 
         // 2. 预热 EIP-712 域分隔符（4 种 chain×negRisk 组合）
@@ -341,7 +340,9 @@ impl FastExecutor {
         lat: &mut OrderLatency,
     ) -> ClobResult<(SignedOrder, ExecutionSource)> {
         let t = StageTimer::start();
-        let order = self.client.build_unsigned_order(wallet, user_order, options)?;
+        let order = self
+            .client
+            .build_unsigned_order(wallet, user_order, options)?;
         t.stop(lat, Stage::BuildOrder);
 
         let t = StageTimer::start();
@@ -349,7 +350,10 @@ impl FastExecutor {
         let signature = sign_order(wallet, &order, self.chain.id(), verifying)?;
         t.stop(lat, Stage::Sign);
 
-        Ok((SignedOrder { order, signature }, ExecutionSource::LiveSigned))
+        Ok((
+            SignedOrder { order, signature },
+            ExecutionSource::LiveSigned,
+        ))
     }
 
     /// 执行一笔快速下单
@@ -364,14 +368,9 @@ impl FastExecutor {
             let t = StageTimer::start();
             let w = match &params.password {
                 Some(pw) => self.hot.get_or_unlock(&params.wallet_address, pw)?,
-                None => self
-                    .hot
-                    .get(&params.wallet_address)
-                    .ok_or_else(|| {
-                        ClobError::OrderFailed(
-                            "热钱包未预热且未提供密码，无法解锁".to_string(),
-                        )
-                    })?,
+                None => self.hot.get(&params.wallet_address).ok_or_else(|| {
+                    ClobError::OrderFailed("热钱包未预热且未提供密码，无法解锁".to_string())
+                })?,
             };
             t.stop(&mut lat, Stage::WalletUnlock);
             w
@@ -416,7 +415,8 @@ impl FastExecutor {
             if pending > local + 10 {
                 tracing::warn!(
                     "nonce 偏差过大: local={}, pending={}, 可能 stuck tx",
-                    local, pending
+                    local,
+                    pending
                 );
             }
         }
@@ -520,7 +520,8 @@ impl FastExecutor {
         // --- ★ FillLedger: 记录完整成交记录（下单时间/成交时间/价格/数量/滑点/手续费）---
         if let Some(ref ledger) = self.fill_ledger {
             if resp.success && !resp.orderID.is_empty() {
-                let filled_price = if !resp.makingAmount.is_empty() && !resp.takingAmount.is_empty() {
+                let filled_price = if !resp.makingAmount.is_empty() && !resp.takingAmount.is_empty()
+                {
                     resp.makingAmount.parse::<f64>().unwrap_or(0.0)
                         / resp.takingAmount.parse::<f64>().unwrap_or(1.0)
                 } else {
@@ -604,7 +605,9 @@ impl FastExecutor {
                 expiration: None,
                 taker: None,
             };
-            let order = self.client.build_unsigned_order(&wallet, &user_order, &options)?;
+            let order = self
+                .client
+                .build_unsigned_order(&wallet, &user_order, &options)?;
             let verifying = get_exchange_address(self.chain, options.neg_risk);
             let signature = sign_order(&wallet, &order, self.chain.id(), verifying)?;
             let signed = SignedOrder { order, signature };
@@ -675,6 +678,17 @@ impl FastExecutor {
     pub fn mempool_monitor(&self) -> Option<&Arc<MempoolMonitor>> {
         self.mempool.as_ref()
     }
+
+    /// 获取 CLOB 客户端（用于共享认证上下文）
+    pub fn clob_client(&self) -> &ClobClient {
+        &self.client
+    }
+
+    /// 获取热钱包（用于 StateSync L2 认证）
+    /// 获取热钱包（用于 StateSync L2 认证）
+    pub fn wallet(&self, address: &str) -> Option<Arc<LocalWallet>> {
+        self.hot.get(address)
+    }
 }
 
 #[cfg(test)]
@@ -718,7 +732,10 @@ mod tests {
             tick_size: TickSize::Point01,
             neg_risk: false,
         };
-        let order = exec.client().build_unsigned_order(&wallet, &uo, &opts).unwrap();
+        let order = exec
+            .client()
+            .build_unsigned_order(&wallet, &uo, &opts)
+            .unwrap();
         assert_eq!(order.side, 0); // BUY
         assert_eq!(order.signature_type, 0); // EOA
         assert!(!order.salt.is_empty());
@@ -752,13 +769,17 @@ mod tests {
             tick_size: TickSize::Point01,
             neg_risk: false,
         };
-        let (signed, src) = exec.build_and_sign(&wallet, &uo, &opts, &mut OrderLatency::new()).await.unwrap();
+        let (signed, src) = exec
+            .build_and_sign(&wallet, &uo, &opts, &mut OrderLatency::new())
+            .await
+            .unwrap();
         assert_eq!(src, ExecutionSource::LiveSigned);
         assert!(signed.signature.starts_with("0x"));
         assert_eq!(signed.signature.len(), 132);
         // 验证签名能被规范 digest 路径复现
         let verifying = get_exchange_address(Chain::Polygon, false);
-        let digest = signing_cache::fast_order_digest(&signed.order, Chain::Polygon.id(), verifying);
+        let digest =
+            signing_cache::fast_order_digest(&signed.order, Chain::Polygon.id(), verifying);
         assert_eq!(digest.as_bytes().len(), 32);
     }
 

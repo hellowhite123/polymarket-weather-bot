@@ -16,8 +16,10 @@ use tonic::{Request, Response, Status};
 use crate::clob::client::ClobConfig;
 use crate::fast::executor::FastExecutor;
 use crate::fast::fill_records::{compute_slippage, FillLedger, FillRecord};
+use crate::fast::market_events::TradeEvent;
 use crate::fast::order_state::{OrderState, OrderStore};
 use crate::fast::risk_engine::{RiskConfig, RiskEngine};
+use crate::fast::trading_gate::TradingGate;
 use crate::order::{OrderFlow, PlaceOrderParams};
 use crate::types::enums::{OrderType, Side};
 use crate::wallet::WalletManager;
@@ -37,10 +39,31 @@ fn direction_to_side(direction: i32) -> Result<Side, Status> {
     match direction {
         x if x == pb::Direction::BuyYes as i32 => Ok(Side::Buy),
         x if x == pb::Direction::BuyNo as i32 => Ok(Side::Buy),
-        _ => Err(Status::invalid_argument(format!(
-            "未知方向: {}",
-            direction
-        ))),
+        _ => Err(Status::invalid_argument(format!("未知方向: {}", direction))),
+    }
+}
+
+/// 已有订单状态 → 幂等返回的 OrderResult。
+fn existing_order_result(existing: &crate::fast::order_state::OrderState) -> pb::OrderResult {
+    use crate::fast::order_state::OrderStateStatus;
+    let status = match existing.status {
+        OrderStateStatus::Filled => pb::ExecutionStatus::Filled as i32,
+        OrderStateStatus::PartialFilled => pb::ExecutionStatus::Partial as i32,
+        OrderStateStatus::Live => pb::ExecutionStatus::Live as i32,
+        OrderStateStatus::Rejected => pb::ExecutionStatus::Rejected as i32,
+        OrderStateStatus::Cancelled => pb::ExecutionStatus::Cancelled as i32,
+        _ => pb::ExecutionStatus::Pending as i32,
+    };
+    pb::OrderResult {
+        order_id: existing.client_order_id.clone(),
+        success: true,
+        exchange_order_id: existing.exchange_order_id.clone().unwrap_or_default(),
+        error_message: String::new(),
+        timestamp: Utc::now().to_rfc3339(),
+        filled_price: 0.0,
+        filled_size: existing.filled_size,
+        status,
+        ..Default::default()
     }
 }
 
@@ -74,7 +97,13 @@ fn map_execution_status(status: &str, success: bool) -> pb::ExecutionStatus {
 ///
 /// - matched → 从 making/taking 推导真实成交数量（R2-P0-03：matched ≠ 全额）
 /// - live/pending 等 → 0（未成交）
-fn filled_size_from_status(status: &str, requested: f64, side: Side, making: &str, taking: &str) -> f64 {
+fn filled_size_from_status(
+    status: &str,
+    requested: f64,
+    side: Side,
+    making: &str,
+    taking: &str,
+) -> f64 {
     match status.to_lowercase().as_str() {
         "matched" => derive_filled_size(side, making, taking).unwrap_or(0.0),
         _ => 0.0,
@@ -116,6 +145,7 @@ fn derive_price(side: Side, making: &str, taking: &str) -> Option<f64> {
 }
 
 /// 执行服务实现。
+#[derive(Clone)]
 pub struct ExecutionServiceImpl {
     /// 下单流程 (内部封装了 ClobClient + WalletManager)
     order_flow: Arc<Mutex<OrderFlow>>,
@@ -150,6 +180,9 @@ pub struct ExecutionServiceImpl {
 
     /// 订单状态存储 —— 状态机 + 幂等去重（R2-P0-05/06）。
     order_store: Arc<OrderStore>,
+
+    /// 交易闸门 —— 未达到 READY 时禁止新订单进入执行路径。
+    trading_gate: Arc<TradingGate>,
 
     /// 风控引擎（可选）—— 挂载后 place_order 强制走 pre_check（R2-P0-08）。
     risk_engine: Option<Arc<RiskEngine>>,
@@ -212,6 +245,7 @@ impl ExecutionServiceImpl {
         wallet_manager: Arc<WalletManager>,
         wallet_address: String,
         password: String,
+        trading_gate: Arc<TradingGate>,
     ) -> Self {
         Self {
             order_flow: Arc::new(Mutex::new(order_flow)),
@@ -228,10 +262,22 @@ impl ExecutionServiceImpl {
             fast_executor: None,
             fill_ledger: Arc::new(FillLedger::new()),
             order_store: Arc::new(OrderStore::new()),
+            trading_gate,
             risk_engine: None,
         }
     }
-
+    /// 获取当前本地仍处于活动状态的远端订单 ID。
+    ///
+    /// 用于 StateSync 启动对账。
+    pub fn snapshot_pending_exchange_order_ids(&self) -> std::collections::HashSet<String> {
+        self.order_store.pending_exchange_order_ids()
+    }
+    /// 获取当前本地风险状态中的仓位快照。
+    ///
+    /// 用于 StateSync 启动对账。
+    pub async fn snapshot_positions(&self) -> std::collections::HashMap<String, f64> {
+        self.risk_state.lock().await.positions.clone()
+    }
     /// 创建用于测试的 Mock 实例 (不连接真实 API)。
     pub fn new_mock() -> Self {
         let wallet_mgr = Arc::new(WalletManager::new("keystore_mock.json"));
@@ -251,6 +297,7 @@ impl ExecutionServiceImpl {
             fast_executor: None,
             fill_ledger: Arc::new(FillLedger::new()),
             order_store: Arc::new(OrderStore::new()),
+            trading_gate: Arc::new(TradingGate::new()),
             risk_engine: None,
         }
     }
@@ -288,6 +335,60 @@ impl ExecutionServiceImpl {
     pub fn settle_token(&self, token_id: &str, outcome: f64) -> usize {
         self.fill_ledger.settle_by_token(token_id, outcome)
     }
+
+    /// P1-006：异步成交同步。
+    ///
+    /// 将 market_events 轮询到的成交事件（TradeEvent）同步到：
+    /// 1. RiskEngine 权威仓位（on_fill）
+    /// 2. 内部 risk_state 快照（保持与 snapshot_positions 一致）
+    /// 3. FillLedger 成交账簿
+    /// 4. OrderStore 订单状态
+    pub async fn on_market_trade(&self, trade: &TradeEvent) {
+        let side = match trade.side.as_str() {
+            "BUY" => Side::Buy,
+            "SELL" => Side::Sell,
+            _ => {
+                tracing::warn!("忽略未知 side 的成交事件: {}", trade.side);
+                return;
+            }
+        };
+
+        let notional = trade.price * trade.size;
+
+        // 1. RiskEngine 权威仓位
+        if let Some(re) = self.risk_engine.as_ref() {
+            re.on_fill(&trade.token_id, side, trade.size, notional);
+        }
+
+        // 2. 内部 risk_state 快照
+        {
+            let mut rs = self.risk_state.lock().await;
+            let entry = rs.positions.entry(trade.token_id.clone()).or_insert(0.0);
+            match side {
+                Side::Buy => *entry += trade.size,
+                Side::Sell => *entry -= trade.size,
+            }
+        }
+
+        // 3. FillLedger 成交账簿
+        if !trade.order_id.is_empty() {
+            let mut rec = FillRecord::new(
+                trade.order_id.clone(),
+                trade.token_id.clone(),
+                trade.side.clone(),
+                trade.price,
+                trade.size,
+            );
+            rec.mark_filled(trade.price, 0.0);
+            self.fill_ledger.record(rec);
+        }
+
+        // 4. OrderStore 订单状态
+        if let Some(mut st) = self.order_store.get(&trade.order_id) {
+            st.update_fill(trade.size);
+            self.order_store.upsert(st);
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -298,33 +399,38 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
         request: Request<pb::AggregatedOrder>,
     ) -> Result<Response<pb::OrderResult>, Status> {
         let order = request.into_inner();
+        self.trading_gate
+            .ensure_ready()
+            .map_err(Status::failed_precondition)?;
 
-        // ★ R2-P0-06 幂等：order_id 已存在则返回已有状态，不重复下单
+        // 方向转换（提前到幂等检查之前，供原子占位使用）
+        let side = direction_to_side(order.direction)?;
+
+        // ★ P0-004 幂等：先查已有，再原子 claim 占位，并发下只允许一个请求下单
         if !order.order_id.is_empty() {
             if let Some(existing) = self.order_store.get(&order.order_id) {
                 tracing::info!(
                     "order_id={} 已存在（幂等去重），返回已有状态 {}",
-                    order.order_id, existing.status
+                    order.order_id,
+                    existing.status
                 );
-                let status = match existing.status {
-                    crate::fast::order_state::OrderStateStatus::Filled => pb::ExecutionStatus::Filled as i32,
-                    crate::fast::order_state::OrderStateStatus::PartialFilled => pb::ExecutionStatus::Partial as i32,
-                    crate::fast::order_state::OrderStateStatus::Live => pb::ExecutionStatus::Live as i32,
-                    crate::fast::order_state::OrderStateStatus::Rejected => pb::ExecutionStatus::Rejected as i32,
-                    crate::fast::order_state::OrderStateStatus::Cancelled => pb::ExecutionStatus::Cancelled as i32,
-                    _ => pb::ExecutionStatus::Pending as i32,
-                };
-                return Ok(Response::new(pb::OrderResult {
-                    order_id: order.order_id.clone(),
-                    success: true,
-                    exchange_order_id: existing.exchange_order_id.unwrap_or_default(),
-                    error_message: String::new(),
-                    timestamp: Utc::now().to_rfc3339(),
-                    filled_price: 0.0,
-                    filled_size: existing.filled_size,
-                    status,
-                    ..Default::default()
-                }));
+                return Ok(Response::new(existing_order_result(&existing)));
+            }
+            // 原子占位：首次返回 Some；并发穿透者返回 None（已被抢先占位）
+            if self
+                .order_store
+                .claim(
+                    order.order_id.clone(),
+                    order.token_id.clone(),
+                    side.as_str().to_string(),
+                    order.quantity,
+                )
+                .is_none()
+            {
+                if let Some(existing) = self.order_store.get(&order.order_id) {
+                    tracing::info!("order_id={} 并发去重命中，返回已有状态", order.order_id);
+                    return Ok(Response::new(existing_order_result(&existing)));
+                }
             }
         }
 
@@ -347,8 +453,11 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
         if order.paper_trading {
             tracing::info!(
                 "[PAPER] 纸面下单: order_id={}, token={}, price={}, qty={}, conf={:.2}",
-                order.order_id, order.token_id, order.target_price,
-                order.quantity, order.confidence,
+                order.order_id,
+                order.token_id,
+                order.target_price,
+                order.quantity,
+                order.confidence,
             );
             let ex_id = format!("paper_{}", order.order_id);
             let side_str = match order.direction {
@@ -403,19 +512,21 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
             }
         }
 
-        // 方向转换
-        let side = direction_to_side(order.direction)?;
+        // ★ R2-P0-08：RiskEngine 必须存在，缺失时 FAIL-CLOSED
+        let re = match self.risk_engine.as_ref() {
+            Some(re) => re,
+            None => {
+                tracing::error!(
+                    "RiskEngine 未初始化，拒绝实时订单: order_id={}, token={}",
+                    order.order_id,
+                    order.token_id
+                );
 
-        // ★ R2-P0-08 风控：RiskEngine pre_check 强制接入（熔断/仓位硬限制/时间窗口等）
-        if let Some(ref re) = self.risk_engine {
-            let notional = order.quantity * order.target_price;
-            if let Err(e) = re.pre_check(&order.token_id, side, notional, order.quantity, 0) {
-                tracing::warn!("风控预检拦截: token={}, {}", order.token_id, e);
                 return Ok(Response::new(pb::OrderResult {
                     order_id: order.order_id.clone(),
                     success: false,
                     exchange_order_id: String::new(),
-                    error_message: format!("风控预检拦截: {}", e),
+                    error_message: "RiskEngine 未初始化，禁止实时交易".to_string(),
                     timestamp: Utc::now().to_rfc3339(),
                     filled_price: 0.0,
                     filled_size: 0.0,
@@ -423,6 +534,24 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
                     ..Default::default()
                 }));
             }
+        };
+
+        let notional = order.quantity * order.target_price;
+
+        if let Err(e) = re.pre_check(&order.token_id, side, notional, order.quantity, 0) {
+            tracing::warn!("风控预检拦截: token={}, {}", order.token_id, e);
+
+            return Ok(Response::new(pb::OrderResult {
+                order_id: order.order_id.clone(),
+                success: false,
+                exchange_order_id: String::new(),
+                error_message: format!("风控预检拦截: {}", e),
+                timestamp: Utc::now().to_rfc3339(),
+                filled_price: 0.0,
+                filled_size: 0.0,
+                status: pb::ExecutionStatus::Rejected as i32,
+                ..Default::default()
+            }));
         }
 
         // 亚秒级 fast path：若已挂载 FastExecutor，走热路径（缓存命中时本地 < 1ms）
@@ -448,30 +577,38 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
                     let execution_status = map_execution_status(&result.response.status, success);
                     // R2-P0-03/21：从 making/taking 按 side 推导真实 fill 与成交价
                     let filled_size = filled_size_from_status(
-                        &result.response.status, order.quantity, side,
-                        &result.response.makingAmount, &result.response.takingAmount,
+                        &result.response.status,
+                        order.quantity,
+                        side,
+                        &result.response.makingAmount,
+                        &result.response.takingAmount,
                     );
                     let filled_price = derive_price(
-                        side, &result.response.makingAmount, &result.response.takingAmount,
-                    ).unwrap_or(order.target_price);
-                    let (slippage, slippage_pct) = compute_slippage(order.target_price, filled_price, filled_size);
+                        side,
+                        &result.response.makingAmount,
+                        &result.response.takingAmount,
+                    )
+                    .unwrap_or(order.target_price);
+                    let (slippage, slippage_pct) =
+                        compute_slippage(order.target_price, filled_price, filled_size);
 
                     // 记录订单状态（R2-P0-05 状态机）
                     if !order.order_id.is_empty() {
-                        let mut st = self.order_store
-                            .get(&order.order_id)
-                            .unwrap_or_else(|| self.order_store.create(
+                        let mut st = self.order_store.get(&order.order_id).unwrap_or_else(|| {
+                            self.order_store.create(
                                 order.order_id.clone(),
                                 order.token_id.clone(),
                                 side.as_str().to_string(),
                                 order.quantity,
-                            ));
+                            )
+                        });
                         if !exchange_order_id.is_empty() {
                             st.mark_submitted(exchange_order_id.clone());
                         }
                         if filled_size > 0.0 {
                             st.update_fill(filled_size);
-                        } else if st.status == crate::fast::order_state::OrderStateStatus::Submitted {
+                        } else if st.status == crate::fast::order_state::OrderStateStatus::Submitted
+                        {
                             st.mark_live();
                         }
                         self.order_store.upsert(st);
@@ -482,7 +619,12 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
                         let mut rs = self.risk_state.lock().await;
                         *rs.positions.entry(order.token_id.clone()).or_insert(0.0) += filled_size;
                     }
+                    // ★ P0-04：真实成交同步到 RiskEngine authoritative position state
+                    if filled_size > 0.0 {
+                        let filled_notional = filled_size * filled_price;
 
+                        re.on_fill(&order.token_id, side, filled_size, filled_notional);
+                    }
                     // 记录成交：只有真实 fill 才记（P0-04）
                     if filled_size > 0.0 && !exchange_order_id.is_empty() {
                         let mut rec = FillRecord::new(
@@ -530,118 +672,22 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
             }
         }
 
-        tracing::info!(
-            "收到下单指令: order_id={}, token={}, direction={:?}, price={}, qty={}",
-            order.order_id,
-            order.token_id,
-            pb::Direction::try_from(order.direction).unwrap_or(pb::Direction::Unspecified),
-            order.target_price,
-            order.quantity,
+        tracing::error!(
+            "FastExecutor 未初始化，拒绝实时订单，禁止降级到普通 OrderFlow: order_id={}",
+            order.order_id
         );
 
-        // 构建 PlaceOrderParams
-        let params = PlaceOrderParams {
-            wallet_address: self.wallet_address.clone(),
-            password: self.password.clone(),
-            token_id: order.token_id.clone(),
-            price: order.target_price,
-            size: order.quantity,
-            side,
-            tick_size: None,     // 从 API 获取
-            neg_risk: None,      // 默认 false
-            order_type: Some(OrderType::GTC),  // 默认 GTC
-        };
-
-        // 执行下单
-        let mut flow = self.order_flow.lock().await;
-        match flow.place_order(params).await {
-            Ok(response) => {
-                // 状态机：accepted ≠ filled（P0-03）
-                let execution_status = map_execution_status(&response.status, response.success);
-                // R2-P0-03/21：从 making/taking 按 side 推导真实 fill 与成交价
-                let filled_size = filled_size_from_status(
-                    &response.status, order.quantity, side,
-                    &response.makingAmount, &response.takingAmount,
-                );
-                let filled_price = derive_price(
-                    side, &response.makingAmount, &response.takingAmount,
-                ).unwrap_or(order.target_price);
-
-                // 滑点计算
-                let (slippage, slippage_pct) = compute_slippage(order.target_price, filled_price, filled_size);
-
-                // 记录订单状态（R2-P0-05 状态机）
-                if !order.order_id.is_empty() {
-                    let mut st = self.order_store
-                        .get(&order.order_id)
-                        .unwrap_or_else(|| self.order_store.create(
-                            order.order_id.clone(),
-                            order.token_id.clone(),
-                            side.as_str().to_string(),
-                            order.quantity,
-                        ));
-                    if !response.orderID.is_empty() {
-                        st.mark_submitted(response.orderID.clone());
-                    }
-                    if filled_size > 0.0 {
-                        st.update_fill(filled_size);
-                    } else if st.status == crate::fast::order_state::OrderStateStatus::Submitted {
-                        st.mark_live();
-                    }
-                    self.order_store.upsert(st);
-                }
-
-                // 风控：只有真实 fill 才更新持仓（P0-03/04）
-                if filled_size > 0.0 {
-                    let mut rs = self.risk_state.lock().await;
-                    *rs.positions.entry(order.token_id.clone()).or_insert(0.0) += filled_size;
-                }
-
-                // 记录成交：只有真实 fill 才记（P0-04）
-                if filled_size > 0.0 && !response.orderID.is_empty() {
-                    let mut rec = FillRecord::new(
-                        response.orderID.clone(),
-                        order.token_id.clone(),
-                        side.as_str().to_string(),
-                        order.target_price,
-                        filled_size,
-                    );
-                    rec.mark_filled(filled_price, 0.0);
-                    self.fill_ledger.record(rec);
-                }
-
-                Ok(Response::new(pb::OrderResult {
-                    order_id: order.order_id.clone(),
-                    success: response.success,
-                    exchange_order_id: response.orderID.clone(),
-                    error_message: response.errorMsg.clone(),
-                    timestamp: Utc::now().to_rfc3339(),
-                    filled_price,
-                    filled_size,
-                    status: execution_status as i32,
-                    filled_at: Utc::now().to_rfc3339(),
-                    settled_at: String::new(),
-                    slippage,
-                    slippage_pct,
-                    fee: 0.0,
-                    pnl: 0.0,
-                }))
-            }
-            Err(e) => {
-                tracing::error!("下单失败: {}", e);
-                Ok(Response::new(pb::OrderResult {
-                    order_id: order.order_id.clone(),
-                    success: false,
-                    exchange_order_id: String::new(),
-                    error_message: format!("下单失败: {}", e),
-                    timestamp: Utc::now().to_rfc3339(),
-                    filled_price: 0.0,
-                    filled_size: 0.0,
-                    status: pb::ExecutionStatus::Rejected as i32,
-                    ..Default::default()
-                }))
-            }
-        }
+        return Ok(Response::new(pb::OrderResult {
+            order_id: order.order_id.clone(),
+            success: false,
+            exchange_order_id: String::new(),
+            error_message: "FastExecutor 未初始化，禁止进入普通交易路径".to_string(),
+            timestamp: Utc::now().to_rfc3339(),
+            filled_price: 0.0,
+            filled_size: 0.0,
+            status: pb::ExecutionStatus::Rejected as i32,
+            ..Default::default()
+        }));
     }
 
     /// 批量下单。
@@ -653,10 +699,7 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
         let mut results = Vec::with_capacity(orders.len());
 
         for order in orders {
-            let result = self
-                .place_order(Request::new(order))
-                .await?
-                .into_inner();
+            let result = self.place_order(Request::new(order)).await?.into_inner();
             results.push(result);
         }
 
@@ -689,6 +732,8 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
     }
 
     /// 取消所有订单。
+
+    /// 取消所有订单。
     async fn cancel_all(
         &self,
         _request: Request<pb::CancelAllRequest>,
@@ -696,19 +741,11 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
         let flow = self.order_flow.lock().await;
 
         match flow.cancel_all(&self.wallet_address, &self.password).await {
-            Ok(()) => {
-                let count = {
-                    let mut rs = self.risk_state.lock().await;
-                    let n = rs.positions.len() as i32;
-                    rs.positions.clear();
-                    n
-                };
-                Ok(Response::new(pb::CancelResult {
-                    success: true,
-                    message: format!("已取消 {} 个订单", count),
-                    cancelled_count: count,
-                }))
-            }
+            Ok(()) => Ok(Response::new(pb::CancelResult {
+                success: true,
+                message: "已取消全部未成交订单，持仓保持不变".to_string(),
+                cancelled_count: 0,
+            })),
             Err(e) => Ok(Response::new(pb::CancelResult {
                 success: false,
                 message: format!("取消全部失败: {}", e),
@@ -727,8 +764,9 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
     }
 
     /// 流式推送风控状态更新。
-    type StreamRiskStateUpdatesStream =
-        std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<pb::RiskStateUpdate, Status>> + Send>>;
+    type StreamRiskStateUpdatesStream = std::pin::Pin<
+        Box<dyn tokio_stream::Stream<Item = Result<pb::RiskStateUpdate, Status>> + Send>,
+    >;
 
     async fn stream_risk_state_updates(
         &self,
@@ -936,8 +974,14 @@ mod tests {
     #[test]
     fn test_filled_size_live_zero() {
         // P0-04 核心：live 订单不是 fill，filled_size 必须为 0
-        assert_eq!(filled_size_from_status("live", 10.0, Side::Buy, "", ""), 0.0);
-        assert_eq!(filled_size_from_status("pending", 10.0, Side::Buy, "", ""), 0.0);
+        assert_eq!(
+            filled_size_from_status("live", 10.0, Side::Buy, "", ""),
+            0.0
+        );
+        assert_eq!(
+            filled_size_from_status("pending", 10.0, Side::Buy, "", ""),
+            0.0
+        );
         assert_eq!(filled_size_from_status("", 10.0, Side::Buy, "", ""), 0.0);
     }
 
@@ -958,5 +1002,33 @@ mod tests {
 
         let side_yes = direction_to_side(pb::Direction::BuyYes as i32).unwrap();
         assert_eq!(side_yes, Side::Buy);
+    }
+
+    #[tokio::test]
+    async fn test_on_market_trade_updates_fill_ledger_and_risk() {
+        let mut service = ExecutionServiceImpl::new_mock();
+        let risk_engine = Arc::new(RiskEngine::new(RiskConfig::default()));
+        service.set_risk_engine(risk_engine);
+
+        let trade = TradeEvent {
+            token_id: "token-1".to_string(),
+            trade_id: "trade-1".to_string(),
+            order_id: "order-1".to_string(),
+            side: "BUY".to_string(),
+            price: 0.5,
+            size: 10.0,
+            timestamp: 0,
+            taker_order_id: "order-1".to_string(),
+            maker_order_id: "maker-1".to_string(),
+        };
+
+        service.on_market_trade(&trade).await;
+
+        // FillLedger 记录 1 条
+        assert_eq!(service.fill_ledger().list().len(), 1);
+
+        // risk_state 仓位更新（BUY +10）
+        let rs = service.risk_state.lock().await;
+        assert_eq!(rs.positions.get("token-1").copied().unwrap_or(0.0), 10.0);
     }
 }

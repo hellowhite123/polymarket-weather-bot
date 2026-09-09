@@ -302,7 +302,10 @@ impl Drop for HotWalletCache {
 /// 地址归一化：统一小写，容忍带不带 0x 前缀的差异
 fn normalize(address: &str) -> String {
     let a = address.trim();
-    let a = a.strip_prefix("0x").or_else(|| a.strip_prefix("0X")).unwrap_or(a);
+    let a = a
+        .strip_prefix("0x")
+        .or_else(|| a.strip_prefix("0X"))
+        .unwrap_or(a);
     format!("0x{}", a.to_ascii_lowercase())
 }
 
@@ -363,7 +366,10 @@ mod tests {
             "热路径应显著快于冷路径: cold={cold:?}, hot={hot:?}"
         );
         // 热路径必须是亚毫秒
-        assert!(hot < Duration::from_millis(1), "热路径耗时 {hot:?} 超过 1ms");
+        assert!(
+            hot < Duration::from_millis(1),
+            "热路径耗时 {hot:?} 超过 1ms"
+        );
 
         let s = cache.stats();
         assert_eq!(s.hits, 1);

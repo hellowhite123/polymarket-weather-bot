@@ -7,8 +7,13 @@ use serde::{Deserialize, Serialize};
 /// API Key credentials (for L2 auth)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiKeyCreds {
+    #[serde(default, rename = "apiKey")]
     pub key: String,
+
+    #[serde(default)]
     pub secret: String,
+
+    #[serde(default)]
     pub passphrase: String,
 }
 
@@ -55,14 +60,14 @@ pub struct Order {
     pub maker: String,
     pub signer: String,
     pub taker: String,
-    pub token_id: String, // uint256
+    pub token_id: String,     // uint256
     pub maker_amount: String, // uint256
     pub taker_amount: String, // uint256
-    pub expiration: String, // uint256
-    pub nonce: String, // uint256
+    pub expiration: String,   // uint256
+    pub nonce: String,        // uint256
     pub fee_rate_bps: String, // uint256
-    pub side: u8, // uint8
-    pub signature_type: u8, // uint8
+    pub side: u8,             // uint8
+    pub signature_type: u8,   // uint8
 }
 
 /// Signed order

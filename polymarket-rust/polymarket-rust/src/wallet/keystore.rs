@@ -68,7 +68,8 @@ impl KeyStore {
     /// 删除指定地址的条目
     pub fn remove(&mut self, address: &str) -> WalletResult<()> {
         let before = self.keys.len();
-        self.keys.retain(|k| !k.address.eq_ignore_ascii_case(address));
+        self.keys
+            .retain(|k| !k.address.eq_ignore_ascii_case(address));
         if self.keys.len() == before {
             Err(WalletError::WalletNotFound(address.to_string()))
         } else {
@@ -110,7 +111,12 @@ impl EncryptedKey {
 
         // 通过 PBKDF2 从密码派生 AES-256 密钥
         let mut derived_key = [0u8; KEY_LEN];
-        pbkdf2::pbkdf2_hmac::<sha2::Sha256>(password.as_bytes(), &salt, PBKDF2_ITERATIONS, &mut derived_key);
+        pbkdf2::pbkdf2_hmac::<sha2::Sha256>(
+            password.as_bytes(),
+            &salt,
+            PBKDF2_ITERATIONS,
+            &mut derived_key,
+        );
 
         // AES-256-GCM 加密
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&derived_key));
@@ -141,7 +147,12 @@ impl EncryptedKey {
             .map_err(|_| WalletError::DecryptionFailed)?;
 
         let mut derived_key = [0u8; KEY_LEN];
-        pbkdf2::pbkdf2_hmac::<sha2::Sha256>(password.as_bytes(), &salt, self.iterations, &mut derived_key);
+        pbkdf2::pbkdf2_hmac::<sha2::Sha256>(
+            password.as_bytes(),
+            &salt,
+            self.iterations,
+            &mut derived_key,
+        );
 
         let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&derived_key));
         let nonce = Nonce::from_slice(&nonce_bytes);
@@ -189,13 +200,16 @@ mod tests {
         .unwrap();
 
         ks.insert(ek.clone()).unwrap();
-        assert!(ks.find("0x1234567890abcdef1234567890abcdef12345678").is_some());
+        assert!(ks
+            .find("0x1234567890abcdef1234567890abcdef12345678")
+            .is_some());
         assert_eq!(ks.list_addresses().len(), 1);
 
         // 重复插入应失败
         assert!(ks.insert(ek).is_err());
 
-        ks.remove("0x1234567890abcdef1234567890abcdef12345678").unwrap();
+        ks.remove("0x1234567890abcdef1234567890abcdef12345678")
+            .unwrap();
         assert!(ks.list_addresses().is_empty());
     }
 }

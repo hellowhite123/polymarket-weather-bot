@@ -219,7 +219,10 @@ impl FillLedger {
 
     /// 记录一笔成交（若 order_id 已存在则覆盖）。
     pub fn record(&self, rec: FillRecord) {
-        self.records.write().unwrap().insert(rec.order_id.clone(), rec);
+        self.records
+            .write()
+            .unwrap()
+            .insert(rec.order_id.clone(), rec);
     }
 
     /// 获取单笔成交记录。
@@ -293,7 +296,10 @@ impl FillLedger {
     pub fn stats(&self) -> FillStats {
         let list = self.list();
         let total = list.len();
-        let settled = list.iter().filter(|r| r.status == FillStatus::Settled).count();
+        let settled = list
+            .iter()
+            .filter(|r| r.status == FillStatus::Settled)
+            .count();
         let total_fee: f64 = list.iter().map(|r| r.fee).sum();
         let total_slippage: f64 = list.iter().map(|r| r.slippage).sum();
         let total_pnl: f64 = list.iter().filter_map(|r| r.pnl).sum();
@@ -455,12 +461,24 @@ mod tests {
     #[test]
     fn test_ledger_stats() {
         let ledger = FillLedger::new();
-        let mut r1 = FillRecord::new("o1".to_string(), "t1".to_string(), "BUY".to_string(), 0.5, 10.0);
+        let mut r1 = FillRecord::new(
+            "o1".to_string(),
+            "t1".to_string(),
+            "BUY".to_string(),
+            0.5,
+            10.0,
+        );
         r1.mark_filled(0.5, 1.0);
         r1.mark_settled(2.0);
         ledger.record(r1);
 
-        let mut r2 = FillRecord::new("o2".to_string(), "t2".to_string(), "SELL".to_string(), 0.5, 10.0);
+        let mut r2 = FillRecord::new(
+            "o2".to_string(),
+            "t2".to_string(),
+            "SELL".to_string(),
+            0.5,
+            10.0,
+        );
         r2.mark_filled(0.5, 1.0);
         ledger.record(r2);
 
@@ -474,7 +492,13 @@ mod tests {
     #[test]
     fn test_ledger_to_json() {
         let ledger = FillLedger::new();
-        ledger.record(FillRecord::new("o1".to_string(), "t1".to_string(), "BUY".to_string(), 0.5, 10.0));
+        ledger.record(FillRecord::new(
+            "o1".to_string(),
+            "t1".to_string(),
+            "BUY".to_string(),
+            0.5,
+            10.0,
+        ));
         let json = ledger.to_json();
         assert!(json.contains("o1"));
         assert!(json.contains("token"));
@@ -515,15 +539,33 @@ mod tests {
     fn test_ledger_settle_by_token() {
         let ledger = FillLedger::new();
         // 两条同市场记录 + 一条其他市场
-        let mut r1 = FillRecord::new("o1".to_string(), "t1".to_string(), "BUY".to_string(), 0.5, 10.0);
+        let mut r1 = FillRecord::new(
+            "o1".to_string(),
+            "t1".to_string(),
+            "BUY".to_string(),
+            0.5,
+            10.0,
+        );
         r1.mark_filled(0.5, 0.0);
         ledger.record(r1);
 
-        let mut r2 = FillRecord::new("o2".to_string(), "t1".to_string(), "SELL".to_string(), 0.4, 20.0);
+        let mut r2 = FillRecord::new(
+            "o2".to_string(),
+            "t1".to_string(),
+            "SELL".to_string(),
+            0.4,
+            20.0,
+        );
         r2.mark_filled(0.4, 0.0);
         ledger.record(r2);
 
-        let mut r3 = FillRecord::new("o3".to_string(), "t2".to_string(), "BUY".to_string(), 0.6, 5.0);
+        let mut r3 = FillRecord::new(
+            "o3".to_string(),
+            "t2".to_string(),
+            "BUY".to_string(),
+            0.6,
+            5.0,
+        );
         r3.mark_filled(0.6, 0.0);
         ledger.record(r3);
 

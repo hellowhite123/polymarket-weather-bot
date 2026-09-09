@@ -71,7 +71,12 @@ pub struct OrderState {
 
 impl OrderState {
     /// 新建 RECEIVED 状态。
-    pub fn new(client_order_id: String, token_id: String, side: String, requested_size: f64) -> Self {
+    pub fn new(
+        client_order_id: String,
+        token_id: String,
+        side: String,
+        requested_size: f64,
+    ) -> Self {
         let now = now_secs();
         Self {
             client_order_id,
@@ -113,6 +118,24 @@ impl OrderState {
         };
         self.updated_at = now_secs();
     }
+
+    /// 标记已取消。
+    pub fn mark_cancelled(&mut self) {
+        self.status = OrderStateStatus::Cancelled;
+        self.updated_at = now_secs();
+    }
+
+    /// 标记已拒绝。
+    pub fn mark_rejected(&mut self) {
+        self.status = OrderStateStatus::Rejected;
+        self.updated_at = now_secs();
+    }
+
+    /// 标记已过期。
+    pub fn mark_expired(&mut self) {
+        self.status = OrderStateStatus::Expired;
+        self.updated_at = now_secs();
+    }
 }
 
 // ============================================================================
@@ -146,10 +169,36 @@ impl OrderStore {
     }
 
     /// 新建 RECEIVED 状态并返回（用于 place_order 幂等占位）。
-    pub fn create(&self, client_order_id: String, token_id: String, side: String, requested_size: f64) -> OrderState {
+    pub fn create(
+        &self,
+        client_order_id: String,
+        token_id: String,
+        side: String,
+        requested_size: f64,
+    ) -> OrderState {
         let state = OrderState::new(client_order_id, token_id, side, requested_size);
         self.upsert(state.clone());
         state
+    }
+
+    /// 原子占位：`client_order_id` 不存在则创建并返回新状态；已存在则返回 `None`。
+    ///
+    /// 与 `create` 不同，本方法在**单次写锁**内完成「查重 + 插入」，
+    /// 避免并发下 check-then-act 穿透导致重复下单（P0-004）。
+    pub fn claim(
+        &self,
+        client_order_id: String,
+        token_id: String,
+        side: String,
+        requested_size: f64,
+    ) -> Option<OrderState> {
+        let mut orders = self.orders.write().unwrap();
+        if orders.contains_key(&client_order_id) {
+            return None;
+        }
+        let state = OrderState::new(client_order_id, token_id, side, requested_size);
+        orders.insert(state.client_order_id.clone(), state.clone());
+        Some(state)
     }
 
     /// 订单总数。
@@ -159,6 +208,47 @@ impl OrderStore {
 
     pub fn is_empty(&self) -> bool {
         self.orders.read().unwrap().is_empty()
+    }
+    /// 返回当前本地仍处于活动状态的订单 ID。
+    ///
+    /// 用于启动时 StateSync reconciliation。
+    pub fn pending_order_ids(&self) -> std::collections::HashSet<String> {
+        self.orders
+            .read()
+            .unwrap()
+            .iter()
+            .filter_map(|(id, state)| match state.status {
+                OrderStateStatus::Received
+                | OrderStateStatus::Submitted
+                | OrderStateStatus::Live
+                | OrderStateStatus::PartialFilled => Some(id.clone()),
+                OrderStateStatus::Filled
+                | OrderStateStatus::Cancelled
+                | OrderStateStatus::Rejected
+                | OrderStateStatus::Expired => None,
+            })
+            .collect()
+    }
+    /// 返回本地已经提交、且当前仍可能处于远端 open 状态的 exchange order ID。
+    ///
+    /// 用于 StateSync 与 CLOB open orders 做对账。
+    pub fn pending_exchange_order_ids(&self) -> std::collections::HashSet<String> {
+        self.orders
+            .read()
+            .unwrap()
+            .values()
+            .filter_map(|state| match state.status {
+                OrderStateStatus::Submitted
+                | OrderStateStatus::Live
+                | OrderStateStatus::PartialFilled => state.exchange_order_id.clone(),
+
+                OrderStateStatus::Received
+                | OrderStateStatus::Filled
+                | OrderStateStatus::Cancelled
+                | OrderStateStatus::Rejected
+                | OrderStateStatus::Expired => None,
+            })
+            .collect()
     }
 }
 
@@ -206,6 +296,45 @@ mod tests {
     }
 
     #[test]
+    fn test_order_lifecycle_cancelled() {
+        let mut s = OrderState::new("c3".to_string(), "t3".to_string(), "BUY".to_string(), 100.0);
+        s.mark_submitted("ex3".to_string());
+        s.mark_live();
+        s.mark_cancelled();
+        assert_eq!(s.status, OrderStateStatus::Cancelled);
+    }
+
+    #[test]
+    fn test_order_lifecycle_rejected() {
+        let mut s = OrderState::new("c4".to_string(), "t4".to_string(), "BUY".to_string(), 100.0);
+        s.mark_rejected();
+        assert_eq!(s.status, OrderStateStatus::Rejected);
+    }
+
+    #[test]
+    fn test_order_lifecycle_expired() {
+        let mut s = OrderState::new("c5".to_string(), "t5".to_string(), "BUY".to_string(), 100.0);
+        s.mark_expired();
+        assert_eq!(s.status, OrderStateStatus::Expired);
+    }
+
+    #[test]
+    fn test_order_full_lifecycle_terminal_states() {
+        // 完整生命周期：Received → Submitted → Live → PartialFilled → Filled
+        let mut s = OrderState::new("c6".to_string(), "t6".to_string(), "BUY".to_string(), 100.0);
+        assert_eq!(s.status, OrderStateStatus::Received);
+        s.mark_submitted("ex6".to_string());
+        assert_eq!(s.status, OrderStateStatus::Submitted);
+        s.mark_live();
+        assert_eq!(s.status, OrderStateStatus::Live);
+        s.update_fill(50.0);
+        assert_eq!(s.status, OrderStateStatus::PartialFilled);
+        s.update_fill(100.0);
+        assert_eq!(s.status, OrderStateStatus::Filled);
+        assert_eq!(s.remaining_size, 0.0);
+    }
+
+    #[test]
     fn test_order_store_idempotency() {
         let store = OrderStore::new();
         assert!(store.is_empty());
@@ -219,5 +348,44 @@ mod tests {
         assert_eq!(store.len(), 1);
 
         assert!(store.get("missing").is_none());
+    }
+
+    /// 并发去重：16 个线程同时 claim 同一 order_id，应只有一次成功（原子占位）。
+    #[test]
+    fn test_order_store_concurrent_dedup() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        let store = Arc::new(OrderStore::new());
+        let id = "concurrent-1";
+        let claimed = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(16));
+
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let store = Arc::clone(&store);
+            let claimed = Arc::clone(&claimed);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                // 原子 claim：只有一个线程能成功占位
+                if store
+                    .claim(id.to_string(), "t1".to_string(), "BUY".to_string(), 10.0)
+                    .is_some()
+                {
+                    claimed.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert_eq!(store.len(), 1, "store 应只保留一条订单");
+        assert_eq!(
+            claimed.load(Ordering::SeqCst),
+            1,
+            "并发提交同一 order_id 应只有一次 claim 成功（原子占位）"
+        );
     }
 }

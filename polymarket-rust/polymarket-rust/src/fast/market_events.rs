@@ -135,20 +135,20 @@ struct TradeApiResponse {
 // ============================================================================
 
 #[derive(Debug, Clone, Deserialize)]
-struct OpenOrderSnapshot {
+pub struct OpenOrderSnapshot {
     #[serde(default)]
-    id: String,
+    pub id: String,
     #[serde(default)]
-    asset_id: String,
+    pub asset_id: String,
     #[serde(default)]
-    status: String,
+    pub status: String,
     #[serde(default)]
     #[serde(rename = "size_matched")]
-    size_matched: String,
+    pub size_matched: String,
     #[serde(default)]
-    size: String,
+    pub size: String,
     #[serde(default)]
-    price: String,
+    pub price: String,
 }
 
 // ============================================================================
@@ -216,7 +216,12 @@ impl MarketEventPoller {
     /// 轮询单次 trades（对指定 token_id）
     pub async fn poll_trades(&self, token_id: &str) -> Result<Vec<TradeEvent>, String> {
         let url = format!("{}/data/trades?token_id={}", self.host, token_id);
-        let resp = self.client.get(&url).send().await.map_err(|e| e.to_string())?;
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
 
         let trades: Vec<TradeApiResponse> = resp.json().await.map_err(|e| e.to_string())?;
 
@@ -272,19 +277,32 @@ impl MarketEventPoller {
     /// 轮询单次 order book
     pub async fn poll_order_book(&self, token_id: &str) -> Result<BookSnapshot, String> {
         let url = format!("{}/book?token_id={}", self.host, token_id);
-        let resp = self.client.get(&url).send().await.map_err(|e| e.to_string())?;
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
         let book: OrderBookSummary = resp.json().await.map_err(|e| e.to_string())?;
 
         let snapshot = BookSnapshot {
             token_id: token_id.to_string(),
-            bids: book.bids.into_iter().map(|b| Level {
-                price: b.price.parse().unwrap_or(0.0),
-                size: b.size.parse().unwrap_or(0.0),
-            }).collect(),
-            asks: book.asks.into_iter().map(|b| Level {
-                price: b.price.parse().unwrap_or(0.0),
-                size: b.size.parse().unwrap_or(0.0),
-            }).collect(),
+            bids: book
+                .bids
+                .into_iter()
+                .map(|b| Level {
+                    price: b.price.parse().unwrap_or(0.0),
+                    size: b.size.parse().unwrap_or(0.0),
+                })
+                .collect(),
+            asks: book
+                .asks
+                .into_iter()
+                .map(|b| Level {
+                    price: b.price.parse().unwrap_or(0.0),
+                    size: b.size.parse().unwrap_or(0.0),
+                })
+                .collect(),
             timestamp: now_secs(),
         };
 
@@ -294,7 +312,12 @@ impl MarketEventPoller {
     /// 轮询 open orders
     pub async fn poll_open_orders(&self) -> Result<Vec<OpenOrderSnapshot>, String> {
         let url = format!("{}/data/orders", self.host);
-        let resp = self.client.get(&url).send().await.map_err(|e| e.to_string())?;
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
         let orders: Vec<OpenOrderSnapshot> = resp.json().await.map_err(|e| e.to_string())?;
         Ok(orders)
     }
@@ -324,9 +347,8 @@ impl MarketEventPoller {
         // Open orders
         if let Ok(orders) = self.poll_open_orders().await {
             let prev = self.last_order_snapshot.read().unwrap().clone();
-            let current: HashMap<String, Vec<OpenOrderSnapshot>> = orders
-                .into_iter()
-                .fold(HashMap::new(), |mut acc, o| {
+            let current: HashMap<String, Vec<OpenOrderSnapshot>> =
+                orders.into_iter().fold(HashMap::new(), |mut acc, o| {
                     acc.entry(o.asset_id.clone()).or_default().push(o);
                     acc
                 });
@@ -336,7 +358,9 @@ impl MarketEventPoller {
                 let prev_orders = prev.get(tid);
                 for o in orders {
                     let changed = prev_orders.map_or(true, |po| {
-                        !po.iter().any(|p| p.id == o.id && p.status == o.status && p.size_matched == o.size_matched)
+                        !po.iter().any(|p| {
+                            p.id == o.id && p.status == o.status && p.size_matched == o.size_matched
+                        })
                     });
                     if changed {
                         let event = OrderStateEvent {
@@ -367,7 +391,9 @@ impl MarketEventPoller {
                 if n > 0 {
                     tracing::info!(
                         "market_events: 市场 {} 结算 outcome={}, 回填 {} 条成交盈亏",
-                        token_id, outcome, n
+                        token_id,
+                        outcome,
+                        n
                     );
                 }
             }
@@ -479,5 +505,30 @@ mod tests {
         poller.mark_settled("token-1", 1.0);
         let stats = poller.stats();
         assert_eq!(stats.settled_markets, 1);
+    }
+
+    #[test]
+    fn test_mark_settled_backfills_pnl() {
+        use crate::fast::fill_records::{FillLedger, FillRecord, FillStatus};
+
+        let ledger = Arc::new(FillLedger::new());
+        let mut r = FillRecord::new(
+            "o1".to_string(),
+            "token-1".to_string(),
+            "BUY".to_string(),
+            0.5,
+            10.0,
+        );
+        r.mark_filled(0.5, 0.0);
+        ledger.record(r);
+
+        let poller =
+            MarketEventPoller::new("https://example.com").with_fill_ledger(ledger.clone());
+        poller.mark_settled("token-1", 1.0);
+
+        // 结算回填：BUY 10 @ 0.5 结算 1.0 → +5.0
+        let rec = ledger.get("o1").unwrap();
+        assert_eq!(rec.status, FillStatus::Settled);
+        assert!((rec.pnl.unwrap() - 5.0).abs() < 1e-9);
     }
 }
