@@ -406,20 +406,12 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
         // 方向转换（提前到幂等检查之前，供原子占位使用）
         let side = direction_to_side(order.direction)?;
 
-        // ★ P0-004 幂等：先查已有，再原子 claim 占位，并发下只允许一个请求下单
+        // ★ P0-004 幂等：原子 claim_or_retry 占位，并发下只允许一个请求下单；
+        // 可重试终态（Rejected/Expired/Cancelled）会被重置并重新下单。
         if !order.order_id.is_empty() {
-            if let Some(existing) = self.order_store.get(&order.order_id) {
-                tracing::info!(
-                    "order_id={} 已存在（幂等去重），返回已有状态 {}",
-                    order.order_id,
-                    existing.status
-                );
-                return Ok(Response::new(existing_order_result(&existing)));
-            }
-            // 原子占位：首次返回 Some；并发穿透者返回 None（已被抢先占位）
             if self
                 .order_store
-                .claim(
+                .claim_or_retry(
                     order.order_id.clone(),
                     order.token_id.clone(),
                     side.as_str().to_string(),
@@ -427,8 +419,13 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
                 )
                 .is_none()
             {
+                // 进行中或已成交：幂等去重，返回已有状态
                 if let Some(existing) = self.order_store.get(&order.order_id) {
-                    tracing::info!("order_id={} 并发去重命中，返回已有状态", order.order_id);
+                    tracing::info!(
+                        "order_id={} 幂等去重（进行中/已成交），返回已有状态 {}",
+                        order.order_id,
+                        existing.status
+                    );
                     return Ok(Response::new(existing_order_result(&existing)));
                 }
             }
@@ -436,6 +433,7 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
 
         // 只执行 OPEN 状态的指令
         if order.status != pb::OrderStatus::Open as i32 {
+            self.order_store.mark_rejected(&order.order_id);
             return Ok(Response::new(pb::OrderResult {
                 order_id: order.order_id.clone(),
                 success: false,
@@ -498,6 +496,7 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
         {
             let rs = self.risk_state.lock().await;
             if rs.daily_circuit_breaker || rs.manual_halt {
+                self.order_store.mark_rejected(&order.order_id);
                 return Ok(Response::new(pb::OrderResult {
                     order_id: order.order_id.clone(),
                     success: false,
@@ -522,6 +521,7 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
                     order.token_id
                 );
 
+                self.order_store.mark_rejected(&order.order_id);
                 return Ok(Response::new(pb::OrderResult {
                     order_id: order.order_id.clone(),
                     success: false,
@@ -541,6 +541,7 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
         if let Err(e) = re.pre_check(&order.token_id, side, notional, order.quantity, 0) {
             tracing::warn!("风控预检拦截: token={}, {}", order.token_id, e);
 
+            self.order_store.mark_rejected(&order.order_id);
             return Ok(Response::new(pb::OrderResult {
                 order_id: order.order_id.clone(),
                 success: false,
@@ -657,6 +658,7 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
                 }
                 Err(e) => {
                     tracing::error!("fast path 下单失败: {}", e);
+                    self.order_store.mark_rejected(&order.order_id);
                     return Ok(Response::new(pb::OrderResult {
                         order_id: order.order_id.clone(),
                         success: false,
@@ -677,6 +679,7 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
             order.order_id
         );
 
+        self.order_store.mark_rejected(&order.order_id);
         return Ok(Response::new(pb::OrderResult {
             order_id: order.order_id.clone(),
             success: false,
@@ -1030,5 +1033,41 @@ mod tests {
         // risk_state 仓位更新（BUY +10）
         let rs = service.risk_state.lock().await;
         assert_eq!(rs.positions.get("token-1").copied().unwrap_or(0.0), 10.0);
+    }
+
+    /// P1-010：下单失败路径（RiskEngine 未初始化）会把 claim 占位标记为 Rejected，
+    /// 之后同 order_id 可重试且不进入 pending 对账。
+    #[tokio::test]
+    async fn test_failed_place_order_marks_rejected() {
+        use crate::fast::order_state::OrderStateStatus;
+        use crate::fast::trading_gate::TradingGateState;
+        use pb::execution_service_server::ExecutionService;
+
+        let mut service = ExecutionServiceImpl::new_mock();
+        service.trading_gate.set_state(TradingGateState::Ready);
+        // 不挂载 risk_engine → 走「RiskEngine 未初始化」失败路径
+
+        let req = pb::AggregatedOrder {
+            order_id: "o-fail".to_string(),
+            token_id: "t1".to_string(),
+            direction: pb::Direction::BuyYes as i32,
+            quantity: 10.0,
+            status: pb::OrderStatus::Open as i32,
+            target_price: 0.5,
+            paper_trading: false,
+            ..Default::default()
+        };
+
+        let resp = service.place_order(Request::new(req)).await.unwrap();
+        let result = resp.into_inner();
+
+        assert_eq!(result.status, pb::ExecutionStatus::Rejected as i32);
+        // 占位已被标记 rejected（不再残留 Received）
+        assert_eq!(
+            service.order_store.get("o-fail").map(|s| s.status),
+            Some(OrderStateStatus::Rejected)
+        );
+        // 且不再进入 pending（对账不误报）
+        assert!(!service.order_store.pending_order_ids().contains("o-fail"));
     }
 }

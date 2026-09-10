@@ -201,6 +201,42 @@ impl OrderStore {
         Some(state)
     }
 
+    /// 标记拒绝（若存在）。用于下单失败路径清理占位，避免残留 `Received`
+    /// 状态被 `pending_order_ids` 误报，或被幂等命中拦下导致无法重试。
+    pub fn mark_rejected(&self, client_order_id: &str) {
+        if let Some(mut st) = self.get(client_order_id) {
+            st.mark_rejected();
+            self.upsert(st);
+        }
+    }
+
+    /// 幂等占位（支持重试）：`client_order_id` 不存在、或处于可重试终态
+    /// （`Rejected` / `Expired` / `Cancelled`）时，创建/重置为 `Received` 并返回状态；
+    /// 处于进行中或已成交则返回 `None`（拒绝重复下单）。
+    ///
+    /// 单次写锁内完成「查状态 + 插入/重置」，保证并发原子性（P0-004）。
+    pub fn claim_or_retry(
+        &self,
+        client_order_id: String,
+        token_id: String,
+        side: String,
+        requested_size: f64,
+    ) -> Option<OrderState> {
+        let mut orders = self.orders.write().unwrap();
+        match orders.get(&client_order_id).map(|s| s.status) {
+            None
+            | Some(OrderStateStatus::Rejected)
+            | Some(OrderStateStatus::Expired)
+            | Some(OrderStateStatus::Cancelled) => {
+                let state =
+                    OrderState::new(client_order_id.clone(), token_id, side, requested_size);
+                orders.insert(client_order_id, state.clone());
+                Some(state)
+            }
+            _ => None,
+        }
+    }
+
     /// 订单总数。
     pub fn len(&self) -> usize {
         self.orders.read().unwrap().len()
@@ -387,5 +423,58 @@ mod tests {
             1,
             "并发提交同一 order_id 应只有一次 claim 成功（原子占位）"
         );
+    }
+
+    /// claim_or_retry：下单失败标记 rejected 后，同 order_id 可重新占位（重试）。
+    #[test]
+    fn test_claim_retry_after_rejected() {
+        let store = OrderStore::new();
+
+        // 首次占位成功
+        assert!(store
+            .claim_or_retry("o1".to_string(), "t1".to_string(), "BUY".to_string(), 10.0)
+            .is_some());
+
+        // 进行中：重复 claim_or_retry 返回 None（幂等去重）
+        assert!(store
+            .claim_or_retry("o1".to_string(), "t1".to_string(), "BUY".to_string(), 10.0)
+            .is_none());
+
+        // 下单失败 → 标记 rejected
+        store.mark_rejected("o1");
+        assert_eq!(
+            store.get("o1").map(|s| s.status),
+            Some(OrderStateStatus::Rejected)
+        );
+
+        // rejected 后可重试：claim_or_retry 重新占位成功
+        assert!(store
+            .claim_or_retry("o1".to_string(), "t1".to_string(), "BUY".to_string(), 10.0)
+            .is_some());
+    }
+
+    /// 失败路径 mark_rejected 后，订单不再进入 pending（避免对账误报）。
+    #[test]
+    fn test_mark_rejected_clears_pending() {
+        let store = OrderStore::new();
+        store.create("o1".to_string(), "t1".to_string(), "BUY".to_string(), 10.0);
+        assert!(store.pending_order_ids().contains("o1"));
+
+        store.mark_rejected("o1");
+        assert!(!store.pending_order_ids().contains("o1"));
+    }
+
+    /// claim_or_retry 对已成交订单去重（不可重复下单）。
+    #[test]
+    fn test_claim_or_retry_rejects_filled() {
+        let store = OrderStore::new();
+        store.create("o1".to_string(), "t1".to_string(), "BUY".to_string(), 10.0);
+        if let Some(mut st) = store.get("o1") {
+            st.update_fill(10.0); // Filled
+            store.upsert(st);
+        }
+        assert!(store
+            .claim_or_retry("o1".to_string(), "t1".to_string(), "BUY".to_string(), 10.0)
+            .is_none());
     }
 }
