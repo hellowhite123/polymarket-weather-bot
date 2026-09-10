@@ -10,14 +10,13 @@
 | 级别 | 数量 | GPT 状态分布 | 按标准的状态映射 |
 |------|------|-------------|-----------------|
 | P0 | 7 | 6 已修 + 1 基本完成 | **7 项全部 VERIFIED（09-09 闭环）** |
-| P1 | 9 | 4 待修 + 5 待验证 | **9 项全部完成（09-07 闭环）** |
-| **合计** | **16** | | |
+| P1 | 10 | 4 待修 + 5 待验证 + 1 遗留 | **10 项全部完成（09-10 闭环）** |
+| **合计** | **17** | | |
 
 **验证进展**：
 - `VERIFIED`：旧 P0-07/P0-11（TradingGate）+ P0-003（RiskEngine 超仓）+ P0-004（Order Dedup 并发）+ P0-007（full_reconcile 启动）+ P0-001（FastExecutor 初始化，09-08）+ P0-005（StateSync L2 认证）+ P0-006（StateSync JSON Decode）+ **P0-002（Docker Secret，09-09）**
 - **P0 全部 7 项 VERIFIED（09-09）**
-- **P1-001~009 全部完成（09-07）**：4 项待修已实现 + 5 项待验证已补测试
-- 其余 P0（002）已修复并 VERIFIED（09-09）
+- **P1-001~010 全部完成**：P1-001~009（09-07）+ P1-010 claim 占位失败清理（09-10）
 
 ---
 
@@ -59,7 +58,7 @@
 
 ---
 
-## 三、P1 清单（9 项，全部完成 09-07）
+## 三、P1 清单（10 项，全部完成 09-10）
 
 | 新编号 | 问题 | 处置 | 落地 |
 |--------|------|------|------|
@@ -72,6 +71,7 @@
 | P1-007 | State 恢复机制 | ✅ 已实现 | server.rs 后台周期对账（每 30s full_reconcile）+ 差异告警 |
 | P1-008 | Settlement Observation | ✅ 已补 | market_events.mark_settled 回填盈亏测试（settle_by_token 链路） |
 | P1-009 | Ensemble Calibration | ✅ 已补 | test_ensemble_fusion.py 5 个测试（Brier/权重/贝叶斯收敛/CI） |
+| P1-010 | Order Dedup claim 占位失败清理（P0-004 遗留） | ✅ 已实现 | OrderStore.mark_rejected + claim_or_retry；place_order 6 失败路径清理占位；4 测试全绿 |
 
 **测试结果（09-07）**：Rust 241 单元测试 + 9 集成测试全绿；Python 5 测试全过。
 
@@ -88,14 +88,14 @@
 | ➕ 新增 | P1-001/002/003/004/008/009 | 6 项旧清单未覆盖 |
 | ✅ 已验证 | 旧 P0-07（TradingGate 状态机）、P0-11（TradingGate 进 READY） | 代码闭环 + 补 7 测试全过 → **VERIFIED** |
 | ✅ 已确认 | 旧 P0-10（full_reconcile 接入） | 已接入启动流程（server.rs:138-141），见 P0-007 |
-| ❓ 疑遗漏 | 旧 P0-04（FastExecutor 真实执行路径） | 新清单无明确对应项，待验证 |
+| ✅ 已确认 | 旧 P0-04（FastExecutor 真实执行路径） | 已实现于 FastExecutor 15 子模块（185 tests），place_order 全链路代码闭环；真实 CLOB 下单端到端留待实盘/Shadow Trading |
 
 ---
 
 ## 五、关键风险提示 🔴
 
 1. ~~TradingGate 相关项疑似整体消失~~ → **✅ 已验证完成**：旧 P0-07（状态机）+ P0-11（进 READY）代码闭环，补 7 个测试全过（总计 229 tests），达 VERIFIED。GPT 新清单未列是因其已判定完成，非遗漏。
-2. **P0 降级到 P1 无理由记录**：post_check 成交闭环、pending orders、后台对账循环从 P0 降到 P1，按标准应附 Reason，目前没有。资金安全相关项降级需 Human 确认。
+2. **P0 降级到 P1 理由已记录**：post_check 成交闭环、pending orders、后台对账循环从 P0 降到 P1，理由 = 逻辑已实现且有单测，但真实成交触发依赖 L2 `/data/trades` 轮询，sandbox 无外网无法端到端验证 → 推迟到 Shadow Trading 阶段。⚠️ 资金安全相关项降级仍待 Human 显式确认归档（记录见 `MASTER_TASKS.md`「P0 → P1 降级记录」）。
 3. **「已修」≠「已验证」**：P0 全部 7 项（001~007）已 VERIFIED（09-09）；P1 9 项已完成（09-07）。
 
 ---
