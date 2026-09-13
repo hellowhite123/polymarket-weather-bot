@@ -28,7 +28,7 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -74,6 +74,8 @@ impl std::fmt::Display for FillStatus {
 pub struct FillRecord {
     /// 统一订单 ID（交易所 orderID）
     pub order_id: String,
+    /// 成交唯一标识（trade id，fill 级 identity，P0-015 幂等 key）
+    pub trade_id: String,
     /// 市场 token id
     pub token_id: String,
     /// 方向 BUY / SELL
@@ -117,6 +119,7 @@ impl FillRecord {
         let now = now_secs();
         Self {
             order_id,
+            trade_id: String::new(),
             token_id,
             side,
             placed_at: now,
@@ -208,13 +211,26 @@ pub fn compute_pnl(side: &str, size: f64, filled_price: f64, settlement: f64, fe
 #[derive(Debug, Default)]
 pub struct FillLedger {
     records: RwLock<HashMap<String, FillRecord>>,
+    /// fill 幂等去重集合（trade_id），P0-015
+    seen_trade_ids: RwLock<HashSet<String>>,
 }
 
 impl FillLedger {
     pub fn new() -> Self {
         Self {
             records: RwLock::new(HashMap::new()),
+            seen_trade_ids: RwLock::new(HashSet::new()),
         }
+    }
+
+    /// P0-015：fill 幂等去重。首次见到该 `trade_id` 返回 `true`（并登记），
+    /// 已处理过返回 `false`（调用方应忽略）。空 `trade_id` 不启用去重（保持旧行为）。
+    pub fn claim_trade(&self, trade_id: &str) -> bool {
+        if trade_id.is_empty() {
+            return true;
+        }
+        let mut seen = self.seen_trade_ids.write().unwrap();
+        seen.insert(trade_id.to_string())
     }
 
     /// 记录一笔成交（若 order_id 已存在则覆盖）。
@@ -588,5 +604,20 @@ mod tests {
         let o3 = ledger.get("o3").unwrap();
         assert_eq!(o3.status, FillStatus::Filled);
         assert!(o3.pnl.is_none());
+    }
+
+    #[test]
+    fn test_claim_trade_dedup() {
+        let ledger = FillLedger::new();
+        assert!(ledger.claim_trade("trade-1")); // 首次
+        assert!(!ledger.claim_trade("trade-1")); // 重复
+        assert!(ledger.claim_trade("trade-2")); // 不同 trade
+    }
+
+    #[test]
+    fn test_claim_trade_empty_always_true() {
+        let ledger = FillLedger::new();
+        assert!(ledger.claim_trade(""));
+        assert!(ledger.claim_trade(""));
     }
 }

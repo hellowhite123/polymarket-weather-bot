@@ -58,8 +58,9 @@ pub enum MarketEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TradeEvent {
     pub token_id: String,
+    /// 成交唯一标识（trade id，作为 fill 幂等 key）
     pub trade_id: String,
-    /// 统一订单 ID（taker 侧订单 ID，主动成交方）
+    /// 归属后的「我的订单 ID」（按 trader_side 正确归属，见 P0-013）
     pub order_id: String,
     pub side: String, // BUY / SELL
     pub price: f64,
@@ -67,6 +68,12 @@ pub struct TradeEvent {
     pub timestamp: u64,
     pub taker_order_id: String,
     pub maker_order_id: String,
+    /// 当前用户在此成交中的角色：TAKER / MAKER
+    pub trader_side: String,
+    /// 归属方地址（owner）
+    pub owner: String,
+    /// 成交状态（MATCHED / MINED 等）
+    pub status: String,
 }
 
 /// 订单簿快照
@@ -128,6 +135,41 @@ struct TradeApiResponse {
     #[serde(default)]
     #[serde(rename = "makerOrderId")]
     maker_order_id: String,
+    // ── P0-013 新增：完整 trade metadata ──
+    /// 当前用户角色：TAKER / MAKER
+    #[serde(default)]
+    #[serde(rename = "traderSide")]
+    trader_side: String,
+    /// taker 地址
+    #[serde(default)]
+    owner: String,
+    #[serde(default)]
+    #[serde(rename = "makerAddress")]
+    maker_address: String,
+    /// maker 订单列表（归属 MAKER 成交用）
+    #[serde(default)]
+    #[serde(rename = "makerOrders")]
+    maker_orders: Vec<MakerOrderRef>,
+    /// 成交状态（MATCHED / MINED 等）
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    #[serde(rename = "feeRateBps")]
+    fee_rate_bps: String,
+    #[serde(default)]
+    #[serde(rename = "transactionHash")]
+    transaction_hash: String,
+}
+
+/// `maker_orders` 数组元素（P0-013 归属 MAKER 成交用）。
+#[derive(Debug, Clone, Deserialize)]
+struct MakerOrderRef {
+    #[serde(default)]
+    #[serde(rename = "orderId")]
+    order_id: String,
+    #[serde(default)]
+    #[serde(rename = "makerAddress")]
+    maker_address: String,
 }
 
 // ============================================================================
@@ -176,6 +218,8 @@ pub struct MarketEventPoller {
     settled_markets: RwLock<HashSet<String>>,
     /// 成交记录账簿（可选）。挂载后 `mark_settled` 会自动回填盈亏。
     fill_ledger: Option<Arc<FillLedger>>,
+    /// 自己的钱包地址（P0-013：归属 MAKER 成交时在 maker_orders 里匹配）。
+    owner_address: Option<String>,
 }
 
 impl MarketEventPoller {
@@ -199,12 +243,19 @@ impl MarketEventPoller {
             event_count: AtomicU64::new(0),
             settled_markets: RwLock::new(HashSet::new()),
             fill_ledger: None,
+            owner_address: None,
         }
     }
 
     /// 挂载成交记录账簿。此后 `mark_settled` 会自动回填该市场所有成交的盈亏。
     pub fn with_fill_ledger(mut self, ledger: Arc<FillLedger>) -> Self {
         self.fill_ledger = Some(ledger);
+        self
+    }
+
+    /// 挂载自己的钱包地址（P0-013：归属 MAKER 成交时用于匹配 maker_orders）。
+    pub fn with_owner_address(mut self, address: String) -> Self {
+        self.owner_address = Some(address);
         self
     }
 
@@ -237,19 +288,41 @@ impl MarketEventPoller {
                 }
             }
 
+            // P0-013：按 trader_side 正确归属「我的订单 ID」。无法安全归属则跳过
+            //（宁可漏记，不可把成交错误归属到别的订单导致 RiskEngine/FillLedger 错误记账）。
+            let order_id = match attribute_order(
+                &t.trader_side,
+                &t.taker_order_id,
+                &t.maker_orders,
+                self.owner_address.as_deref(),
+            ) {
+                Some(oid) => oid,
+                None => {
+                    tracing::warn!(
+                        "market_events: 无法归属成交 trade_id={} trader_side={:?}，跳过",
+                        t.id,
+                        t.trader_side
+                    );
+                    continue;
+                }
+            };
+
             let price = parse_f64(&t.price);
             let size = parse_f64(&t.size);
 
             let event = TradeEvent {
                 token_id: token_id.to_string(),
                 trade_id: t.id.clone(),
-                order_id: t.taker_order_id.clone(),
-                side: t.side,
+                order_id,
+                side: t.side.clone(),
                 price,
                 size,
                 timestamp: parse_timestamp(&t.created_at),
-                taker_order_id: t.taker_order_id,
-                maker_order_id: t.maker_order_id,
+                taker_order_id: t.taker_order_id.clone(),
+                maker_order_id: t.maker_order_id.clone(),
+                trader_side: t.trader_side.clone(),
+                owner: t.owner.clone(),
+                status: t.status.clone(),
             };
 
             new_events.push(event);
@@ -446,6 +519,52 @@ pub struct EventStats {
 // 工具函数
 // ============================================================================
 
+/// P0-013：按 `trader_side` 正确归属「我的订单 ID」。
+///
+/// - `TAKER` → 返回 `taker_order_id`
+/// - `MAKER` → 在 `maker_orders` 里匹配 `owner_address` 的 order_id；未配地址或匹配不到时，
+///   仅当 `maker_orders` 只有一条才兜底取它，否则返回 `None`
+/// - 未知 `trader_side` → 返回 `None`
+///
+/// 返回 `None` 表示无法安全归属，调用方应跳过该成交（避免错误记账）。
+fn attribute_order(
+    trader_side: &str,
+    taker_order_id: &str,
+    maker_orders: &[MakerOrderRef],
+    owner_address: Option<&str>,
+) -> Option<String> {
+    match trader_side {
+        "TAKER" => {
+            if taker_order_id.is_empty() {
+                None
+            } else {
+                Some(taker_order_id.to_string())
+            }
+        }
+        "MAKER" => {
+            if let Some(addr) = owner_address.filter(|a| !a.is_empty()) {
+                maker_orders
+                    .iter()
+                    .find(|m| m.maker_address == addr)
+                    .map(|m| m.order_id.clone())
+                    .or_else(|| {
+                        // 兜底：地址未匹配，但只有一个 maker 时取它
+                        if maker_orders.len() == 1 {
+                            maker_orders.first().map(|m| m.order_id.clone())
+                        } else {
+                            None
+                        }
+                    })
+            } else if maker_orders.len() == 1 {
+                maker_orders.first().map(|m| m.order_id.clone())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 fn parse_f64(v: &serde_json::Value) -> f64 {
     match v {
         serde_json::Value::String(s) => s.parse().unwrap_or(0.0),
@@ -530,5 +649,55 @@ mod tests {
         let rec = ledger.get("o1").unwrap();
         assert_eq!(rec.status, FillStatus::Settled);
         assert!((rec.pnl.unwrap() - 5.0).abs() < 1e-9);
+    }
+
+    // ── P0-013：Trade 归属 attribution ──
+
+    fn mkr(order_id: &str, maker_address: &str) -> MakerOrderRef {
+        MakerOrderRef {
+            order_id: order_id.to_string(),
+            maker_address: maker_address.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_attribute_order_taker() {
+        let oid = attribute_order("TAKER", "taker-1", &[], None);
+        assert_eq!(oid.as_deref(), Some("taker-1"));
+    }
+
+    #[test]
+    fn test_attribute_order_taker_empty_returns_none() {
+        assert_eq!(attribute_order("TAKER", "", &[], None), None);
+    }
+
+    #[test]
+    fn test_attribute_order_maker_single_fallback() {
+        let makers = vec![mkr("maker-1", "0xmaker1")];
+        assert_eq!(
+            attribute_order("MAKER", "taker-1", &makers, None).as_deref(),
+            Some("maker-1")
+        );
+    }
+
+    #[test]
+    fn test_attribute_order_maker_match_owner() {
+        let makers = vec![mkr("maker-a", "0xAAA"), mkr("maker-b", "0xme")];
+        assert_eq!(
+            attribute_order("MAKER", "taker-1", &makers, Some("0xme")).as_deref(),
+            Some("maker-b")
+        );
+    }
+
+    #[test]
+    fn test_attribute_order_maker_multi_no_match_returns_none() {
+        let makers = vec![mkr("maker-a", "0xAAA"), mkr("maker-b", "0xBBB")];
+        assert_eq!(attribute_order("MAKER", "taker-1", &makers, Some("0xme")), None);
+        assert_eq!(attribute_order("MAKER", "taker-1", &makers, None), None);
+    }
+
+    #[test]
+    fn test_attribute_order_unknown_side_returns_none() {
+        assert_eq!(attribute_order("UNKNOWN", "taker-1", &[], None), None);
     }
 }

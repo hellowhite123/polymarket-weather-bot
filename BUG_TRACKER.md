@@ -9,9 +9,9 @@
 
 | 级别 | 数量 | GPT 状态分布 | 按标准的状态映射 |
 |------|------|-------------|-----------------|
-| P0 | 7 | 6 已修 + 1 基本完成 | **7 项全部 VERIFIED（09-09 闭环）** |
-| P1 | 10 | 4 待修 + 5 待验证 + 1 遗留 | **10 项全部完成（09-10 闭环）** |
-| **合计** | **17** | | |
+| P0 | 7+9 | 6 已修 + 1 基本完成 + 9 新发现 | **7 项 VERIFIED（09-09）+ 9 项实盘阻塞待修（09-13 GPT×Gemini 综合）** |
+| P1 | 10+25 | 4 待修 + 5 待验证 + 1 遗留 + 25 新发现 | **10 项完成（09-10）+ 25 项待修（09-13 综合）** |
+| **合计** | **17+48** | | |
 
 **验证进展**：
 - `VERIFIED`：旧 P0-07/P0-11（TradingGate）+ P0-003（RiskEngine 超仓）+ P0-004（Order Dedup 并发）+ P0-007（full_reconcile 启动）+ P0-001（FastExecutor 初始化，09-08）+ P0-005（StateSync L2 认证）+ P0-006（StateSync JSON Decode）+ **P0-002（Docker Secret，09-09）**
@@ -55,6 +55,30 @@
 2. 修复：`server.rs` 新增 `load_wallet_password()` —— 优先读 `WALLET_PASSWORD_FILE` 文件并 trim，未配置/读失败回退 `WALLET_PASSWORD`，两者空返回空串（上层 `!password.is_empty()` 保持 fail-closed）；
 3. 测试：抽纯函数 `resolve_password(file_content, env_password)`，补 4 个测试（文件优先/回退 env/空白文件回退/双空 fail-closed）全绿；
 4. `MASTER_TASKS.md` P0-02 已把 `server.rs` 加入 Allowed Files。
+
+---
+
+## 二-B、P0 实盘阻塞清单（09-13 GPT × Gemini 综合，待修 9 项）
+
+> 来源：GPT `POLYMARKET_WEATHER_FINAL_CODE_AUDIT.md` + Gemini《代码审查修改建议汇总》。综合见 `docs/audit_synthesis_2026-09-13.md`。
+
+| 编号 | 问题 | 来源 | 状态 | 修复阶段 |
+|------|------|------|------|---------|
+| P0-013 | Trade 归属 attribution（taker_order_id ≠ 用户订单） | GPT | 🔧 FIXED（09-13） | 阶段一 |
+| P0-014 | MarketEventPoller → ExecutionService 未接线 | GPT | 🔧 FIXED（09-13，默认关，`MARKET_EVENTS_ENABLED=1` 启用） | 阶段一 |
+| P0-015 | Fill 幂等 / 双路重复记账 | GPT | 🔧 FIXED（09-13：`trade_id` 幂等 + 方案 X 成交唯一走路径 B） | 阶段一 |
+| P0-007B | full_reconcile 只有检测、没有恢复 | GPT | 🔧 FIXED（09-13：`full_reconcile_with_recovery` + `build_recovery_plan` + `apply_recovery` + `sync_position`） | 阶段三 |
+| P0-008 | Risk check-and-reserve 非原子 | GPT | 🔧 FIXED（09-13：`check_and_reserve` 原子预留 + `release_reserve` 回退 + `on_fill` 冲抵预留） | 阶段二 |
+| P0-009 | Risk 输入校验 NaN/Inf/负值 | GPT | 🔧 FIXED（09-13：notional/qty NaN/Inf/负值全拒 + `RiskConfig::validate` fail-fast） | 阶段二 |
+| P0-010 | Nonce 并发分配 | GPT + Gemini | 🔧 FIXED（09-13：`next_local` AtomicU64 原子递增游标 + 并发测试） | 阶段二 |
+| P0-011 | Nonce 确认语义 | GPT | 🔧 FIXED（09-13：`NonceState` 状态机 Allocated/Pending，分配游标与确认解耦） | 阶段二 |
+| P0-012 | Mempool capacity TOCTOU | GPT | 🔧 FIXED（09-13：`try_submit` 原子 check+reserve + 并发测试） | 阶段二 |
+
+**阶段一（已完成 09-13）**：P0-013 → P0-014 → P0-015（Trade 一致性链）。
+**阶段二（已完成 09-13）**：P0-008（check-and-reserve 原子）+ P0-009（输入校验）+ P0-010/011（Nonce 并发分配 + 状态机）+ P0-012（Mempool capacity TOCTOU）。
+**阶段三（已完成 09-13）**：P0-007B（full_reconcile 自动恢复）。
+
+> ✅ **P0 实盘阻塞 9 项全部 FIXED（09-13）**，待三重证据（git diff + 测试 + 调用链）VERIFIED。
 
 ---
 

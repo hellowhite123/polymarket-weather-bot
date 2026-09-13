@@ -15,7 +15,7 @@
 
 pub mod service;
 
-pub use service::ExecutionServiceImpl;
+pub use service::{consume_trade_events, ExecutionServiceImpl};
 
 use std::sync::Arc;
 use tonic::transport::Server;

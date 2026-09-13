@@ -21,10 +21,11 @@ use tracing_subscriber::EnvFilter;
 
 use polymarket_rust::clob::client::ClobConfig;
 use polymarket_rust::fast::executor::FastExecutor;
+use polymarket_rust::fast::market_events::MarketEventPoller;
 use polymarket_rust::fast::risk_engine::{RiskConfig, RiskEngine};
 use polymarket_rust::fast::state_sync::StateSync;
 use polymarket_rust::fast::trading_gate::{TradingGate, TradingGateState};
-use polymarket_rust::grpc::{serve, ExecutionServiceImpl};
+use polymarket_rust::grpc::{consume_trade_events, serve, ExecutionServiceImpl};
 use polymarket_rust::order::OrderFlow;
 use polymarket_rust::types::Chain;
 use polymarket_rust::wallet::WalletManager;
@@ -153,11 +154,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let local_positions = service.snapshot_positions().await;
     let local_pending_orders = service.snapshot_pending_exchange_order_ids();
 
-    // ★ 4B：启动时执行一次完整远端状态对账
+    // ★ 4B：启动时执行一次完整远端状态对账 + 自动恢复（P0-007B）
+    let (_, _, recovery) = state_sync
+        .full_reconcile_with_recovery(&local_positions, &local_pending_orders)
+        .await
+        .map_err(|e| format!("启动 StateSync reconciliation 失败: {}", e))?;
+
+    // 应用恢复计划，修复本地状态（成交补记 / 订单终态 / 仓位重建）
+    if recovery.has_actions() {
+        let applied = service.apply_recovery(&recovery).await;
+        tracing::info!("StateSync 启动恢复计划已应用 {} 项动作", applied);
+    }
+    if recovery.has_unresolved() {
+        tracing::error!(
+            "StateSync 启动对账存在 {} 个无法分类的消失订单，保持 FAIL-CLOSED",
+            recovery.unresolved_orders.len()
+        );
+    }
+
+    // 恢复后再快照并重新对账，得到权威同步结论（驱动 TradingGate）
+    let local_positions = service.snapshot_positions().await;
+    let local_pending_orders = service.snapshot_pending_exchange_order_ids();
     let (pos_report, order_report) = state_sync
         .full_reconcile(&local_positions, &local_pending_orders)
         .await
-        .map_err(|e| format!("启动 StateSync reconciliation 失败: {}", e))?;
+        .map_err(|e| format!("启动 StateSync 恢复后复核对账失败: {}", e))?;
 
     tracing::info!(
     "StateSync 启动对账完成: positions_in_sync={}, orders_in_sync={}, position_diffs={}, order_diffs={}",
@@ -190,8 +211,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tick.tick().await;
                 let local_positions = svc.snapshot_positions().await;
                 let local_orders = svc.snapshot_pending_exchange_order_ids();
-                match ss.full_reconcile(&local_positions, &local_orders).await {
-                    Ok((pos, ord)) => {
+                match ss
+                    .full_reconcile_with_recovery(&local_positions, &local_orders)
+                    .await
+                {
+                    Ok((pos, ord, recovery)) => {
+                        // P0-007B：后台对账自动恢复（成交补记 / 订单终态 / 仓位重建）
+                        if recovery.has_actions() {
+                            let applied = svc.apply_recovery(&recovery).await;
+                            tracing::info!("StateSync 后台对账恢复 {} 项动作", applied);
+                        }
+                        if recovery.has_unresolved() {
+                            tracing::warn!(
+                                "StateSync 后台对账存在 {} 个无法分类的消失订单",
+                                recovery.unresolved_orders.len()
+                            );
+                        }
                         if !pos.in_sync || !ord.in_sync {
                             tracing::warn!(
                                 "StateSync 后台对账发现差异: positions_in_sync={}, orders_in_sync={}",
@@ -206,6 +241,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         });
+    }
+
+    // P0-014：MarketEventPoller → ExecutionService 事件消费链接线。
+    // 默认禁用：sandbox 无外网，且需先确认「路径 A/B 记账归属」决策（见 MASTER_TASKS.md）。
+    // 启用：MARKET_EVENTS_ENABLED=1
+    if matches!(
+        env::var("MARKET_EVENTS_ENABLED").as_deref(),
+        Ok("1") | Ok("true")
+    ) {
+        let poller = Arc::new(
+            MarketEventPoller::new(&clob_host)
+                .with_owner_address(address.clone())
+                .with_fill_ledger(service.fill_ledger().clone()),
+        );
+
+        // 消费循环：Trade 事件 → on_market_trade
+        {
+            let svc = service.clone();
+            let rx = poller.subscribe();
+            tokio::spawn(consume_trade_events(svc, rx));
+        }
+
+        // 轮询循环：每 2s tick 一次（token_ids 后续接 MarketDiscovery 注册表）
+        {
+            let p = poller.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+                loop {
+                    tick.tick().await;
+                    // TODO: 从 MarketDiscovery 注册表取监控 token 列表
+                    let token_ids: Vec<String> = Vec::new();
+                    p.tick(&token_ids).await;
+                }
+            });
+        }
+
+        tracing::info!("MarketEventPoller 已接线（MARKET_EVENTS_ENABLED=1）");
     }
 
     // 启动 gRPC server

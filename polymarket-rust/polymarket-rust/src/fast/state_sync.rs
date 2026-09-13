@@ -52,6 +52,54 @@ pub struct RemotePosition {
     pub cash_pnl: f64,
 }
 
+/// CLOB `/data/trades` 单笔成交响应（P0-007B 恢复分类用）。
+///
+/// 字段采用 camelCase 为主、snake_case 兜底（CLOB 与 Data API 两套命名
+/// 不一致），`price`/`size` 兼容字符串或数字。
+#[derive(Debug, Clone, Deserialize)]
+pub struct RemoteTrade {
+    #[serde(default)]
+    pub id: String,
+
+    #[serde(default, rename = "takerOrderId", alias = "taker_order_id")]
+    pub taker_order_id: String,
+
+    #[serde(default, rename = "makerOrderId", alias = "maker_order_id")]
+    pub maker_order_id: String,
+
+    #[serde(default)]
+    pub side: String,
+
+    #[serde(default)]
+    pub price: serde_json::Value,
+
+    #[serde(default)]
+    pub size: serde_json::Value,
+
+    #[serde(default, rename = "assetId", alias = "asset_id")]
+    pub asset_id: String,
+}
+
+impl RemoteTrade {
+    /// 成交价（字符串或数字 → f64）。
+    pub fn price(&self) -> f64 {
+        parse_json_f64(&self.price)
+    }
+
+    /// 成交量（字符串或数字 → f64）。
+    pub fn size(&self) -> f64 {
+        parse_json_f64(&self.size)
+    }
+
+    /// 该成交是否引用了指定订单（作为 taker 或 maker）。
+    ///
+    /// 用于判断一个从 open orders 消失的订单是否已经真实成交。
+    pub fn references_order(&self, order_id: &str) -> bool {
+        !order_id.is_empty()
+            && (self.taker_order_id == order_id || self.maker_order_id == order_id)
+    }
+}
+
 // ============================================================================
 // PaginatedResponse — Polymarket CLOB /data/* 端点的统一分页包装
 // ============================================================================
@@ -94,6 +142,9 @@ pub const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_secs(30);
 pub const DEFAULT_RECONNECT_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 pub const DEFAULT_RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
 
+/// 仓位对账容差（token quantity）。与 `reconcile_positions` 现有容差保持一致。
+pub const DEFAULT_POSITION_TOLERANCE: f64 = 1.0;
+
 // ============================================================================
 // 对账报告
 // ============================================================================
@@ -131,6 +182,64 @@ impl ReconciliationReport {
         self.diffs
             .iter()
             .any(|d| matches!(d.severity, DiffSeverity::Critical))
+    }
+}
+
+// ============================================================================
+// 恢复 (Recovery) — P0-007B
+// ============================================================================
+// full_reconcile 原实现只「检测」不「修复」：消失的订单无法确认终态、
+// 仓位差异只报告不重建。以下类型把「检测到的差异」转成「可执行的恢复动作」，
+// 由调用方（ExecutionService::apply_recovery）落到本地状态。
+
+/// 消失订单的终态分类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderTerminalState {
+    /// 已真实成交（有 trade 引用该订单）
+    Filled,
+    /// 已消失但无成交记录（取消 / 过期 / 其他非成交终态）
+    NonFilled,
+}
+
+/// 单条恢复动作。
+#[derive(Debug, Clone)]
+pub enum RecoveryAction {
+    /// 订单已成交：补记 fill（FillLedger + RiskEngine + OrderStore）
+    MarkOrderFilled {
+        order_id: String,
+        token_id: String,
+        side: String,
+        price: f64,
+        size: f64,
+        trade_id: String,
+    },
+    /// 订单已消失但非成交：标记终态，清除 pending
+    MarkOrderNonFilled { order_id: String },
+    /// 持仓重建：以远端为权威覆盖本地仓位（qty=0 且 notional=0 表示删除）
+    RebuildPosition {
+        token_id: String,
+        qty: f64,
+        notional: f64,
+    },
+}
+
+/// 一次对账产出的恢复计划。
+#[derive(Debug, Clone, Default)]
+pub struct RecoveryPlan {
+    /// 待执行的恢复动作
+    pub actions: Vec<RecoveryAction>,
+    /// 无法安全分类的消失订单（trades 拉取失败等），必须 FAIL-CLOSED 保留 pending
+    pub unresolved_orders: Vec<String>,
+}
+
+impl RecoveryPlan {
+    pub fn has_actions(&self) -> bool {
+        !self.actions.is_empty()
+    }
+
+    /// 是否存在无法分类的消失订单（true = 仍需人工介入）。
+    pub fn has_unresolved(&self) -> bool {
+        !self.unresolved_orders.is_empty()
     }
 }
 
@@ -367,6 +476,55 @@ impl StateSync {
             )
         })
     }
+
+    /// 拉取当前用户的成交记录（P0-007B 恢复分类用）。
+    ///
+    /// `/data/trades?user=<address>` 需要 L2 认证，响应为 `PaginatedResponse`
+    /// 包装对象或顶层数组，与 `fetch_open_orders` 一致地双格式兜底。
+    pub async fn fetch_trades(&self) -> Result<Vec<RemoteTrade>, String> {
+        let query = format!("user={}", self.wallet_address);
+        let url = format!("{}/data/trades?{}", self.clob_host, query);
+        let request_path = format!("/data/trades?{}", query);
+
+        let timestamp = now_secs();
+        let l2_args = L2HeaderArgs {
+            method: "GET".to_string(),
+            request_path,
+            body: None,
+        };
+        let headers = create_l2_headers(&self.wallet, &self.api_creds, &l2_args, timestamp)
+            .map_err(|e| e.to_string())?;
+
+        let mut req = self.client.get(&url);
+        for (k, v) in headers {
+            req = req.header(k, v);
+        }
+        let resp = req.send().await.map_err(|e| e.to_string())?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!(
+                "trades API request failed: status={}, body={}",
+                status, body
+            ));
+        }
+
+        let text = resp.text().await.map_err(|e| e.to_string())?;
+
+        // 1) 优先：PaginatedResponse 包装对象（真实格式）
+        if let Ok(p) = serde_json::from_str::<PaginatedResponse<RemoteTrade>>(&text) {
+            return Ok(p.data);
+        }
+        // 2) 兜底：顶层数组（旧/兼容格式）
+        serde_json::from_str::<Vec<RemoteTrade>>(&text).map_err(|e| {
+            let preview = &text[..text.len().min(200)];
+            format!(
+                "trades body 既不是包装对象也不是数组: {} (body前200字符: {})",
+                e, preview
+            )
+        })
+    }
     // ========================================================================
     // 对账
     // ========================================================================
@@ -512,8 +670,72 @@ impl StateSync {
     }
 
     // ========================================================================
-    // 完整对账流程
+    // 恢复计划构建（P0-007B）
     // ========================================================================
+
+    /// 执行完整对账 + 自动恢复（P0-007B）。
+    ///
+    /// 在 `full_reconcile` 的检测基础上，额外拉取成交记录，为「从 open orders
+    /// 消失」的订单分类终态（Filled / NonFilled），并为仓位差异生成重建动作。
+    ///
+    /// - trades 拉取失败不阻断对账，但消失订单会进入 `RecoveryPlan.unresolved_orders`
+    ///   （FAIL-CLOSED 保留 pending，不擅自标记终态）。
+    /// - 无消失订单时跳过 trades 拉取，避免无谓的网络往返。
+    pub async fn full_reconcile_with_recovery(
+        &self,
+        local_positions: &HashMap<String, f64>,
+        local_pending_orders: &std::collections::HashSet<String>,
+    ) -> Result<
+        (
+            ReconciliationReport,
+            ReconciliationReport,
+            RecoveryPlan,
+        ),
+        String,
+    > {
+        let positions = self.fetch_positions().await?;
+        let orders = self.fetch_open_orders().await?;
+
+        let remote_open_ids: std::collections::HashSet<String> = orders
+            .iter()
+            .filter_map(|o| o.get("id").and_then(|id| id.as_str()).map(|s| s.to_string()))
+            .collect();
+
+        // 仅当存在「本地 pending 但远端已消失」的订单时才需要拉取 trades 分类终态
+        let has_vanished = local_pending_orders
+            .iter()
+            .any(|id| !remote_open_ids.contains(id));
+
+        let trades: Option<Vec<RemoteTrade>> = if has_vanished {
+            match self.fetch_trades().await {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    tracing::warn!(
+                        "state_sync: 成交记录拉取失败，消失订单将无法分类（fail-closed）: {e}"
+                    );
+                    None
+                }
+            }
+        } else {
+            Some(Vec::new())
+        };
+
+        let pos_report = self.reconcile_positions(local_positions, &positions);
+        let order_report = self.reconcile_orders(local_pending_orders, &orders);
+        let recovery = build_recovery_plan(
+            local_positions,
+            &positions,
+            local_pending_orders,
+            &remote_open_ids,
+            trades.as_deref(),
+            DEFAULT_POSITION_TOLERANCE,
+        );
+
+        self.sync_count.fetch_add(1, Ordering::Relaxed);
+        *self.last_sync.write().unwrap() = Instant::now();
+
+        Ok((pos_report, order_report, recovery))
+    }
 
     /// 执行完整对账（持仓 + 订单）
     pub async fn full_reconcile(
@@ -619,6 +841,100 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// 字符串或数字 JSON 值 → f64（兼容 Polymarket 两种价量编码）。
+fn parse_json_f64(v: &serde_json::Value) -> f64 {
+    match v {
+        serde_json::Value::String(s) => s.parse().unwrap_or(0.0),
+        serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
+        _ => 0.0,
+    }
+}
+
+// ============================================================================
+// 恢复计划构建（P0-007B）— 纯函数
+// ============================================================================
+
+/// 在成交列表里查找引用指定订单的成交（用于判断消失订单是否已成交）。
+pub fn find_trade_for_order<'a>(order_id: &str, trades: &'a [RemoteTrade]) -> Option<&'a RemoteTrade> {
+    trades.iter().find(|t| t.references_order(order_id))
+}
+
+/// 分类消失订单：有 trade 引用 → Filled；否则 → NonFilled。
+pub fn classify_vanished_order(order_id: &str, trades: &[RemoteTrade]) -> OrderTerminalState {
+    if find_trade_for_order(order_id, trades).is_some() {
+        OrderTerminalState::Filled
+    } else {
+        OrderTerminalState::NonFilled
+    }
+}
+
+/// 由对账输入构建恢复计划。
+///
+/// - 订单恢复：本地 pending 但远端已消失的订单，若有 trade 引用 → `MarkOrderFilled`
+///   （携带完整成交信息）；无 trade → `MarkOrderNonFilled`。
+/// - trades 为 `None`（拉取失败）时，消失订单进入 `unresolved_orders`（FAIL-CLOSED）。
+/// - 持仓恢复：以远端为权威，本地与远端数量差超过 `position_tolerance` → `RebuildPosition`；
+///   本地有但远端没有的非零仓位 → `RebuildPosition`（qty=0 删除）。
+pub fn build_recovery_plan(
+    local_positions: &HashMap<String, f64>,
+    remote_positions: &[RemotePosition],
+    local_pending_order_ids: &std::collections::HashSet<String>,
+    remote_open_ids: &std::collections::HashSet<String>,
+    trades: Option<&[RemoteTrade]>,
+    position_tolerance: f64,
+) -> RecoveryPlan {
+    let mut plan = RecoveryPlan::default();
+
+    // 1) 订单恢复：本地 pending 但远端已消失 → 分类终态
+    for order_id in local_pending_order_ids {
+        if remote_open_ids.contains(order_id) {
+            continue; // 仍在 open，无需恢复
+        }
+        match trades {
+            Some(ts) => match find_trade_for_order(order_id, ts) {
+                Some(t) => plan.actions.push(RecoveryAction::MarkOrderFilled {
+                    order_id: order_id.clone(),
+                    token_id: t.asset_id.clone(),
+                    side: t.side.clone(),
+                    price: t.price(),
+                    size: t.size(),
+                    trade_id: t.id.clone(),
+                }),
+                None => plan
+                    .actions
+                    .push(RecoveryAction::MarkOrderNonFilled { order_id: order_id.clone() }),
+            },
+            None => plan.unresolved_orders.push(order_id.clone()),
+        }
+    }
+
+    // 2) 持仓恢复：以远端为权威重建
+    for pos in remote_positions {
+        let local = local_positions.get(&pos.asset).copied().unwrap_or(0.0);
+        if (local - pos.size).abs() > position_tolerance {
+            let notional = pos.size * pos.avg_price;
+            plan.actions.push(RecoveryAction::RebuildPosition {
+                token_id: pos.asset.clone(),
+                qty: pos.size,
+                notional,
+            });
+        }
+    }
+
+    // 3) 本地有但远端没有的非零仓位 → 清空
+    for (token_id, local_qty) in local_positions {
+        if local_qty.abs() > 0.0 && !remote_positions.iter().any(|p| &p.asset == token_id) {
+            plan.actions.push(RecoveryAction::RebuildPosition {
+                token_id: token_id.clone(),
+                qty: 0.0,
+                notional: 0.0,
+            });
+        }
+    }
+
+    plan
 }
 
 // ============================================================================
@@ -826,5 +1142,255 @@ mod tests {
             serde_json::from_str::<Vec<serde_json::Value>>(body).is_err(),
             "对象 body 不应被当作数组解析成功"
         );
+    }
+
+    // ========================================================================
+    // P0-007B 恢复计划构建测试
+    // ========================================================================
+
+    fn remote_pos(asset: &str, size: f64, avg_price: f64) -> RemotePosition {
+        RemotePosition {
+            asset: asset.to_string(),
+            condition_id: "c1".to_string(),
+            size,
+            avg_price,
+            current_value: 0.0,
+            cash_pnl: 0.0,
+        }
+    }
+
+    fn remote_trade(id: &str, taker: &str, maker: &str, asset: &str, side: &str) -> RemoteTrade {
+        RemoteTrade {
+            id: id.to_string(),
+            taker_order_id: taker.to_string(),
+            maker_order_id: maker.to_string(),
+            side: side.to_string(),
+            price: serde_json::json!("0.5"),
+            size: serde_json::json!("10"),
+            asset_id: asset.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_remote_trade_price_size_parse_string() {
+        let t = remote_trade("t1", "o1", "", "tok-1", "BUY");
+        assert!((t.price() - 0.5).abs() < 1e-9);
+        assert!((t.size() - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_remote_trade_price_size_parse_number() {
+        let mut t = remote_trade("t1", "o1", "", "tok-1", "BUY");
+        t.price = serde_json::json!(0.62);
+        t.size = serde_json::json!(8);
+        assert!((t.price() - 0.62).abs() < 1e-9);
+        assert!((t.size() - 8.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_remote_trade_references_order() {
+        let t = remote_trade("t1", "o-taker", "o-maker", "tok-1", "BUY");
+        assert!(t.references_order("o-taker"));
+        assert!(t.references_order("o-maker"));
+        assert!(!t.references_order("o-other"));
+        assert!(!t.references_order(""));
+    }
+
+    #[test]
+    fn test_classify_vanished_order_filled_vs_nonfilled() {
+        let trades = vec![remote_trade("t1", "o1", "", "tok-1", "BUY")];
+        assert_eq!(
+            classify_vanished_order("o1", &trades),
+            OrderTerminalState::Filled
+        );
+        assert_eq!(
+            classify_vanished_order("o2", &trades),
+            OrderTerminalState::NonFilled
+        );
+    }
+
+    #[test]
+    fn test_build_recovery_plan_filled_order() {
+        let local_pos: HashMap<String, f64> = HashMap::new();
+        let remote_positions: Vec<RemotePosition> = Vec::new();
+        let local_pending: std::collections::HashSet<String> = ["o1".to_string()].into();
+        let remote_open: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let trades = vec![remote_trade("t1", "o1", "", "tok-1", "BUY")];
+
+        let plan = build_recovery_plan(
+            &local_pos,
+            &remote_positions,
+            &local_pending,
+            &remote_open,
+            Some(&trades),
+            1.0,
+        );
+
+        assert_eq!(plan.actions.len(), 1);
+        assert!(plan.unresolved_orders.is_empty());
+        match &plan.actions[0] {
+            RecoveryAction::MarkOrderFilled {
+                order_id,
+                token_id,
+                side,
+                price,
+                size,
+                trade_id,
+            } => {
+                assert_eq!(order_id, "o1");
+                assert_eq!(token_id, "tok-1");
+                assert_eq!(side, "BUY");
+                assert!((price - 0.5).abs() < 1e-9);
+                assert!((size - 10.0).abs() < 1e-9);
+                assert_eq!(trade_id, "t1");
+            }
+            other => panic!("期望 MarkOrderFilled，得到 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_build_recovery_plan_nonfilled_order() {
+        let local_pos: HashMap<String, f64> = HashMap::new();
+        let remote_positions: Vec<RemotePosition> = Vec::new();
+        let local_pending: std::collections::HashSet<String> = ["o2".to_string()].into();
+        let remote_open: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let trades = vec![remote_trade("t1", "o1", "", "tok-1", "BUY")]; // o2 无成交
+
+        let plan = build_recovery_plan(
+            &local_pos,
+            &remote_positions,
+            &local_pending,
+            &remote_open,
+            Some(&trades),
+            1.0,
+        );
+
+        assert_eq!(plan.actions.len(), 1);
+        match &plan.actions[0] {
+            RecoveryAction::MarkOrderNonFilled { order_id } => assert_eq!(order_id, "o2"),
+            other => panic!("期望 MarkOrderNonFilled，得到 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_build_recovery_plan_unresolved_when_trades_none() {
+        let local_pos: HashMap<String, f64> = HashMap::new();
+        let remote_positions: Vec<RemotePosition> = Vec::new();
+        let local_pending: std::collections::HashSet<String> = ["o1".to_string()].into();
+        let remote_open: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // trades 拉取失败（None）→ 消失订单进入 unresolved，不擅自标记终态
+        let plan = build_recovery_plan(
+            &local_pos,
+            &remote_positions,
+            &local_pending,
+            &remote_open,
+            None,
+            1.0,
+        );
+
+        assert!(plan.actions.is_empty());
+        assert!(plan.has_unresolved());
+        assert_eq!(plan.unresolved_orders, vec!["o1".to_string()]);
+    }
+
+    #[test]
+    fn test_build_recovery_plan_position_rebuild() {
+        // 本地 150 vs 远端 100 → 超容差，重建
+        let local_pos: HashMap<String, f64> = [("tok-1".to_string(), 150.0)].into();
+        let remote_positions = vec![remote_pos("tok-1", 100.0, 0.5)];
+        let local_pending: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let remote_open: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        let plan = build_recovery_plan(
+            &local_pos,
+            &remote_positions,
+            &local_pending,
+            &remote_open,
+            Some(&[]),
+            1.0,
+        );
+
+        assert_eq!(plan.actions.len(), 1);
+        match &plan.actions[0] {
+            RecoveryAction::RebuildPosition {
+                token_id,
+                qty,
+                notional,
+            } => {
+                assert_eq!(token_id, "tok-1");
+                assert!((qty - 100.0).abs() < 1e-9);
+                assert!((notional - 50.0).abs() < 1e-9); // 100 * 0.5
+            }
+            other => panic!("期望 RebuildPosition，得到 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_build_recovery_plan_remove_local_only_position() {
+        // 本地有非零仓位，远端没有 → 清空
+        let local_pos: HashMap<String, f64> = [("tok-gone".to_string(), 50.0)].into();
+        let remote_positions: Vec<RemotePosition> = Vec::new();
+        let local_pending: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let remote_open: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        let plan = build_recovery_plan(
+            &local_pos,
+            &remote_positions,
+            &local_pending,
+            &remote_open,
+            Some(&[]),
+            1.0,
+        );
+
+        assert_eq!(plan.actions.len(), 1);
+        match &plan.actions[0] {
+            RecoveryAction::RebuildPosition {
+                token_id,
+                qty,
+                notional,
+            } => {
+                assert_eq!(token_id, "tok-gone");
+                assert_eq!(*qty, 0.0);
+                assert_eq!(*notional, 0.0);
+            }
+            other => panic!("期望 RebuildPosition(清空)，得到 {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_build_recovery_plan_no_diff_no_actions() {
+        // 完全一致 → 无动作
+        let local_pos: HashMap<String, f64> = [("tok-1".to_string(), 100.0)].into();
+        let remote_positions = vec![remote_pos("tok-1", 100.0, 0.5)];
+        let local_pending: std::collections::HashSet<String> = ["o1".to_string()].into();
+        let remote_open: std::collections::HashSet<String> = ["o1".to_string()].into();
+
+        let plan = build_recovery_plan(
+            &local_pos,
+            &remote_positions,
+            &local_pending,
+            &remote_open,
+            Some(&[]),
+            1.0,
+        );
+
+        assert!(!plan.has_actions());
+        assert!(!plan.has_unresolved());
+    }
+
+    #[test]
+    fn test_remote_trade_parse_camelcase_and_snakecase() {
+        // camelCase（CLOB 真实形态）
+        let camel = r#"{"id":"t1","takerOrderId":"o1","makerOrderId":"","side":"BUY","price":"0.5","size":"10","assetId":"tok-1"}"#;
+        let t: RemoteTrade = serde_json::from_str(camel).unwrap();
+        assert_eq!(t.taker_order_id, "o1");
+        assert_eq!(t.asset_id, "tok-1");
+
+        // snake_case（Data API 兼容形态）
+        let snake = r#"{"id":"t1","taker_order_id":"o1","maker_order_id":"","side":"BUY","price":"0.5","size":"10","asset_id":"tok-1"}"#;
+        let t: RemoteTrade = serde_json::from_str(snake).unwrap();
+        assert_eq!(t.taker_order_id, "o1");
+        assert_eq!(t.asset_id, "tok-1");
     }
 }

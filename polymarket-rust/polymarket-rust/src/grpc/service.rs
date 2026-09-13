@@ -10,15 +10,16 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::Utc;
-use tokio::sync::Mutex;
+use tokio::sync::{broadcast, Mutex};
 use tonic::{Request, Response, Status};
 
 use crate::clob::client::ClobConfig;
 use crate::fast::executor::FastExecutor;
 use crate::fast::fill_records::{compute_slippage, FillLedger, FillRecord};
-use crate::fast::market_events::TradeEvent;
+use crate::fast::market_events::{MarketEvent, TradeEvent};
 use crate::fast::order_state::{OrderState, OrderStore};
 use crate::fast::risk_engine::{RiskConfig, RiskEngine};
+use crate::fast::state_sync::{RecoveryAction, RecoveryPlan};
 use crate::fast::trading_gate::TradingGate;
 use crate::order::{OrderFlow, PlaceOrderParams};
 use crate::types::enums::{OrderType, Side};
@@ -353,6 +354,12 @@ impl ExecutionServiceImpl {
             }
         };
 
+        // P0-015：fill 幂等——同一 trade_id 只处理一次（防双路/重复轮询重复记账）
+        if !self.fill_ledger.claim_trade(&trade.trade_id) {
+            tracing::debug!("on_market_trade: trade_id={} 已处理，跳过", trade.trade_id);
+            return;
+        }
+
         let notional = trade.price * trade.size;
 
         // 1. RiskEngine 权威仓位
@@ -379,6 +386,7 @@ impl ExecutionServiceImpl {
                 trade.price,
                 trade.size,
             );
+            rec.trade_id = trade.trade_id.clone(); // P0-015：fill 级 identity
             rec.mark_filled(trade.price, 0.0);
             self.fill_ledger.record(rec);
         }
@@ -387,6 +395,84 @@ impl ExecutionServiceImpl {
         if let Some(mut st) = self.order_store.get(&trade.order_id) {
             st.update_fill(trade.size);
             self.order_store.upsert(st);
+        }
+    }
+
+    /// P0-007B：应用 StateSync 生成的恢复计划，修复本地状态。
+    ///
+    /// - `MarkOrderFilled` → 走 `on_market_trade`（补记 FillLedger + RiskEngine + OrderStore，
+    ///   复用 trade_id 幂等去重，防重复记账）
+    /// - `MarkOrderNonFilled` → 标记 cancelled（终态，清除 pending）
+    /// - `RebuildPosition` → 以远端为权威重建 risk_state 与 RiskEngine 仓位
+    ///
+    /// 返回应用的恢复动作数量。
+    pub async fn apply_recovery(&self, plan: &RecoveryPlan) -> usize {
+        for action in &plan.actions {
+            match action {
+                RecoveryAction::MarkOrderFilled {
+                    order_id,
+                    token_id,
+                    side,
+                    price,
+                    size,
+                    trade_id,
+                } => {
+                    let trade = TradeEvent {
+                        token_id: token_id.clone(),
+                        trade_id: trade_id.clone(),
+                        order_id: order_id.clone(),
+                        side: side.clone(),
+                        price: *price,
+                        size: *size,
+                        timestamp: 0,
+                        taker_order_id: order_id.clone(),
+                        maker_order_id: String::new(),
+                        trader_side: "TAKER".to_string(),
+                        owner: String::new(),
+                        status: "MATCHED".to_string(),
+                    };
+                    self.on_market_trade(&trade).await;
+                }
+                RecoveryAction::MarkOrderNonFilled { order_id } => {
+                    if let Some(mut st) = self.order_store.get(order_id) {
+                        st.mark_cancelled();
+                        self.order_store.upsert(st);
+                    }
+                }
+                RecoveryAction::RebuildPosition {
+                    token_id,
+                    qty,
+                    notional,
+                } => {
+                    {
+                        let mut rs = self.risk_state.lock().await;
+                        if qty.abs() < 1e-9 && notional.abs() < 1e-9 {
+                            rs.positions.remove(token_id);
+                        } else {
+                            rs.positions.insert(token_id.clone(), *qty);
+                        }
+                    }
+                    if let Some(re) = self.risk_engine.as_ref() {
+                        re.sync_position(token_id, *qty, *notional);
+                    }
+                }
+            }
+        }
+        plan.actions.len()
+    }
+}
+
+/// P0-014：市场事件消费循环。把 poller 广播的 Trade 事件转发到
+/// [`ExecutionServiceImpl::on_market_trade`]（成交 → RiskEngine/FillLedger/OrderStore）。
+///
+/// 当 broadcast sender 全部 drop 后（`rx.recv()` 返回 Err）循环退出。
+pub async fn consume_trade_events(
+    service: Arc<ExecutionServiceImpl>,
+    mut rx: broadcast::Receiver<MarketEvent>,
+) {
+    while let Ok(event) = rx.recv().await {
+        if let MarketEvent::Trade(trade) = event {
+            service.on_market_trade(&trade).await;
         }
     }
 }
@@ -538,7 +624,8 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
 
         let notional = order.quantity * order.target_price;
 
-        if let Err(e) = re.pre_check(&order.token_id, side, notional, order.quantity, 0) {
+        // ★ P0-008：原子「检查 + 预留」——并发下单不会同时通过仓位上限。
+        if let Err(e) = re.check_and_reserve(&order.token_id, side, notional, order.quantity, 0) {
             tracing::warn!("风控预检拦截: token={}, {}", order.token_id, e);
 
             self.order_store.mark_rejected(&order.order_id);
@@ -615,29 +702,9 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
                         self.order_store.upsert(st);
                     }
 
-                    // 风控：只有真实 fill 才更新持仓（P0-03/04）
-                    if filled_size > 0.0 {
-                        let mut rs = self.risk_state.lock().await;
-                        *rs.positions.entry(order.token_id.clone()).or_insert(0.0) += filled_size;
-                    }
-                    // ★ P0-04：真实成交同步到 RiskEngine authoritative position state
-                    if filled_size > 0.0 {
-                        let filled_notional = filled_size * filled_price;
-
-                        re.on_fill(&order.token_id, side, filled_size, filled_notional);
-                    }
-                    // 记录成交：只有真实 fill 才记（P0-04）
-                    if filled_size > 0.0 && !exchange_order_id.is_empty() {
-                        let mut rec = FillRecord::new(
-                            exchange_order_id.clone(),
-                            order.token_id.clone(),
-                            side.as_str().to_string(),
-                            order.target_price,
-                            filled_size,
-                        );
-                        rec.mark_filled(filled_price, 0.0);
-                        self.fill_ledger.record(rec);
-                    }
+                    // 方案 X（P0-015 收尾）：成交记账唯一走 on_market_trade（路径 B）。
+                    // 下单路径只更新 OrderStore 状态，不再 on_fill / 记 FillLedger，
+                    // 避免与轮询成交双路重复记账。仓位预留由 P0-008 check-and-reserve 解决。
 
                     return Ok(Response::new(pb::OrderResult {
                         order_id: order.order_id.clone(),
@@ -658,6 +725,8 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
                 }
                 Err(e) => {
                     tracing::error!("fast path 下单失败: {}", e);
+                    // P0-008：下单失败，释放预留额度
+                    re.release_reserve(&order.token_id, notional);
                     self.order_store.mark_rejected(&order.order_id);
                     return Ok(Response::new(pb::OrderResult {
                         order_id: order.order_id.clone(),
@@ -679,6 +748,8 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
             order.order_id
         );
 
+        // P0-008：FastExecutor 缺失，释放预留额度
+        re.release_reserve(&order.token_id, notional);
         self.order_store.mark_rejected(&order.order_id);
         return Ok(Response::new(pb::OrderResult {
             order_id: order.order_id.clone(),
@@ -1023,6 +1094,9 @@ mod tests {
             timestamp: 0,
             taker_order_id: "order-1".to_string(),
             maker_order_id: "maker-1".to_string(),
+            trader_side: "TAKER".to_string(),
+            owner: "0xowner".to_string(),
+            status: "MATCHED".to_string(),
         };
 
         service.on_market_trade(&trade).await;
@@ -1031,6 +1105,79 @@ mod tests {
         assert_eq!(service.fill_ledger().list().len(), 1);
 
         // risk_state 仓位更新（BUY +10）
+        let rs = service.risk_state.lock().await;
+        assert_eq!(rs.positions.get("token-1").copied().unwrap_or(0.0), 10.0);
+    }
+
+    /// P0-015：同一 trade_id 重复投递只记账一次。
+    #[tokio::test]
+    async fn test_on_market_trade_idempotent_by_trade_id() {
+        let mut service = ExecutionServiceImpl::new_mock();
+        let risk_engine = Arc::new(RiskEngine::new(RiskConfig::default()));
+        service.set_risk_engine(risk_engine);
+
+        let trade = TradeEvent {
+            token_id: "token-1".to_string(),
+            trade_id: "trade-1".to_string(),
+            order_id: "order-1".to_string(),
+            side: "BUY".to_string(),
+            price: 0.5,
+            size: 10.0,
+            timestamp: 0,
+            taker_order_id: "order-1".to_string(),
+            maker_order_id: "maker-1".to_string(),
+            trader_side: "TAKER".to_string(),
+            owner: "0xowner".to_string(),
+            status: "MATCHED".to_string(),
+        };
+
+        service.on_market_trade(&trade).await;
+        service.on_market_trade(&trade).await; // 重复投递
+
+        // FillLedger 只记 1 条
+        assert_eq!(service.fill_ledger().list().len(), 1);
+        // 仓位只 +10 一次（不重复累加）
+        let rs = service.risk_state.lock().await;
+        assert_eq!(rs.positions.get("token-1").copied().unwrap_or(0.0), 10.0);
+    }
+
+    /// P0-014：事件消费链 poller → MarketEvent::Trade → on_market_trade 接通。
+    #[tokio::test]
+    async fn test_consume_trade_events_wires_on_market_trade() {
+        let (tx, _) = broadcast::channel(16);
+        let rx = tx.subscribe();
+
+        let mut service = ExecutionServiceImpl::new_mock();
+        service.set_risk_engine(Arc::new(RiskEngine::new(RiskConfig::default())));
+        let service = Arc::new(service);
+
+        // spawn consumer
+        let svc = service.clone();
+        tokio::spawn(consume_trade_events(svc, rx));
+
+        // 发送一笔成交事件
+        let trade = TradeEvent {
+            token_id: "token-1".to_string(),
+            trade_id: "trade-wire".to_string(),
+            order_id: "order-1".to_string(),
+            side: "BUY".to_string(),
+            price: 0.5,
+            size: 10.0,
+            timestamp: 0,
+            taker_order_id: "order-1".to_string(),
+            maker_order_id: "maker-1".to_string(),
+            trader_side: "TAKER".to_string(),
+            owner: "0xowner".to_string(),
+            status: "MATCHED".to_string(),
+        };
+        let _ = tx.send(MarketEvent::Trade(trade));
+        drop(tx); // 关闭 sender，让消费循环退出
+
+        // 给 consumer 时间处理
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // 成交被记账
+        assert_eq!(service.fill_ledger().list().len(), 1);
         let rs = service.risk_state.lock().await;
         assert_eq!(rs.positions.get("token-1").copied().unwrap_or(0.0), 10.0);
     }
@@ -1069,5 +1216,95 @@ mod tests {
         );
         // 且不再进入 pending（对账不误报）
         assert!(!service.order_store.pending_order_ids().contains("o-fail"));
+    }
+
+    /// P0-007B：apply_recovery 应用恢复计划（非成交订单标记终态 + 仓位重建 + 成交补记）。
+    #[tokio::test]
+    async fn test_apply_recovery_rebuild_and_nonfilled() {
+        use crate::fast::order_state::OrderStateStatus;
+        use crate::fast::state_sync::RecoveryAction;
+        use crate::fast::state_sync::RecoveryPlan;
+
+        let mut service = ExecutionServiceImpl::new_mock();
+        service.set_risk_engine(Arc::new(RiskEngine::new(RiskConfig::default())));
+
+        // 先制造一个 pending 订单（Live 状态）
+        service
+            .order_store
+            .create("o-vanish".to_string(), "tok-1".to_string(), "BUY".to_string(), 10.0);
+        if let Some(mut st) = service.order_store.get("o-vanish") {
+            st.mark_submitted("ex-vanish".to_string());
+            st.mark_live();
+            service.order_store.upsert(st);
+        }
+        assert!(service
+            .order_store
+            .pending_exchange_order_ids()
+            .contains("ex-vanish"));
+
+        let plan = RecoveryPlan {
+            actions: vec![
+                RecoveryAction::MarkOrderNonFilled {
+                    order_id: "o-vanish".to_string(),
+                },
+                RecoveryAction::RebuildPosition {
+                    token_id: "tok-1".to_string(),
+                    qty: 25.0,
+                    notional: 12.5,
+                },
+            ],
+            unresolved_orders: Vec::new(),
+        };
+
+        let applied = service.apply_recovery(&plan).await;
+        assert_eq!(applied, 2);
+
+        // 非成交订单 → cancelled，退出 pending
+        assert_eq!(
+            service.order_store.get("o-vanish").map(|s| s.status),
+            Some(OrderStateStatus::Cancelled)
+        );
+        assert!(!service
+            .order_store
+            .pending_exchange_order_ids()
+            .contains("ex-vanish"));
+
+        // 仓位重建 → risk_state 与 RiskEngine 都更新
+        let rs = service.risk_state.lock().await;
+        assert_eq!(rs.positions.get("tok-1").copied().unwrap_or(0.0), 25.0);
+        drop(rs);
+        let re = service.risk_engine.as_ref().unwrap();
+        assert_eq!(re.snapshot_positions().get("tok-1"), Some(&25.0));
+        assert_eq!(re.snapshot().global_exposure, 12.5);
+    }
+
+    /// P0-007B：apply_recovery 对 MarkOrderFilled 走 on_market_trade（成交补记 + 幂等）。
+    #[tokio::test]
+    async fn test_apply_recovery_filled_records_fill() {
+        use crate::fast::state_sync::{RecoveryAction, RecoveryPlan};
+
+        let mut service = ExecutionServiceImpl::new_mock();
+        service.set_risk_engine(Arc::new(RiskEngine::new(RiskConfig::default())));
+
+        let plan = RecoveryPlan {
+            actions: vec![RecoveryAction::MarkOrderFilled {
+                order_id: "o-fill".to_string(),
+                token_id: "tok-1".to_string(),
+                side: "BUY".to_string(),
+                price: 0.5,
+                size: 10.0,
+                trade_id: "trade-recover-1".to_string(),
+            }],
+            unresolved_orders: Vec::new(),
+        };
+
+        let applied = service.apply_recovery(&plan).await;
+        assert_eq!(applied, 1);
+
+        // FillLedger 记 1 条
+        assert_eq!(service.fill_ledger().list().len(), 1);
+        // risk_state 仓位 +10
+        let rs = service.risk_state.lock().await;
+        assert_eq!(rs.positions.get("tok-1").copied().unwrap_or(0.0), 10.0);
     }
 }

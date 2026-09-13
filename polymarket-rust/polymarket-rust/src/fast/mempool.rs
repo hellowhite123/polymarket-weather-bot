@@ -498,7 +498,11 @@ impl PendingOrderTracker {
     }
 
     /// 检查是否允许新增 pending 订单（不实际添加）
+    ///
+    /// 锁顺序统一为「先 orders 后 counts」，与写锁路径（`try_submit`）
+    /// 一致，避免读写锁交叉死锁。
     pub fn check_capacity(&self, token_id: &str) -> ClobResult<()> {
+        let orders = self.orders.read().unwrap();
         let counts = self.per_token_counts.read().unwrap();
 
         // 检查 per-token 上限
@@ -512,7 +516,6 @@ impl PendingOrderTracker {
         }
 
         // 检查全局上限
-        let orders = self.orders.read().unwrap();
         if orders.len() >= self.max_global {
             return Err(ClobError::OrderFailed(format!(
                 "全局 Pending 上限: 已有 {} 笔挂单 (上限 {})",
@@ -524,24 +527,47 @@ impl PendingOrderTracker {
         Ok(())
     }
 
-    /// 记录一笔新提交的订单
+    /// 原子提交（P0-012）：capacity check + reservation 在同一写锁内完成，
+    /// 杜绝并发 submit 同时通过容量检查导致突破 per-token/global 上限。
+    pub fn try_submit(&self, key: String, entry: PendingEntry) -> ClobResult<()> {
+        let token_id = entry.fingerprint.token_id.clone();
+
+        // 统一锁顺序：先 orders 后 counts，两个写锁内完成 check + reserve
+        let mut orders = self.orders.write().unwrap();
+        let mut counts = self.per_token_counts.write().unwrap();
+
+        // 检查 per-token 上限
+        let per_token = counts.get(&token_id).copied().unwrap_or(0);
+        if per_token >= self.max_per_token {
+            return Err(ClobError::OrderFailed(format!(
+                "Pending 上限: token={} 已有 {} 笔挂单 (上限 {})",
+                token_id, per_token, self.max_per_token
+            )));
+        }
+
+        // 检查全局上限
+        if orders.len() >= self.max_global {
+            return Err(ClobError::OrderFailed(format!(
+                "全局 Pending 上限: 已有 {} 笔挂单 (上限 {})",
+                orders.len(),
+                self.max_global
+            )));
+        }
+
+        // reserve（原子）
+        orders.insert(key, entry);
+        *counts.entry(token_id).or_insert(0) += 1;
+        self.total_submitted.fetch_add(1, Ordering::Relaxed);
+
+        Ok(())
+    }
+
+    /// 记录一笔新提交的订单（委托 [`PendingOrderTracker::try_submit`]，兼容旧调用）。
     ///
     /// `key` 应该是唯一标识（可用临时 key 如 `"tmp_{timestamp}_{nonce}"`，
     /// 后续收到 orderID 后通过 `update_order_id()` 更新）。
     pub fn submit(&self, key: String, entry: PendingEntry) -> ClobResult<()> {
-        // 先检查容量
-        self.check_capacity(&entry.fingerprint.token_id)?;
-
-        let mut orders = self.orders.write().unwrap();
-        let mut counts = self.per_token_counts.write().unwrap();
-
-        orders.insert(key.clone(), entry.clone());
-        *counts
-            .entry(entry.fingerprint.token_id.clone())
-            .or_insert(0) += 1;
-        self.total_submitted.fetch_add(1, Ordering::Relaxed);
-
-        Ok(())
+        self.try_submit(key, entry)
     }
 
     /// 用正式 orderID 替换临时 key
@@ -1338,5 +1364,41 @@ mod tests {
         assert!(mon
             .check_before_submit("t", Side::Buy, 0.5, 10.0, 0.01)
             .is_ok());
+    }
+
+    // ========== P0-012：Mempool capacity TOCTOU ==========
+
+    #[test]
+    fn test_try_submit_atomic_capacity() {
+        // 全局上限 2，per-token 上限放宽到 10（聚焦全局容量的并发原子性）
+        let tracker = Arc::new(PendingOrderTracker::new(Duration::from_secs(30), 10, 2));
+        let success = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut handles = Vec::new();
+
+        for i in 0..8 {
+            let t = tracker.clone();
+            let s = success.clone();
+            handles.push(std::thread::spawn(move || {
+                let fp = OrderFingerprint::new("token-x", Side::Buy, 0.5, 10.0, 0.01);
+                let entry = PendingEntry {
+                    fingerprint: fp,
+                    order_id: None,
+                    submitted_at: Instant::now(),
+                    status: PendingStatus::Submitted,
+                    price: 0.5,
+                    size: 10.0,
+                };
+                if t.try_submit(format!("ord-{}", i), entry).is_ok() {
+                    s.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // 并发下只有 2 笔成功（全局上限 2），不会突破
+        assert_eq!(success.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(tracker.pending_count(), 2);
     }
 }
