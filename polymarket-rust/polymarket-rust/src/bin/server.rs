@@ -221,6 +221,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let svc = service.clone();
         let ss = state_sync.clone();
+        let tg = trading_gate.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
             loop {
@@ -232,9 +233,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .await
                 {
                     Ok((pos, ord, recovery)) => {
+                        // P1-032：后台对账发现差异 → 先降级 TradingGate 停新单（FAIL-CLOSED）。
+                        // reconcile_complete 不会覆盖 Halted（halt 是闩锁），差异时把 Ready→Reconciling。
+                        if !pos.in_sync || !ord.in_sync {
+                            tg.reconcile_complete(false, false);
+                            tracing::warn!(
+                                "StateSync 后台对账发现差异，TradingGate -> Reconciling（停新单）: positions_in_sync={}, orders_in_sync={}",
+                                pos.in_sync,
+                                ord.in_sync,
+                            );
+                        }
+
                         // P0-007B：后台对账自动恢复（成交补记 / 订单终态 / 仓位重建）
+                        let mut applied = 0usize;
                         if recovery.has_actions() {
-                            let applied = svc.apply_recovery(&recovery).await;
+                            applied = svc.apply_recovery(&recovery).await;
                             tracing::info!("StateSync 后台对账恢复 {} 项动作", applied);
                         }
                         if recovery.has_unresolved() {
@@ -243,16 +256,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 recovery.unresolved_orders.len()
                             );
                         }
-                        if !pos.in_sync || !ord.in_sync {
-                            tracing::warn!(
-                                "StateSync 后台对账发现差异: positions_in_sync={}, orders_in_sync={}",
-                                pos.in_sync,
-                                ord.in_sync,
-                            );
+
+                        // P1-032：发生过差异或恢复动作后，复核对账确认一致才回 Ready。
+                        // apply_recovery 改了本地状态，需重新快照后再对账，否则拿的是旧快照。
+                        if !pos.in_sync || !ord.in_sync || applied > 0 || recovery.has_unresolved()
+                        {
+                            let local_positions = svc.snapshot_positions().await;
+                            let local_orders = svc.snapshot_pending_exchange_order_ids();
+                            match ss.full_reconcile(&local_positions, &local_orders).await {
+                                Ok((pos2, ord2)) => {
+                                    tg.reconcile_complete(pos2.in_sync, ord2.in_sync);
+                                    if pos2.in_sync && ord2.in_sync {
+                                        tracing::info!(
+                                            "StateSync 后台对账复核一致，TradingGate -> Ready"
+                                        );
+                                    } else {
+                                        tracing::warn!(
+                                            "StateSync 后台对账复核仍不一致，保持 Reconciling: positions_in_sync={}, orders_in_sync={}",
+                                            pos2.in_sync,
+                                            ord2.in_sync,
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::error!("StateSync 后台恢复后复核对账失败: {e}");
+                                    // 复核失败 FAIL-CLOSED：保持/降级 Reconciling，不擅自回 Ready
+                                    tg.reconcile_complete(false, false);
+                                }
+                            }
                         }
                     }
                     Err(e) => {
                         tracing::error!("StateSync 后台对账失败: {e}");
+                        // P1-032：后台对账本身失败（网络/认证），同样 FAIL-CLOSED 降级停新单，
+                        // 避免在「状态未知」时继续放行新单。
+                        tg.reconcile_complete(false, false);
                     }
                 }
             }

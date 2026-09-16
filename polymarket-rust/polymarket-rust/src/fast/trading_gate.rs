@@ -208,4 +208,43 @@ mod tests {
         assert_eq!(gate.reason(), Some("api_key_init_failed".to_string()));
         assert!(gate.ensure_ready().is_err());
     }
+
+    /// P1-032：后台对账发现差异 → 降级 Reconciling（停新单）→ 恢复后复核一致 → 回 Ready。
+    /// 验证 TradingGate 支持「Ready → Reconciling → Ready」完整闭环，且降级期间 ensure_ready 拦截新单。
+    #[test]
+    fn test_reconcile_complete_degrade_then_recover() {
+        let gate = TradingGate::new();
+
+        // 启动对账通过 → Ready
+        gate.reconcile_complete(true, true);
+        assert_eq!(gate.state(), TradingGateState::Ready);
+        assert!(gate.ensure_ready().is_ok());
+
+        // 后台对账发现订单差异 → 降级 Reconciling，新单被拦截
+        gate.reconcile_complete(true, false);
+        assert_eq!(gate.state(), TradingGateState::Reconciling);
+        assert!(gate.ensure_ready().is_err());
+
+        // 恢复动作执行后复核一致 → 回 Ready
+        gate.reconcile_complete(true, true);
+        assert_eq!(gate.state(), TradingGateState::Ready);
+        assert!(gate.ensure_ready().is_ok());
+    }
+
+    /// P1-032：降级后复核仍不一致 → 保持 Reconciling（不擅自回 Ready）。
+    #[test]
+    fn test_reconcile_complete_degrade_stays_reconciling_on_persistent_diff() {
+        let gate = TradingGate::new();
+        gate.reconcile_complete(true, true);
+        assert_eq!(gate.state(), TradingGateState::Ready);
+
+        // 降级
+        gate.reconcile_complete(false, true);
+        assert_eq!(gate.state(), TradingGateState::Reconciling);
+
+        // 复核仍不一致 → 保持 Reconciling
+        gate.reconcile_complete(false, true);
+        assert_eq!(gate.state(), TradingGateState::Reconciling);
+        assert!(gate.ensure_ready().is_err());
+    }
 }
