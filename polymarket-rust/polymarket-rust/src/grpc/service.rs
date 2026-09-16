@@ -717,6 +717,25 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
                     let error_message = result.response.errorMsg.clone();
                     // 状态机：accepted ≠ filled（P0-03）
                     let execution_status = map_execution_status(&result.response.status, success);
+
+                    // P1-033②：HTTP 200 但 success=false（交易所拒单）→ 释放预留 + 标记
+                    // rejected，否则预留泄漏（订单不会被成交，on_market_trade 也不会冲抵）。
+                    if !success {
+                        re.release_reserve(&order.token_id, notional);
+                        self.order_store.mark_rejected(&order.order_id);
+                        return Ok(Response::new(pb::OrderResult {
+                            order_id: order.order_id.clone(),
+                            success: false,
+                            exchange_order_id,
+                            error_message,
+                            timestamp: Utc::now().to_rfc3339(),
+                            filled_price: 0.0,
+                            filled_size: 0.0,
+                            status: pb::ExecutionStatus::Rejected as i32,
+                            ..Default::default()
+                        }));
+                    }
+
                     // R2-P0-03/21：从 making/taking 按 side 推导真实 fill 与成交价
                     let filled_size = filled_size_from_status(
                         &result.response.status,
@@ -779,7 +798,29 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
                 }
                 Err(e) => {
                     tracing::error!("fast path 下单失败: {}", e);
-                    // P0-008：下单失败，释放预留额度
+
+                    // P1-033③：网络超时/5xx 结果未知（订单可能已上链）——不立即释放预留、
+                    // 不标记终态，保留 pending（Received 态）交由 StateSync 对账确认远端后再决定。
+                    // 预留保持持有 = 保守方向（避免低估暴露）。
+                    if e.is_unknown_outcome() {
+                        tracing::warn!(
+                            "下单结果未知（可能已成交），保留预留额度待 StateSync 确认: {}",
+                            e
+                        );
+                        return Ok(Response::new(pb::OrderResult {
+                            order_id: order.order_id.clone(),
+                            success: false,
+                            exchange_order_id: String::new(),
+                            error_message: format!("下单结果未知，待对账确认: {}", e),
+                            timestamp: Utc::now().to_rfc3339(),
+                            filled_price: 0.0,
+                            filled_size: 0.0,
+                            status: pb::ExecutionStatus::Pending as i32,
+                            ..Default::default()
+                        }));
+                    }
+
+                    // 确定未成交（4xx 明确拒单 / 本地构建签名失败）：释放预留额度
                     re.release_reserve(&order.token_id, notional);
                     self.order_store.mark_rejected(&order.order_id);
                     return Ok(Response::new(pb::OrderResult {

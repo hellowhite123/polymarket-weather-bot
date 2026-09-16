@@ -123,14 +123,14 @@
 | P1（未编号） | P1-030 | StateSync partial-fill recovery 只恢复第一笔 | 🟢 FIXED（09-16） | 新增 `find_trades_for_order`（返回全部 trades），`build_recovery_plan` 每笔 partial fill 生成一个 `MarkOrderFilled`（`apply_fill` 增量 + `claim_trade` 按 trade_id 去重），不再 `.find()` 只取第一笔；+2 测试（find 全部 + 多笔生成多动作） |
 | P1（未编号） | P1-031 | Recovery 后 reserve 未完整重建 | 🟢 FIXED（09-16） | `risk_engine.rs` 新增 `rebuild_reserve`（skip 上限校验，恢复以远端为权威）；`service.rs` 新增 `rebuild_open_order_reserves`（用 OrderStore 的 token_id + open order price × remaining_size 按 token 聚合回填 reserved，跳过 SELL）；`server.rs` 恢复后非致命接线；+4 测试（重建计入后续检查 + 忽略非法 + SELL 跳过） |
 | P1（未编号） | P1-032 | Background StateSync 不自动降级 TradingGate | 🟢 FIXED（09-16） | 后台对账发现差异/恢复动作/对账失败时，先 `reconcile_complete` 降级 Ready→Reconciling（停新单，`ensure_ready` 拦截）；恢复后重新快照 + 复核对账，一致才回 Ready，仍不一致/复核失败保持 Reconciling（FAIL-CLOSED）；halt 闩锁不被覆盖；+2 测试（降级→恢复回 Ready 全闭环 + 持续差异保持 Reconciling） |
-| P1（未编号） | P1-033 | Reserve Rollback Lifecycle | 🟡 部分完成 | ① concentration 失败后 rollback ② HTTP200+`success=false` 时 service 只在 Err 分支 release → reserve 泄漏 ③ 网络超时/5xx unknown outcome 应进 StateSync 确认远端再决定 release/fill |
+| P1（未编号） | P1-033 | Reserve Rollback Lifecycle | 🟢 FIXED（09-16） | ① `check_and_reserve` 集中度失败后回滚预留（仅 Buy）；② HTTP 200+`success=false` 释放预留 + mark_rejected；③ 网络超时/5xx 判为「未知结果」→ `is_unknown_outcome()` 保留预留 + 返回 Pending（保守，不低估暴露），确定失败（4xx/本地）才释放；+4 测试（集中度回滚 + is_unknown_outcome 分类×2）。指纹级精确确认留待后续 |
 
 **推荐修复顺序（审核给）**：
 1. **OrderStore/Fill**：P1-027 → P1-028 → P1-029
 2. **StateSync**：P1-030 → P1-031 → P1-032
 3. **Reserve Lifecycle**：P1-033
 
-**当前进度**：P0 已清零（09-15）；P1-026 FIXED 待伯森先生确认关闭；P1-027/P1-028/P1-029/P1-030/P1-031/P1-032 FIXED（09-16）；P1-033 待修。
+**当前进度**：P0 已清零（09-15）；P1-026 FIXED 待伯森先生确认关闭；P1-027/P1-028/P1-029/P1-030/P1-031/P1-032/P1-033 FIXED（09-16）。**P1 待修批次（P1-027~033）全部完成。**
 
 ---
 

@@ -948,7 +948,15 @@ impl RiskEngine {
         self.check_gates(token_id, side, notional, qty, gas_gwei)?;
         self.position_limits
             .check_and_reserve(token_id, side, notional)?;
-        self.check_concentration(token_id, side, notional)?;
+        // P1-033①：集中度检查在「预留」之后执行，若失败须回滚刚才的预留额度，
+        // 否则预留泄漏（订单不会成交，也没有后续冲抵）。
+        if let Err(e) = self.check_concentration(token_id, side, notional) {
+            // 仅 Buy 会预留（Sell 不预留；对 Sell 调用 release 会误扣其他 pending 预留）。
+            if matches!(side, crate::types::enums::Side::Buy) {
+                self.position_limits.release_reserve(token_id, notional);
+            }
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -1530,6 +1538,34 @@ mod tests {
         // 现在又能再预留 400
         assert!(engine
             .check_and_reserve("m", Side::Buy, 400.0, 400.0, 50)
+            .is_ok());
+    }
+
+    /// P1-033①：集中度检查失败后回滚预留，不泄漏。
+    ///
+    /// 集中度检查在 `position_limits.check_and_reserve`（已预留）之后执行，失败时必须
+    /// 回滚，否则该市场 reserved 泄漏，后续下单被误拒。
+    #[test]
+    fn test_check_and_reserve_concentration_failure_rolls_back() {
+        let mut cfg = RiskConfig::default();
+        cfg.max_position_per_market = 1000.0;
+        cfg.max_global_exposure = 10000.0;
+        cfg.max_concentration = 0.3; // 30%
+        let engine = RiskEngine::new(cfg);
+
+        // 另一市场已持仓 2000（全局 filled = 2000）
+        engine.on_fill("other", Side::Buy, 2000.0, 2000.0);
+
+        // 集中度失败：new_market=900, future_total=2900 → 900/2900 ≈ 31% > 30%
+        assert!(engine
+            .check_and_reserve("t", Side::Buy, 900.0, 900.0, 50)
+            .is_err());
+
+        // 关键断言：回滚后 reserved("t") 应为 0。
+        // 若泄漏 900，则下面 500 会让 market = 900 + 500 = 1400 > 1000 → Err；
+        // 回滚成功则 market = 0 + 500 = 500 ≤ 1000，且 concentration 500/2500=20% 不触发 → Ok。
+        assert!(engine
+            .check_and_reserve("t", Side::Buy, 500.0, 500.0, 50)
             .is_ok());
     }
 
