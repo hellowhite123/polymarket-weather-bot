@@ -519,14 +519,42 @@ impl ExecutionServiceImpl {
 /// P0-014：市场事件消费循环。把 poller 广播的 Trade 事件转发到
 /// [`ExecutionServiceImpl::on_market_trade`]（成交 → RiskEngine/FillLedger/OrderStore）。
 ///
-/// 当 broadcast sender 全部 drop 后（`rx.recv()` 返回 Err）循环退出。
+/// P1-034：`rx.recv()` 的两种 Err 语义不同，必须分别处理：
+/// - `Lagged(n)`：消费者落后，**跳过了 n 条消息**（可能含成交），但 channel 仍可用 →
+///   告警（成交丢失需 StateSync 对账兜底）后**继续消费**；旧实现用 `while let Ok(...)`
+///   把 Lagged 当致命错误直接退出，导致成交链路静默永久停摆。
+/// - `Closed`：所有 sender 已 drop，真正不可恢复 → 告警后退出。
+///
+/// 只处理 `MarketEvent::Trade`，其余变体（OrderBookUpdate / OrderStateChange /
+/// Settlement）当前阶段静默忽略，不误跑 `on_market_trade`。
+/// trade_id 幂等由下层 `on_market_trade`（`FillLedger::claim_trade`）单点负责，
+/// 本层不重复做。
 pub async fn consume_trade_events(
     service: Arc<ExecutionServiceImpl>,
     mut rx: broadcast::Receiver<MarketEvent>,
 ) {
-    while let Ok(event) = rx.recv().await {
-        if let MarketEvent::Trade(trade) = event {
-            service.on_market_trade(&trade).await;
+    loop {
+        match rx.recv().await {
+            Ok(MarketEvent::Trade(trade)) => {
+                service.on_market_trade(&trade).await;
+            }
+            // 非 Trade 事件：当前阶段不处理
+            Ok(_other) => {}
+            // Lagged：channel 仍可用，但丢了事件（可能含成交）——告警后继续
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                tracing::error!(
+                    "market events 消费者落后，丢弃 {} 条事件（可能含成交，依赖 StateSync 对账兜底）",
+                    n
+                );
+                continue;
+            }
+            // Closed：sender 全部 drop，真正不可恢复——告警后退出
+            Err(broadcast::error::RecvError::Closed) => {
+                tracing::error!(
+                    "market events 广播通道已关闭，成交消费循环退出（需重启/重订阅）"
+                );
+                return;
+            }
         }
     }
 }
@@ -1348,6 +1376,154 @@ mod tests {
         assert_eq!(service.fill_ledger().list().len(), 1);
         let rs = service.risk_state.lock().await;
         assert_eq!(rs.positions.get("token-1").copied().unwrap_or(0.0), 10.0);
+    }
+
+    /// 测试辅助：构造一条 TradeEvent。
+    fn mk_trade(trade_id: &str, token_id: &str, size: f64) -> TradeEvent {
+        TradeEvent {
+            token_id: token_id.to_string(),
+            trade_id: trade_id.to_string(),
+            order_id: "order-x".to_string(),
+            side: "BUY".to_string(),
+            price: 0.5,
+            size,
+            timestamp: 0,
+            taker_order_id: "order-x".to_string(),
+            maker_order_id: String::new(),
+            trader_side: "TAKER".to_string(),
+            owner: String::new(),
+            status: "MATCHED".to_string(),
+        }
+    }
+
+    /// P1-034：`Lagged` 不是致命错误——consumer 必须告警后继续消费。
+    ///
+    /// 旧实现 `while let Ok(...)` 遇到 `Lagged` 直接退出循环，成交链路静默永久停摆。
+    /// 本测试在制造 lag 之后仍投递一笔成交，断言它被正常记账。
+    #[tokio::test]
+    async fn test_consume_trade_events_lagged_not_fatal() {
+        // 容量仅 2，连续发送超出容量 → rx 必然落后，首次 recv 返回 Lagged
+        let (tx, _ka) = broadcast::channel(2);
+        let rx = tx.subscribe();
+
+        let mut service = ExecutionServiceImpl::new_mock();
+        service.set_risk_engine(Arc::new(RiskEngine::new(RiskConfig::default())));
+        let service = Arc::new(service);
+
+        // 制造 lag：rx 尚未开始消费就灌超过容量的事件
+        for i in 0..8 {
+            let _ = tx.send(MarketEvent::Trade(mk_trade(
+                &format!("warmup-{i}"),
+                "tok-lag",
+                1.0,
+            )));
+        }
+        // lag 之后再投递一笔——只有 consumer 没被 Lagged 打死才会被消费
+        let _ = tx.send(MarketEvent::Trade(mk_trade("after-lag", "tok-lag", 7.0)));
+
+        let svc = service.clone();
+        let handle = tokio::spawn(consume_trade_events(svc, rx));
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let fills = service.fill_ledger().list();
+        assert!(
+            fills.iter().any(|f| f.trade_id == "after-lag"),
+            "Lagged 之后仍必须能消费后续成交（旧实现会静默退出，after-lag 丢失）"
+        );
+        // task 仍然存活（未被 Lagged 终止）
+        assert!(
+            !handle.is_finished(),
+            "Lagged 不应终止消费 task（旧实现会退出）"
+        );
+
+        drop(tx);
+        drop(_ka);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+    }
+
+    /// P1-034：`Closed`（所有 sender drop）才真正退出消费循环。
+    #[tokio::test]
+    async fn test_consume_trade_events_closed_exits() {
+        let (tx, _ka) = broadcast::channel(8);
+        let rx = tx.subscribe();
+
+        let mut service = ExecutionServiceImpl::new_mock();
+        service.set_risk_engine(Arc::new(RiskEngine::new(RiskConfig::default())));
+        let service = Arc::new(service);
+
+        let svc = service.clone();
+        let handle = tokio::spawn(consume_trade_events(svc, rx));
+
+        let _ = tx.send(MarketEvent::Trade(mk_trade("before-close", "tok-c", 3.0)));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(service.fill_ledger().list().len(), 1);
+
+        // 所有 sender drop → Closed → 循环退出
+        drop(tx);
+        drop(_ka);
+
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        assert!(
+            joined.is_ok(),
+            "sender 全部 drop（Closed）后 consumer task 应正常退出"
+        );
+    }
+
+    /// P1-034：非 Trade 事件被静默忽略，不会误跑 on_market_trade（不产生记账）。
+    #[tokio::test]
+    async fn test_consume_trade_events_ignores_non_trade_events() {
+        use crate::fast::market_events::{BookSnapshot, OrderStateEvent, SettlementEvent};
+
+        let (tx, _ka) = broadcast::channel(16);
+        let rx = tx.subscribe();
+
+        let mut service = ExecutionServiceImpl::new_mock();
+        service.set_risk_engine(Arc::new(RiskEngine::new(RiskConfig::default())));
+        let service = Arc::new(service);
+
+        let svc = service.clone();
+        let handle = tokio::spawn(consume_trade_events(svc, rx));
+
+        let _ = tx.send(MarketEvent::OrderBookUpdate(BookSnapshot {
+            token_id: "tok-n".to_string(),
+            bids: Vec::new(),
+            asks: Vec::new(),
+            timestamp: 0,
+        }));
+        let _ = tx.send(MarketEvent::OrderStateChange(OrderStateEvent {
+            order_id: "order-n".to_string(),
+            token_id: "tok-n".to_string(),
+            status: "live".to_string(),
+            filled_size: 5.0,
+            remaining_size: 5.0,
+            avg_price: Some(0.5),
+        }));
+        let _ = tx.send(MarketEvent::Settlement(SettlementEvent {
+            token_id: "tok-n".to_string(),
+            outcome: 1.0,
+            settled_at: 0,
+            uma_proposal: false,
+        }));
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        assert_eq!(
+            service.fill_ledger().list().len(),
+            0,
+            "OrderBookUpdate/OrderStateChange/Settlement 都不应触发成交记账"
+        );
+        let rs = service.risk_state.lock().await;
+        assert!(
+            rs.positions.get("tok-n").is_none(),
+            "非 Trade 事件不应污染 RiskEngine/risk_state 仓位"
+        );
+        // task 仍存活（非 Trade 事件被安全吞掉，未退出）
+        assert!(!handle.is_finished());
+
+        drop(tx);
+        drop(_ka);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
     }
 
     /// P1-010：下单失败路径（RiskEngine 未初始化）会把 claim 占位标记为 Rejected，
