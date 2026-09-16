@@ -861,6 +861,21 @@ pub fn find_trade_for_order<'a>(order_id: &str, trades: &'a [RemoteTrade]) -> Op
     trades.iter().find(|t| t.references_order(order_id))
 }
 
+/// 在成交列表里查找引用指定订单的**所有**成交（P1-030）。
+///
+/// 一个订单可能被多笔 partial fill 成交（多笔 trade），旧实现 `.find()`
+/// 只取第一笔，导致恢复时只补记第一笔成交量、丢失后续 fill。
+/// 返回全部引用该订单的 trade（按列表原始顺序）。
+pub fn find_trades_for_order<'a>(
+    order_id: &str,
+    trades: &'a [RemoteTrade],
+) -> Vec<&'a RemoteTrade> {
+    trades
+        .iter()
+        .filter(|t| t.references_order(order_id))
+        .collect()
+}
+
 /// 分类消失订单：有 trade 引用 → Filled；否则 → NonFilled。
 pub fn classify_vanished_order(order_id: &str, trades: &[RemoteTrade]) -> OrderTerminalState {
     if find_trade_for_order(order_id, trades).is_some() {
@@ -893,19 +908,28 @@ pub fn build_recovery_plan(
             continue; // 仍在 open，无需恢复
         }
         match trades {
-            Some(ts) => match find_trade_for_order(order_id, ts) {
-                Some(t) => plan.actions.push(RecoveryAction::MarkOrderFilled {
-                    order_id: order_id.clone(),
-                    token_id: t.asset_id.clone(),
-                    side: t.side.clone(),
-                    price: t.price(),
-                    size: t.size(),
-                    trade_id: t.id.clone(),
-                }),
-                None => plan
-                    .actions
-                    .push(RecoveryAction::MarkOrderNonFilled { order_id: order_id.clone() }),
-            },
+            Some(ts) => {
+                // P1-030：取该订单的**全部** trades（多笔 partial fill），
+                // 每笔生成一个 MarkOrderFilled 动作——恢复时由 `on_market_trade`
+                // 的 `apply_fill` 增量累加 + `claim_trade` 按 trade_id 幂等去重，
+                // 而非旧实现只取第一笔、丢失后续成交量。
+                let matched = find_trades_for_order(order_id, ts);
+                if matched.is_empty() {
+                    plan.actions
+                        .push(RecoveryAction::MarkOrderNonFilled { order_id: order_id.clone() });
+                } else {
+                    for t in matched {
+                        plan.actions.push(RecoveryAction::MarkOrderFilled {
+                            order_id: order_id.clone(),
+                            token_id: t.asset_id.clone(),
+                            side: t.side.clone(),
+                            price: t.price(),
+                            size: t.size(),
+                            trade_id: t.id.clone(),
+                        });
+                    }
+                }
+            }
             None => plan.unresolved_orders.push(order_id.clone()),
         }
     }
@@ -1245,6 +1269,67 @@ mod tests {
                 assert_eq!(trade_id, "t1");
             }
             other => panic!("期望 MarkOrderFilled，得到 {:?}", other),
+        }
+    }
+
+    /// P1-030：find_trades_for_order 返回引用该订单的全部 trades（多笔 partial fill）。
+    #[test]
+    fn test_find_trades_for_order_returns_all() {
+        let trades = vec![
+            remote_trade("t1", "o1", "", "tok-1", "BUY"),
+            remote_trade("t2", "o1", "", "tok-1", "BUY"),
+            remote_trade("t3", "o2", "", "tok-1", "BUY"),
+        ];
+        let matched = find_trades_for_order("o1", &trades);
+        assert_eq!(matched.len(), 2, "应返回引用 o1 的全部 2 笔 trade");
+        assert_eq!(matched[0].id, "t1");
+        assert_eq!(matched[1].id, "t2");
+        // 无引用 → 空
+        assert!(find_trades_for_order("o-none", &trades).is_empty());
+    }
+
+    /// P1-030：同订单多笔 partial fill → 每笔生成一个 MarkOrderFilled 动作，不丢失后续成交量。
+    #[test]
+    fn test_build_recovery_plan_multi_fill_generates_all_actions() {
+        let local_pos: HashMap<String, f64> = HashMap::new();
+        let remote_positions: Vec<RemotePosition> = Vec::new();
+        let local_pending: std::collections::HashSet<String> = ["o1".to_string()].into();
+        let remote_open: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // 同一订单 3 笔 partial fill（t1/t2/t3）
+        let trades = vec![
+            remote_trade("t1", "o1", "", "tok-1", "BUY"),
+            remote_trade("t2", "o1", "", "tok-1", "BUY"),
+            remote_trade("t3", "o1", "", "tok-1", "BUY"),
+        ];
+
+        let plan = build_recovery_plan(
+            &local_pos,
+            &remote_positions,
+            &local_pending,
+            &remote_open,
+            Some(&trades),
+            1.0,
+        );
+
+        // 3 笔 fill → 3 个 MarkOrderFilled 动作（旧实现只取第一笔 → 1 个）
+        assert_eq!(plan.actions.len(), 3, "3 笔 partial fill 应生成 3 个恢复动作");
+        let trade_ids: Vec<String> = plan
+            .actions
+            .iter()
+            .filter_map(|a| match a {
+                RecoveryAction::MarkOrderFilled { trade_id, .. } => Some(trade_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(trade_ids, vec!["t1", "t2", "t3"], "应包含全部 3 笔 trade_id");
+        // 每笔 size 均为单笔成交量 10（累计由 apply_fill 增量完成）
+        for a in &plan.actions {
+            match a {
+                RecoveryAction::MarkOrderFilled { size, .. } => {
+                    assert!((size - 10.0).abs() < 1e-9);
+                }
+                _ => panic!("应全为 MarkOrderFilled"),
+            }
         }
     }
 
