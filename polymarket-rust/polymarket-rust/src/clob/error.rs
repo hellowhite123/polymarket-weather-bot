@@ -73,15 +73,12 @@ mod tests {
     }
 
     #[test]
-    fn test_is_unknown_outcome_network_and_5xx() {
-        // 网络错误 → 未知
-        let http_err = ClobError::OrderFailed("not http".to_string()); // 用占位构造，避免依赖 reqwest 构造
-        let _ = http_err;
-        // 5xx → 未知
+    fn test_is_unknown_outcome_5xx_unknown_4xx_definite() {
+        // 5xx → 未知（服务器可能已处理但返回失败）
         assert!(api(500).is_unknown_outcome());
         assert!(api(502).is_unknown_outcome());
         assert!(api(503).is_unknown_outcome());
-        // 4xx → 确定拒单
+        // 4xx → 确定拒单（客户端错误，订单未上链）
         assert!(!api(400).is_unknown_outcome());
         assert!(!api(401).is_unknown_outcome());
         assert!(!api(422).is_unknown_outcome());
