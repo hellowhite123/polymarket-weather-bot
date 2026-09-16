@@ -66,7 +66,7 @@
 |------|------|------|------|---------|
 | P0-013 | Trade 归属 attribution（taker_order_id ≠ 用户订单） | GPT | 🔧 FIXED（09-13） | 阶段一 |
 | P0-014 | MarketEventPoller → ExecutionService 未接线 | GPT | 🔧 FIXED（09-13，默认关，`MARKET_EVENTS_ENABLED=1` 启用） | 阶段一 |
-| P0-015 | Fill 幂等 / 双路重复记账 | GPT | 🔧 FIXED（09-13：`trade_id` 幂等 + 方案 X 成交唯一走路径 B） | 阶段一 |
+| P0-015 | Fill 幂等 / 双路重复记账 | GPT | ✅ **VERIFIED（09-16）**：`on_market_trade` 是唯一调用 `RiskEngine::on_fill` 的路径；`claim_trade` 位于其之前，单写锁内 check+insert 原子，并发下仅首个返回 `true`；未发现绕过 `claim_trade` 的第二条路径；`FillLedger::record` 已用 trade_id 为 key（P1-029）。**正常非空 trade_id 不会二次入账**。残余边界风险见 **P1-035** | 阶段一 |
 | P0-007B | full_reconcile 只有检测、没有恢复 | GPT | 🔧 FIXED（09-13：`full_reconcile_with_recovery` + `build_recovery_plan` + `apply_recovery` + `sync_position`） | 阶段三 |
 | P0-008 | Risk check-and-reserve 非原子 | GPT | 🔧 FIXED（09-13：`check_and_reserve` 原子预留 + `release_reserve` 回退 + `on_fill` 冲抵预留） | 阶段二 |
 | P0-009 | Risk 输入校验 NaN/Inf/负值 | GPT | 🔧 FIXED（09-13：notional/qty NaN/Inf/负值全拒 + `RiskConfig::validate` fail-fast） | 阶段二 |
@@ -77,6 +77,27 @@
 | P0-017 | market_events JSON 入口「错误变 0」：`parse_f64`/`parse_timestamp` 静默把非法数据转 0.0/0，绕过 P0-009 数值安全；`attribute_order` 可返回空 order_id | 伯森先生点名（09-15，P0-009 数值安全的入口层延伸） | 🔧 FIXED（09-15：`parse_f64`/`parse_timestamp` 改 `Result` + `is_finite` 守卫，`attribute_order` 空 order_id 拦截，`poll_trades` 任一解析失败 warn+continue 跳过整条 TradeEvent，+5 测试） | 阶段三后 |
 | P0-018 | RiskEngine 超仓拒单集成测试缺失（审核 P0-003：只读 `pre_check` 已测，但原子 `check_and_reserve` 拒单后 reserve 不泄漏未锁定；place_order 拒单未验证「不调 FastExecutor/不产生有效订单」） | 外部审核（09-15） | 🔧 FIXED（09-15：`check_and_reserve` 超仓/全局超限 reserve 不泄漏 2 测试 + service 层 `test_place_order_over_limit_rejected_before_executor` 验证风控拦截先于 FastExecutor） | 阶段三后 |
 | P0-019 | StateSync 启动 reconciliation 集成测试缺失（审核 P0-007：正常同步→Ready / critical diff→不 Ready / unresolved→fail-closed 三场景无端到端接线测试） | 外部审核（09-15） | 🔧 FIXED（09-15：新增 `tests/p0_production_validation/state_sync_startup.rs`，wiremock mock CLOB 三端点复现 server.rs 启动对账决策链，3 场景全绿） | 阶段三后 |
+
+### ✅ P0-015 Fill Idempotency / Double Accounting — VERIFIED（09-16）
+
+**验证结果**（伯森先生复核，三重证据：git diff + 测试 + 调用链）：
+
+1. `ExecutionServiceImpl::on_market_trade()` 是全仓**唯一**调用 `RiskEngine::on_fill()` 的路径，不存在第二条入账入口。
+2. `FillLedger::claim_trade()` 位于 `RiskEngine::on_fill()` **之前**（service.rs:358 vs 367）。
+3. `claim_trade()` 使用 `RwLock<HashSet>` 的**写锁**，在同一临界区内完成 check + insert（`seen.insert()` 返回语义），无 TOCTOU。
+4. 相同 `trade_id` 在并发情况下**只有第一个调用能获得 `true`**；后续重复事件在进入 `RiskEngine::on_fill()` 前直接 `return`。
+5. 未发现绕过 `claim_trade()` 直接调用 `RiskEngine::on_fill()` 的第二条路径。
+6. `FillLedger::record()` 使用 `trade_id` 作为正常成交记录的唯一 key，不再以 `order_id` 覆盖不同 partial fills（P1-029 双索引）。
+7. `claim_trade` → `on_fill` 之间**无 `.await` 让渡点**（`on_fill` 为同步函数），不存在并发窗口。
+
+→ **结论：正常非空 `trade_id` 成交事件不会发生二次 RiskEngine 入账。**
+
+**残余边界风险**（已单列 **P1-035**）：
+`claim_trade("")` 当前返回 `true`，空 `trade_id` 不具备幂等保护。该问题是否构成 P0，取决于上游 `TradeEvent` 是否能够产生空 `trade_id`：
+- 若交易所 API 的有效成交事件保证存在非空 trade ID → 属防御性校验问题；
+- 若 API 异常响应可能产生空 ID → 应在 `poll_trades()` 入口 fail-closed，禁止空 `trade_id` 进入 `on_market_trade()`。
+
+**旺财查证结论（09-16）**：上游**代码层面允许**空 trade_id 产生——`TradeApiResponse.id`（market_events.rs:121）与 `RemoteTrade.id`（state_sync.rs:61）均带 `#[serde(default)]`，API 缺字段时得到 `""` 且**反序列化不失败**；且 poller 层去重对空 id 双重失效（market_events.rs:286 不去重、360 不记录）。详见 P1-035。
 
 **阶段一（已完成 09-13）**：P0-013 → P0-014 → P0-015（Trade 一致性链）。
 **阶段二（已完成 09-13）**：P0-008（check-and-reserve 原子）+ P0-009（输入校验）+ P0-010/011（Nonce 并发分配 + 状态机）+ P0-012（Mempool capacity TOCTOU）。
@@ -125,13 +146,16 @@
 | P1（未编号） | P1-032 | Background StateSync 不自动降级 TradingGate | 🟢 FIXED（09-16） | 后台对账发现差异/恢复动作/对账失败时，先 `reconcile_complete` 降级 Ready→Reconciling（停新单，`ensure_ready` 拦截）；恢复后重新快照 + 复核对账，一致才回 Ready，仍不一致/复核失败保持 Reconciling（FAIL-CLOSED）；halt 闩锁不被覆盖；+2 测试（降级→恢复回 Ready 全闭环 + 持续差异保持 Reconciling） |
 | P1（未编号） | P1-033 | Reserve Rollback Lifecycle | 🟢 FIXED（09-16） | ① `check_and_reserve` 集中度失败后回滚预留（仅 Buy）；② HTTP 200+`success=false` 释放预留 + mark_rejected；③ 网络超时/5xx 判为「未知结果」→ `is_unknown_outcome()` 保留预留 + 返回 Pending（保守，不低估暴露），确定失败（4xx/本地）才释放；+4 测试（集中度回滚 + is_unknown_outcome 分类×2）。指纹级精确确认留待后续 |
 | P1（未编号） | P1-034 | `consume_trade_events` 把 `Lagged` 当致命错误 | 🟢 FIXED（09-16） | 旧实现 `while let Ok(...)` 遇 `broadcast::RecvError::Lagged(n)` 直接退出循环且无日志 → 成交链路静默永久停摆（现场仍在交易但成交不记账）。改为 `loop + match`：`Lagged` → `tracing::error!` 告警（含丢失条数，需 StateSync 兜底）+ continue；`Closed` → 告警后 return。保留「仅消费 Trade」+「幂等由下层单点」；+3 测试（Lagged 不致命 / Closed 才退出 / 非 Trade 不记账）。**已做回归验证：还原旧实现后 `test_consume_trade_events_lagged_not_fatal` 必 FAILED**，证明测试有鉴别力 |
+| P1（未编号） | P1-035 | 空 `trade_id` 绕过 fill 幂等（P0-015 残余边界风险） | 🔴 待修（待定级） | `claim_trade("")` 返回 `true`（fill_records.rs:336）→ 空 trade_id 无幂等保护。**上游代码层面允许空 id**：`TradeApiResponse.id`（market_events.rs:121）与 `RemoteTrade.id`（state_sync.rs:61）均带 `#[serde(default)]`，缺字段时 = `""` 且反序列化不失败。**poller 层去重对空 id 双重失效**：market_events.rs:286 `contains(&t.id) && !t.id.is_empty()` 不去重 + 360 `if !e.trade_id.is_empty()` 不记录。→ 同一无 id trade 每 2s 重复进 `on_market_trade` → `RiskEngine.on_fill` 仓位无限累加。建议 `poll_trades()` 入口 fail-closed（空 id → warn + continue）+ `on_market_trade` 空 trade_id 拒绝 |
+
+**P1-035 定级待伯森先生裁决**：原文判断「是否构成 P0 取决于上游能否产生空 trade_id」。查证显示代码层面**允许**空 id 产生（serde(default) 且反序列化不失败），但 API 实际是否返回无 id trade 属外部事实。鉴于后果严重（仓位无限累加）而修复成本极低（几行 fail-closed），倾向按 P0 处理；若确认 API 保证非空 id，则降为 P1 防御性校验。
 
 **推荐修复顺序（审核给）**：
 1. **OrderStore/Fill**：P1-027 → P1-028 → P1-029
 2. **StateSync**：P1-030 → P1-031 → P1-032
 3. **Reserve Lifecycle**：P1-033
 
-**当前进度**：P0 已清零（09-15）；P1-026 FIXED 待伯森先生确认关闭；P1-027~033 FIXED（09-16，P1 待修批次全部完成）；**P1-034（`consume_trade_events` Lagged 缺陷，伯森先生审查 `tokio::spawn(consume_trade_events(...))` 时发现）** FIXED（09-16）。
+**当前进度**：**P0-015 VERIFIED（09-16，伯森先生复核确认）**；P0 其余项已清零（09-15）；P1-026 FIXED 待伯森先生确认关闭；P1-027~033 FIXED（09-16，P1 待修批次完成）；P1-034（`consume_trade_events` Lagged 缺陷）FIXED（09-16）；**P1-035（空 trade_id 绕过幂等）🔴 待修 + 待定级**。
 
 ---
 
