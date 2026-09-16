@@ -463,6 +463,57 @@ impl ExecutionServiceImpl {
         }
         plan.actions.len()
     }
+
+    /// P1-031：重建远端仍 open 的 BUY 订单的预留额度。
+    ///
+    /// 对账恢复时 `sync_position` 会清空各市场的 reserved（幽灵预留），但远端
+    /// 仍 open 的订单（本地下单、未成交、仍在挂单）对应的 pending 预留没有重建。
+    /// 本方法遍历本地 pending 订单（`OrderStore` 持有正确的 token_id，规避
+    /// open order `asset_id` 与 ERC-1155 token_id 的映射问题），按 exchange_order_id
+    /// 匹配远端 open order 的 price，计算剩余 notional = remaining_size × price，
+    /// 按 token 聚合后回填 RiskEngine.reserved。
+    pub fn rebuild_open_order_reserves(&self, remote_open_orders: &[serde_json::Value]) {
+        let re = match self.risk_engine.as_ref() {
+            Some(re) => re,
+            None => return,
+        };
+
+        // 远端 open order 的 price 索引（按 id）
+        let price_by_id: HashMap<String, f64> = remote_open_orders
+            .iter()
+            .filter_map(|o| {
+                let id = o.get("id")?.as_str()?.to_string();
+                let price = match o.get("price") {
+                    Some(serde_json::Value::String(s)) => s.parse::<f64>().ok()?,
+                    Some(serde_json::Value::Number(n)) => n.as_f64()?,
+                    _ => return None,
+                };
+                Some((id, price))
+            })
+            .collect();
+
+        // 按 token 聚合 open BUY 订单的剩余 notional
+        let mut reserve_by_token: HashMap<String, f64> = HashMap::new();
+        for ex_id in self.order_store.pending_exchange_order_ids() {
+            let Some(st) = self.order_store.get_by_exchange_order_id(&ex_id) else {
+                continue;
+            };
+            if st.side != "BUY" || st.remaining_size <= 0.0 {
+                continue;
+            }
+            let Some(price) = price_by_id.get(&ex_id) else {
+                continue;
+            };
+            let notional = st.remaining_size * price;
+            if notional > 0.0 {
+                *reserve_by_token.entry(st.token_id.clone()).or_insert(0.0) += notional;
+            }
+        }
+
+        for (token_id, notional) in reserve_by_token {
+            re.rebuild_reserve(&token_id, notional);
+        }
+    }
 }
 
 /// P0-014：市场事件消费循环。把 poller 广播的 Trade 事件转发到
@@ -1410,6 +1461,75 @@ mod tests {
         let re = service.risk_engine.as_ref().unwrap();
         assert_eq!(re.snapshot_positions().get("tok-1"), Some(&25.0));
         assert_eq!(re.snapshot().global_exposure, 12.5);
+    }
+
+    /// P1-031：rebuild_open_order_reserves 用 OrderStore 的 token_id + open order 的 price
+    /// 重建远端仍 open 的 BUY 订单预留额度。
+    #[tokio::test]
+    async fn test_rebuild_open_order_reserves_rebuilds_reserve() {
+        let mut service = ExecutionServiceImpl::new_mock();
+        let mut cfg = RiskConfig::default();
+        cfg.max_position_per_market = 100.0;
+        cfg.max_global_exposure = 100.0;
+        let engine = Arc::new(RiskEngine::new(cfg));
+        service.set_risk_engine(engine.clone());
+
+        // 本地 pending BUY 订单：requested 100，已成交 60，remaining 40
+        let mut st = service
+            .order_store
+            .create("client-r".to_string(), "tok-r".to_string(), "BUY".to_string(), 100.0);
+        st.mark_submitted("exchange-r".to_string());
+        st.update_fill(60.0); // PartialFilled, remaining 40
+        service.order_store.upsert(st);
+
+        // 远端 open order JSON：id 匹配 exchange-r，price = 0.5
+        let open_orders: Vec<serde_json::Value> = serde_json::from_value(serde_json::json!([
+            {"id": "exchange-r", "price": "0.5", "side": "BUY", "original_size": "100", "size_matched": "60"}
+        ]))
+        .unwrap();
+
+        service.rebuild_open_order_reserves(&open_orders);
+
+        // 重建 reserved = remaining 40 × 0.5 = 20。
+        // 再 reserve 85 → 20 + 85 = 105 > 100 → Err（暴露检查计入重建预留）
+        assert!(engine
+            .check_and_reserve("tok-r", Side::Buy, 85.0, 85.0, 50)
+            .is_err());
+        // 再 reserve 80 → 20 + 80 = 100 = 上限 → Ok
+        assert!(engine
+            .check_and_reserve("tok-r", Side::Buy, 80.0, 80.0, 50)
+            .is_ok());
+    }
+
+    /// P1-031：rebuild_open_order_reserves 对 SELL 订单不重建（减少暴露无需预留）。
+    #[tokio::test]
+    async fn test_rebuild_open_order_reserves_skips_sell() {
+        let mut service = ExecutionServiceImpl::new_mock();
+        let mut cfg = RiskConfig::default();
+        cfg.max_position_per_market = 100.0;
+        cfg.max_global_exposure = 100.0;
+        let engine = Arc::new(RiskEngine::new(cfg));
+        service.set_risk_engine(engine.clone());
+
+        // 本地 pending SELL 订单
+        let mut st = service
+            .order_store
+            .create("client-s".to_string(), "tok-s".to_string(), "SELL".to_string(), 100.0);
+        st.mark_submitted("exchange-s".to_string());
+        st.mark_live();
+        service.order_store.upsert(st);
+
+        let open_orders: Vec<serde_json::Value> = serde_json::from_value(serde_json::json!([
+            {"id": "exchange-s", "price": "0.5", "side": "SELL", "original_size": "100", "size_matched": "0"}
+        ]))
+        .unwrap();
+
+        service.rebuild_open_order_reserves(&open_orders);
+
+        // SELL 不重建预留 → 仍可满额 reserve 100
+        assert!(engine
+            .check_and_reserve("tok-s", Side::Buy, 100.0, 100.0, 50)
+            .is_ok());
     }
 
     /// P0-007B：apply_recovery 对 MarkOrderFilled 走 on_market_trade（成交补记 + 幂等）。

@@ -373,6 +373,23 @@ impl PositionLimits {
         }
     }
 
+    /// P1-031：重建预留额度。
+    ///
+    /// `sync_position` 重建仓位时会清空 `reserved`（下线前残留的幽灵预留），
+    /// 但远端仍 open 的 BUY 订单（本地下单、未成交、仍在挂单）对应的 pending
+    /// 预留没有随之重建，导致恢复后全局暴露检查遗漏这些 open 订单的额度。
+    ///
+    /// 本方法按 token 累加 `reserved`，跳过上限校验——恢复时以远端为权威，
+    /// 不在恢复路径重复做下单前的上限判断（避免因顺序/权威性误拒）。
+    pub fn rebuild_reserve(&self, token_id: &str, notional: f64) {
+        if !notional.is_finite() || notional <= 0.0 {
+            return;
+        }
+        let mut positions = self.positions.write().unwrap();
+        let entry = positions.entry(token_id.to_string()).or_default();
+        entry.reserved += notional;
+    }
+
     /// 获取指定市场仓位 (quantity, notional)
     pub fn market_position(&self, token_id: &str) -> Option<(f64, f64)> {
         self.positions
@@ -938,6 +955,11 @@ impl RiskEngine {
     /// 释放预留额度（订单被拒/取消/过期）。
     pub fn release_reserve(&self, token_id: &str, notional: f64) {
         self.position_limits.release_reserve(token_id, notional);
+    }
+
+    /// P1-031：重建预留额度（对账恢复后，远端仍 open 的 BUY 订单需重建 pending 预留）。
+    pub fn rebuild_reserve(&self, token_id: &str, notional: f64) {
+        self.position_limits.rebuild_reserve(token_id, notional);
     }
 
     /// 公共门槛检查：输入校验 → 熔断 → Gas → 时间窗口。
@@ -1543,5 +1565,40 @@ mod tests {
         engine.sync_position("m1", 100.0, f64::INFINITY);
         assert!(engine.snapshot_positions().get("m1").is_none());
         assert_eq!(engine.snapshot().global_exposure, 0.0);
+    }
+
+    /// P1-031：rebuild_reserve 重建预留额度，计入后续 check_and_reserve 的暴露检查。
+    #[test]
+    fn test_rebuild_reserve_blocks_subsequent_order() {
+        let mut cfg = RiskConfig::default();
+        cfg.max_position_per_market = 1000.0;
+        cfg.max_global_exposure = 1000.0;
+        let engine = RiskEngine::new(cfg);
+
+        // 重建 reserved = 600（模拟远端仍 open 的订单预留）
+        engine.rebuild_reserve("t1", 600.0);
+
+        // 再 reserve 500 → 600 + 500 = 1100 > 1000 → Err（暴露检查计入重建的预留）
+        assert!(engine
+            .check_and_reserve("t1", Side::Buy, 500.0, 500.0, 50)
+            .is_err());
+
+        // 再 reserve 400 → 600 + 400 = 1000 = 上限（不大于）→ Ok
+        assert!(engine
+            .check_and_reserve("t1", Side::Buy, 400.0, 400.0, 50)
+            .is_ok());
+    }
+
+    /// P1-031：rebuild_reserve 忽略非法 notional（NaN / ≤0），不污染风控状态。
+    #[test]
+    fn test_rebuild_reserve_ignores_invalid() {
+        let engine = make_engine();
+        engine.rebuild_reserve("t1", f64::NAN);
+        engine.rebuild_reserve("t1", -5.0);
+        engine.rebuild_reserve("t1", 0.0);
+        // 未污染：仍能正常预留
+        assert!(engine
+            .check_and_reserve("t1", Side::Buy, 100.0, 100.0, 50)
+            .is_ok());
     }
 }

@@ -172,6 +172,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // P1-031：重建远端仍 open 订单的预留额度（sync_position 清空 reserved 后）
+    match state_sync.fetch_open_orders().await {
+        Ok(open_orders) => {
+            service.rebuild_open_order_reserves(&open_orders);
+            tracing::info!(
+                "StateSync 已按 {} 个远端 open 订单重建预留额度",
+                open_orders.len()
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                "StateSync 重建 open 订单预留失败（不阻断启动，预留可能偏保守）: {e}"
+            );
+        }
+    }
+
     // 恢复后再快照并重新对账，得到权威同步结论（驱动 TradingGate）
     let local_positions = service.snapshot_positions().await;
     let local_pending_orders = service.snapshot_pending_exchange_order_ids();
