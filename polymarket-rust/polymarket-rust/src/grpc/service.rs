@@ -393,11 +393,10 @@ impl ExecutionServiceImpl {
 
         // 4. OrderStore 订单状态（P0-016：trade.order_id 是交易所订单 ID，
         //    需按 exchange_order_id 反查，而非 client_order_id；
-        //    P1-026：用 apply_fill 增量累加，避免多笔 partial fill 绝对覆盖）
-        if let Some(mut st) = self.order_store.get_by_exchange_order_id(&trade.order_id) {
-            st.apply_fill(trade.size);
-            self.order_store.upsert(st);
-        }
+        //    P1-026：用 apply_fill 增量累加，避免多笔 partial fill 绝对覆盖；
+        //    P1-027：改用 apply_fill_by_exchange_order_id 单写锁内完成，避免并发 fill lost update）
+        self.order_store
+            .apply_fill_by_exchange_order_id(&trade.order_id, trade.size);
     }
 
     /// P0-007B：应用 StateSync 生成的恢复计划，修复本地状态。

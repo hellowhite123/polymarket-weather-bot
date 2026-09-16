@@ -194,6 +194,34 @@ impl OrderStore {
             .cloned()
     }
 
+    /// 按交易所订单 ID 定位订单，并在**单次写锁内**增量累加成交（P1-027）。
+    ///
+    /// 并发 fill 场景下，`get_by_exchange_order_id → clone → apply_fill → upsert`
+    /// 是读-改-写非原子：两笔 fill 各自读到旧的 `filled_size`，各自累加后
+    /// `upsert`，后写覆盖先写，造成 lost update。
+    ///
+    /// 本方法在单次写锁内完成「定位 + 增量 + 写回」，并发 fill 串行化。
+    /// 返回更新后的 `OrderState`（命中时）；未命中或非法增量（NaN / ≤0）返回 `None`。
+    pub fn apply_fill_by_exchange_order_id(
+        &self,
+        exchange_order_id: &str,
+        delta_size: f64,
+    ) -> Option<OrderState> {
+        if exchange_order_id.is_empty() || !delta_size.is_finite() || delta_size <= 0.0 {
+            return None;
+        }
+        let mut orders = self.orders.write().unwrap();
+        let mut updated: Option<OrderState> = None;
+        for state in orders.values_mut() {
+            if state.exchange_order_id.as_deref() == Some(exchange_order_id) {
+                state.apply_fill(delta_size);
+                updated = Some(state.clone());
+                break;
+            }
+        }
+        updated
+    }
+
     /// 写入/更新状态。
     pub fn upsert(&self, state: OrderState) {
         self.orders
@@ -235,12 +263,31 @@ impl OrderStore {
         Some(state)
     }
 
-    /// 标记拒绝（若存在）。用于下单失败路径清理占位，避免残留 `Received`
-    /// 状态被 `pending_order_ids` 误报，或被幂等命中拦下导致无法重试。
+    /// 原子标记拒绝（P1-028）。
+    ///
+    /// 用于下单失败路径清理占位，避免残留 `Received` 状态被 `pending_order_ids`
+    /// 误报，或被幂等命中拦下导致无法重试。
+    ///
+    /// 原实现 `get → mark_rejected → upsert` 是读-改-写非原子：并发下，已成交单
+    /// （`Filled`）可能被并发的 `mark_rejected` 覆盖为 `Rejected`（状态倒退）。
+    /// 本方法在**单次写锁内**完成「定位 + 状态转换」，且只允许从非终态转换：
+    /// 已是终态（`Filled`/`Cancelled`/`Rejected`/`Expired`）则跳过，不覆盖。
     pub fn mark_rejected(&self, client_order_id: &str) {
-        if let Some(mut st) = self.get(client_order_id) {
-            st.mark_rejected();
-            self.upsert(st);
+        let mut orders = self.orders.write().unwrap();
+        if let Some(st) = orders.get_mut(client_order_id) {
+            match st.status {
+                OrderStateStatus::Received
+                | OrderStateStatus::Submitted
+                | OrderStateStatus::Live
+                | OrderStateStatus::PartialFilled => {
+                    st.mark_rejected();
+                }
+                // 终态不覆盖（尤其 Filled 不能被 reject 倒退）
+                OrderStateStatus::Filled
+                | OrderStateStatus::Cancelled
+                | OrderStateStatus::Rejected
+                | OrderStateStatus::Expired => {}
+            }
         }
     }
 
@@ -472,6 +519,57 @@ mod tests {
         assert!(store.get_by_exchange_order_id("").is_none());
     }
 
+    /// P1-027：并发 fill 无 lost update——10 线程各自 +10，单写锁内串行化，累计 100。
+    #[test]
+    fn test_apply_fill_by_exchange_order_id_concurrent_no_lost_update() {
+        use std::sync::{Arc, Barrier};
+
+        let store = Arc::new(OrderStore::new());
+        let mut st = store.create("client-1".to_string(), "t1".to_string(), "BUY".to_string(), 100.0);
+        st.mark_submitted("exchange-1".to_string());
+        store.upsert(st);
+
+        let barrier = Arc::new(Barrier::new(10));
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                store.apply_fill_by_exchange_order_id("exchange-1", 10.0);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let st = store.get("client-1").unwrap();
+        assert_eq!(
+            st.filled_size, 100.0,
+            "10 笔并发 fill ×10 应累计到 100，读-改-写非原子会丢更新"
+        );
+        assert_eq!(st.status, OrderStateStatus::Filled);
+        assert_eq!(st.remaining_size, 0.0);
+    }
+
+    /// P1-027：非法增量（NaN/≤0/空 id）在 apply_fill_by_exchange_order_id 被拒绝。
+    #[test]
+    fn test_apply_fill_by_exchange_order_id_rejects_invalid() {
+        let store = OrderStore::new();
+        let mut st = store.create("client-1".to_string(), "t1".to_string(), "BUY".to_string(), 100.0);
+        st.mark_submitted("exchange-1".to_string());
+        store.upsert(st);
+
+        assert!(store.apply_fill_by_exchange_order_id("exchange-1", 0.0).is_none());
+        assert!(store.apply_fill_by_exchange_order_id("exchange-1", -5.0).is_none());
+        assert!(store.apply_fill_by_exchange_order_id("exchange-1", f64::NAN).is_none());
+        assert!(store.apply_fill_by_exchange_order_id("", 10.0).is_none());
+        assert!(store.apply_fill_by_exchange_order_id("missing", 10.0).is_none());
+
+        let st = store.get("client-1").unwrap();
+        assert_eq!(st.filled_size, 0.0, "非法增量不应改变 filled_size");
+    }
+
     /// 并发去重：16 个线程同时 claim 同一 order_id，应只有一次成功（原子占位）。
     #[test]
     fn test_order_store_concurrent_dedup() {
@@ -548,6 +646,74 @@ mod tests {
 
         store.mark_rejected("o1");
         assert!(!store.pending_order_ids().contains("o1"));
+    }
+
+    /// P1-028：已成交单（Filled）不被 mark_rejected 倒退覆盖。
+    #[test]
+    fn test_mark_rejected_does_not_overwrite_filled() {
+        let store = OrderStore::new();
+        let mut st = store.create("o1".to_string(), "t1".to_string(), "BUY".to_string(), 10.0);
+        st.mark_submitted("ex1".to_string());
+        st.update_fill(10.0); // Filled
+        store.upsert(st);
+
+        store.mark_rejected("o1"); // 尝试 reject 已成交单
+
+        let st = store.get("o1").unwrap();
+        assert_eq!(
+            st.status,
+            OrderStateStatus::Filled,
+            "已成交单不应被 mark_rejected 倒退为 Rejected"
+        );
+        assert_eq!(st.filled_size, 10.0);
+    }
+
+    /// P1-028：并发 fill 与 reject 竞争——Filled 后 reject 不倒退；
+    /// 结果要么 Filled（fill 赢），要么 Rejected（reject 先到），但 status 与 filled_size 不自相矛盾。
+    #[test]
+    fn test_concurrent_fill_and_reject_no_regression() {
+        use std::sync::{Arc, Barrier};
+
+        let store = Arc::new(OrderStore::new());
+        let mut st = store.create("o1".to_string(), "t1".to_string(), "BUY".to_string(), 100.0);
+        st.mark_submitted("ex1".to_string());
+        store.upsert(st);
+
+        let barrier = Arc::new(Barrier::new(20));
+        let mut handles = Vec::new();
+        for i in 0..20 {
+            let store = Arc::clone(&store);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                if i % 2 == 0 {
+                    // 偶数线程：尝试填满（10×10=100）
+                    store.apply_fill_by_exchange_order_id("ex1", 10.0);
+                } else {
+                    // 奇数线程：尝试 reject
+                    store.mark_rejected("o1");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let st = store.get("o1").unwrap();
+        // 不变量：filled_size == requested_size ⟺ status == Filled；
+        // 若 status 是 Rejected 但 filled_size 已满，说明 reject 覆盖了 Filled（回归）。
+        match st.status {
+            OrderStateStatus::Filled => {
+                assert_eq!(st.filled_size, 100.0, "Filled 单 filled_size 必须为满额");
+            }
+            OrderStateStatus::Rejected => {
+                assert!(
+                    st.filled_size < 100.0,
+                    "reject 生效时 filled_size 不应已达满额（否则是 Filled 被倒退）"
+                );
+            }
+            other => panic!("并发竞争后出现非预期状态: {}", other),
+        }
     }
 
     /// claim_or_retry 对已成交订单去重（不可重复下单）。

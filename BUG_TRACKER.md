@@ -117,8 +117,8 @@
 | 审核编号 | BUG_TRACKER 编号 | 问题 | 状态 | 关键点 |
 |---------|----------------|------|------|--------|
 | P1-026 | P1-026 | Multi-partial-fill 成交量覆盖 | 🟢 FIXED（09-14） | `apply_fill(delta)` 增量累计替代绝对覆盖 `update_fill`；`on_market_trade` 改 `st.apply_fill(trade.size)`；测试 30→70→100 |
-| P1-027 | P1-027 | OrderStore 并发 fill lost update | 🔴 待修 | `get_by_exchange_order_id→clone→apply_fill→upsert` 非原子，并发两 fill 各自读旧 `filled_size`。建议 `apply_fill_by_exchange_order_id()` 单写锁内完成；并发测试 10×10=100 |
-| P1-028 | P1-028 | mark_rejected 与 fill 状态竞争 | 🔴 待修 | `get→mark_rejected→upsert` 非原子，已成交单可能被并发 reject 覆盖为 Rejected。建议原子状态转换方法 + 并发 fill/reject 测试 |
+| P1-027 | P1-027 | OrderStore 并发 fill lost update | 🟢 FIXED（09-16） | 新增 `apply_fill_by_exchange_order_id()` 单写锁内完成「定位+增量+写回」，`on_market_trade` 改走该方法；+2 测试（并发 10×10=100 无 lost update + 非法增量拒绝） |
+| P1-028 | P1-028 | mark_rejected 与 fill 状态竞争 | 🟢 FIXED（09-16） | `mark_rejected` 改单写锁内原子状态转换 + 终态保护（Filled/Cancelled/Rejected/Expired 不覆盖）；+2 测试（Filled 不倒退 + 并发 fill/reject 无回归） |
 | P1（未编号） | P1-029 | FillLedger 多笔 fill 被覆盖 | 🔴 待修 | `records: order_id→FillRecord` 1:1，同订单 30+20+50 互相覆盖。**勿简单改主键为 trade_id**（`get/settle/cancel(order_id)` 是订单级 API），建议拆 Order aggregate + Fill history（keyed by trade_id） |
 | P1（未编号） | P1-030 | StateSync partial-fill recovery 只恢复第一笔 | 🔴 待修 | `find_trade_for_order()` 用 `.find()` 只取第一笔 trade。应取全部相关 trades 按 trade_id 去重累计 |
 | P1（未编号） | P1-031 | Recovery 后 reserve 未完整重建 | 🔴 待修 | `sync_position` 清 token-level reserved，但远端仍 open 的订单没重建 reserve。Recovery 应同时重建 positions + open orders + live-order reserves |
@@ -130,7 +130,7 @@
 2. **StateSync**：P1-030 → P1-031 → P1-032
 3. **Reserve Lifecycle**：P1-033
 
-**当前进度**：P0 已清零（09-15）；P1-026 FIXED 待伯森先生确认关闭；P1-027 ~ P1-033 待修。
+**当前进度**：P0 已清零（09-15）；P1-026 FIXED 待伯森先生确认关闭；P1-027/P1-028 FIXED（09-16）；P1-029 ~ P1-033 待修。
 
 ---
 
