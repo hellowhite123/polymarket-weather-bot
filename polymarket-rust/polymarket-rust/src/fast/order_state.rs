@@ -106,6 +106,9 @@ impl OrderState {
     }
 
     /// 更新成交数量（partial fill 时 filled < requested）。
+    ///
+    /// 绝对覆盖语义：调用方须传入「累计成交量」。用于下单路径 A——
+    /// 下单响应的 making/taking 给出的是整单累计成交。
     pub fn update_fill(&mut self, filled_size: f64) {
         self.filled_size = filled_size.max(0.0).min(self.requested_size);
         self.remaining_size = (self.requested_size - self.filled_size).max(0.0);
@@ -117,6 +120,19 @@ impl OrderState {
             OrderStateStatus::Live
         };
         self.updated_at = now_secs();
+    }
+
+    /// 增量累加成交（P1-026）。
+    ///
+    /// 用于成交事件路径 B（`on_market_trade`）——每笔 trade 只有「单笔增量」，
+    /// 直接调 `update_fill(trade.size)` 会绝对覆盖、丢掉跨笔 partial fill 的累计。
+    /// 本方法把增量加到现有 `filled_size` 上，再复用 `update_fill` 的 clamp 与状态机。
+    /// 非法增量（NaN / ≤0）直接忽略。
+    pub fn apply_fill(&mut self, delta_size: f64) {
+        if !delta_size.is_finite() || delta_size <= 0.0 {
+            return;
+        }
+        self.update_fill(self.filled_size + delta_size);
     }
 
     /// 标记已取消。
@@ -158,6 +174,24 @@ impl OrderStore {
     /// 幂等查询：order_id 已存在则返回已有状态（R2-P0-06）。
     pub fn get(&self, client_order_id: &str) -> Option<OrderState> {
         self.orders.read().unwrap().get(client_order_id).cloned()
+    }
+
+    /// 按交易所订单 ID 反向查找（P0-016）。
+    ///
+    /// 成交/恢复路径（`on_market_trade` / `apply_recovery`）只持有交易所分配的
+    /// `exchange_order_id`，而本 store 以 `client_order_id` 为键，故需反向定位。
+    /// 返回完整 `OrderState`（含 `client_order_id`），调用方继续 `upsert`
+    /// 时仍按 `client_order_id` 键写回。
+    pub fn get_by_exchange_order_id(&self, exchange_order_id: &str) -> Option<OrderState> {
+        if exchange_order_id.is_empty() {
+            return None;
+        }
+        self.orders
+            .read()
+            .unwrap()
+            .values()
+            .find(|s| s.exchange_order_id.as_deref() == Some(exchange_order_id))
+            .cloned()
     }
 
     /// 写入/更新状态。
@@ -321,6 +355,38 @@ mod tests {
         assert_eq!(s.remaining_size, 0.0);
     }
 
+    /// P1-026：apply_fill 增量累加——多笔 partial fill 不互相覆盖。
+    #[test]
+    fn test_apply_fill_accumulates() {
+        let mut s = OrderState::new("c-acc".to_string(), "t".to_string(), "BUY".to_string(), 100.0);
+        s.apply_fill(30.0);
+        assert_eq!(s.filled_size, 30.0);
+        assert_eq!(s.status, OrderStateStatus::PartialFilled);
+
+        s.apply_fill(40.0);
+        assert_eq!(s.filled_size, 70.0, "第二笔应累加而非覆盖");
+        assert_eq!(s.status, OrderStateStatus::PartialFilled);
+
+        s.apply_fill(30.0);
+        assert_eq!(s.filled_size, 100.0);
+        assert_eq!(s.status, OrderStateStatus::Filled);
+        assert_eq!(s.remaining_size, 0.0);
+    }
+
+    /// P1-026：apply_fill 忽略非法增量（NaN / <=0），并 clamp 到 requested。
+    #[test]
+    fn test_apply_fill_ignores_invalid_and_clamps() {
+        let mut s = OrderState::new("c-clamp".to_string(), "t".to_string(), "BUY".to_string(), 100.0);
+        s.apply_fill(0.0);
+        s.apply_fill(-5.0);
+        s.apply_fill(f64::NAN);
+        assert_eq!(s.filled_size, 0.0, "非法增量不应改变 filled_size");
+
+        s.apply_fill(120.0);
+        assert_eq!(s.filled_size, 100.0, "累计超 requested 应 clamp 到 100");
+        assert_eq!(s.status, OrderStateStatus::Filled);
+    }
+
     #[test]
     fn test_partial_fill_not_full() {
         let mut s = OrderState::new("c2".to_string(), "t2".to_string(), "BUY".to_string(), 100.0);
@@ -384,6 +450,26 @@ mod tests {
         assert_eq!(store.len(), 1);
 
         assert!(store.get("missing").is_none());
+    }
+
+    /// P0-016：按 exchange_order_id 反向查找（成交/恢复路径只持有交易所订单 ID）。
+    #[test]
+    fn test_get_by_exchange_order_id() {
+        let store = OrderStore::new();
+        let mut st = store
+            .create("client-1".to_string(), "t1".to_string(), "BUY".to_string(), 10.0);
+        st.mark_submitted("exchange-1".to_string());
+        store.upsert(st);
+
+        // 命中：通过 exchange_order_id 找回 client_order_id 键的订单
+        let found = store.get_by_exchange_order_id("exchange-1");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().client_order_id, "client-1");
+
+        // 未命中
+        assert!(store.get_by_exchange_order_id("exchange-missing").is_none());
+        // 空 id 直接返回 None（不误命中 exchange_order_id 为空串的订单）
+        assert!(store.get_by_exchange_order_id("").is_none());
     }
 
     /// 并发去重：16 个线程同时 claim 同一 order_id，应只有一次成功（原子占位）。

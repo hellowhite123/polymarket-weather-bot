@@ -73,12 +73,18 @@
 | P0-010 | Nonce 并发分配 | GPT + Gemini | 🔧 FIXED（09-13：`next_local` AtomicU64 原子递增游标 + 并发测试） | 阶段二 |
 | P0-011 | Nonce 确认语义 | GPT | 🔧 FIXED（09-13：`NonceState` 状态机 Allocated/Pending，分配游标与确认解耦） | 阶段二 |
 | P0-012 | Mempool capacity TOCTOU | GPT | 🔧 FIXED（09-13：`try_submit` 原子 check+reserve + 并发测试） | 阶段二 |
+| P0-016 | OrderStore 键错配：恢复/成交路径用 exchange_order_id 查 client_order_id 键的 store，静默失效 | 旺财验收发现（09-13） | 🔧 FIXED（09-13：新增 `get_by_exchange_order_id` + 修 `on_market_trade`/`apply_recovery` 2 处 + 3 测试） | 阶段三后 |
+| P0-017 | market_events JSON 入口「错误变 0」：`parse_f64`/`parse_timestamp` 静默把非法数据转 0.0/0，绕过 P0-009 数值安全；`attribute_order` 可返回空 order_id | 伯森先生点名（09-15，P0-009 数值安全的入口层延伸） | 🔧 FIXED（09-15：`parse_f64`/`parse_timestamp` 改 `Result` + `is_finite` 守卫，`attribute_order` 空 order_id 拦截，`poll_trades` 任一解析失败 warn+continue 跳过整条 TradeEvent，+5 测试） | 阶段三后 |
+| P0-018 | RiskEngine 超仓拒单集成测试缺失（审核 P0-003：只读 `pre_check` 已测，但原子 `check_and_reserve` 拒单后 reserve 不泄漏未锁定；place_order 拒单未验证「不调 FastExecutor/不产生有效订单」） | 外部审核（09-15） | 🔧 FIXED（09-15：`check_and_reserve` 超仓/全局超限 reserve 不泄漏 2 测试 + service 层 `test_place_order_over_limit_rejected_before_executor` 验证风控拦截先于 FastExecutor） | 阶段三后 |
+| P0-019 | StateSync 启动 reconciliation 集成测试缺失（审核 P0-007：正常同步→Ready / critical diff→不 Ready / unresolved→fail-closed 三场景无端到端接线测试） | 外部审核（09-15） | 🔧 FIXED（09-15：新增 `tests/p0_production_validation/state_sync_startup.rs`，wiremock mock CLOB 三端点复现 server.rs 启动对账决策链，3 场景全绿） | 阶段三后 |
 
 **阶段一（已完成 09-13）**：P0-013 → P0-014 → P0-015（Trade 一致性链）。
 **阶段二（已完成 09-13）**：P0-008（check-and-reserve 原子）+ P0-009（输入校验）+ P0-010/011（Nonce 并发分配 + 状态机）+ P0-012（Mempool capacity TOCTOU）。
 **阶段三（已完成 09-13）**：P0-007B（full_reconcile 自动恢复）。
 
 > ✅ **P0 实盘阻塞 9 项全部 FIXED（09-13）**，待三重证据（git diff + 测试 + 调用链）VERIFIED。
+> ➕ **P0-016（09-13 验收新增）**：OrderStore 以 client_order_id 为键，但 `apply_recovery`/`on_market_trade` 用 exchange_order_id 查 store，恢复/成交对 OrderStore 更新静默失效。已 FIXED（新增 `get_by_exchange_order_id` + 修 2 处调用 + 3 测试），全绿 303 passed。
+> 🔗 **审核编号映射（09-15 对齐）**：外部审核文件 `Polymarket_P0_P1_Current_Audit.md` 的 `P0-003`（超仓拒绝测试）＝本表 **P0-018**；审核 `P0-007`（startup reconciliation 集成测试）＝本表 **P0-019**；审核 `P0-004/P0-008/P0-015/P0-016` 与本表同编号一一对应。P1 编号见「三-B」。
 
 ---
 
@@ -100,6 +106,31 @@
 **测试结果（09-07）**：Rust 241 单元测试 + 9 集成测试全绿；Python 5 测试全过。
 
 > 已知限制：P1-006 的 `on_market_trade` 已实现但 `MarketEventPoller` 尚未接入启动流程（需 L2 认证的 `/data/trades` 轮询驱动），异步成交的端到端触发留待 Shadow Trading 阶段验证。
+
+---
+
+## 三-B、P1 待修清单（09-15 外部审核，编号对齐）
+
+> 来源：`Polymarket_P0_P1_Current_Audit.md`（伯森先生 09-15 提供）。
+> **编号口径**：沿用审核文件的 P1 编号（`P1-026` 起；审核文件 5 个未编号项按顺序续编 `P1-029`~`P1-033`）。旧 `P1-001`~`P1-010`（上方「三」）是 09-10 那批已完成的 P1，编号区间不连续但互不冲突。
+
+| 审核编号 | BUG_TRACKER 编号 | 问题 | 状态 | 关键点 |
+|---------|----------------|------|------|--------|
+| P1-026 | P1-026 | Multi-partial-fill 成交量覆盖 | 🟢 FIXED（09-14） | `apply_fill(delta)` 增量累计替代绝对覆盖 `update_fill`；`on_market_trade` 改 `st.apply_fill(trade.size)`；测试 30→70→100 |
+| P1-027 | P1-027 | OrderStore 并发 fill lost update | 🔴 待修 | `get_by_exchange_order_id→clone→apply_fill→upsert` 非原子，并发两 fill 各自读旧 `filled_size`。建议 `apply_fill_by_exchange_order_id()` 单写锁内完成；并发测试 10×10=100 |
+| P1-028 | P1-028 | mark_rejected 与 fill 状态竞争 | 🔴 待修 | `get→mark_rejected→upsert` 非原子，已成交单可能被并发 reject 覆盖为 Rejected。建议原子状态转换方法 + 并发 fill/reject 测试 |
+| P1（未编号） | P1-029 | FillLedger 多笔 fill 被覆盖 | 🔴 待修 | `records: order_id→FillRecord` 1:1，同订单 30+20+50 互相覆盖。**勿简单改主键为 trade_id**（`get/settle/cancel(order_id)` 是订单级 API），建议拆 Order aggregate + Fill history（keyed by trade_id） |
+| P1（未编号） | P1-030 | StateSync partial-fill recovery 只恢复第一笔 | 🔴 待修 | `find_trade_for_order()` 用 `.find()` 只取第一笔 trade。应取全部相关 trades 按 trade_id 去重累计 |
+| P1（未编号） | P1-031 | Recovery 后 reserve 未完整重建 | 🔴 待修 | `sync_position` 清 token-level reserved，但远端仍 open 的订单没重建 reserve。Recovery 应同时重建 positions + open orders + live-order reserves |
+| P1（未编号） | P1-032 | Background StateSync 不自动降级 TradingGate | 🔴 待修 | 后台发现 critical divergence 只记日志，不把 Ready→Reconciling/Halted。建议 critical→Reconciling/Halted→停新单→Recovery→再 reconcile→一致后 Ready |
+| P1（未编号） | P1-033 | Reserve Rollback Lifecycle | 🟡 部分完成 | ① concentration 失败后 rollback ② HTTP200+`success=false` 时 service 只在 Err 分支 release → reserve 泄漏 ③ 网络超时/5xx unknown outcome 应进 StateSync 确认远端再决定 release/fill |
+
+**推荐修复顺序（审核给）**：
+1. **OrderStore/Fill**：P1-027 → P1-028 → P1-029
+2. **StateSync**：P1-030 → P1-031 → P1-032
+3. **Reserve Lifecycle**：P1-033
+
+**当前进度**：P0 已清零（09-15）；P1-026 FIXED 待伯森先生确认关闭；P1-027 ~ P1-033 待修。
 
 ---
 

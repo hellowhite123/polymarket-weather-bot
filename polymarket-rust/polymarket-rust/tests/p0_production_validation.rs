@@ -16,3 +16,5 @@ mod risk_engine;
 mod trading_gate;
 #[path = "p0_production_validation/fast_executor_init.rs"]
 mod fast_executor_init;
+#[path = "p0_production_validation/state_sync_startup.rs"]
+mod state_sync_startup;

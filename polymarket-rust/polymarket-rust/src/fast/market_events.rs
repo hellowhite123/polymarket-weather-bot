@@ -307,8 +307,31 @@ impl MarketEventPoller {
                 }
             };
 
-            let price = parse_f64(&t.price);
-            let size = parse_f64(&t.size);
+            let price = match parse_f64(&t.price) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("market_events: invalid trade price, trade_id={}, err={}", t.id, e);
+                    continue;
+                }
+            };
+            let size = match parse_f64(&t.size) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("market_events: invalid trade size, trade_id={}, err={}", t.id, e);
+                    continue;
+                }
+            };
+            let timestamp = match parse_timestamp(&t.created_at) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(
+                        "market_events: invalid trade timestamp, trade_id={}, err={}",
+                        t.id,
+                        e
+                    );
+                    continue;
+                }
+            };
 
             let event = TradeEvent {
                 token_id: token_id.to_string(),
@@ -317,7 +340,7 @@ impl MarketEventPoller {
                 side: t.side.clone(),
                 price,
                 size,
-                timestamp: parse_timestamp(&t.created_at),
+                timestamp,
                 taker_order_id: t.taker_order_id.clone(),
                 maker_order_id: t.maker_order_id.clone(),
                 trader_side: t.trader_side.clone(),
@@ -533,13 +556,12 @@ fn attribute_order(
     maker_orders: &[MakerOrderRef],
     owner_address: Option<&str>,
 ) -> Option<String> {
-    match trader_side {
+    let order_id = match trader_side {
         "TAKER" => {
             if taker_order_id.is_empty() {
-                None
-            } else {
-                Some(taker_order_id.to_string())
+                return None;
             }
+            Some(taker_order_id.to_string())
         }
         "MAKER" => {
             if let Some(addr) = owner_address.filter(|a| !a.is_empty()) {
@@ -561,20 +583,37 @@ fn attribute_order(
                 None
             }
         }
-        _ => None,
-    }
+        _ => return None,
+    };
+    // 兜底：maker_orders 里 order_id 字段缺失（空串）时，视作无法安全归属
+    order_id.filter(|oid| !oid.is_empty())
 }
 
-fn parse_f64(v: &serde_json::Value) -> f64 {
-    match v {
-        serde_json::Value::String(s) => s.parse().unwrap_or(0.0),
-        serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
-        _ => 0.0,
+/// 解析成交价/数量：字符串或数字 → f64。
+///
+/// 失败（非字符串/数字、非法字符串、非有限数）返回 `Err`，**绝不静默转 0.0**
+/// —— 否则会把 `"abc"`/`null` 伪造成合法的 0 价成交，绕过 P0-009 数值安全。
+fn parse_f64(v: &serde_json::Value) -> Result<f64, String> {
+    let value = match v {
+        serde_json::Value::String(s) => s
+            .parse::<f64>()
+            .map_err(|_| format!("invalid float string: {s}"))?,
+        serde_json::Value::Number(n) => n
+            .as_f64()
+            .ok_or_else(|| "invalid JSON number".to_string())?,
+        _ => return Err("expected string or number".to_string()),
+    };
+    if !value.is_finite() {
+        return Err("non-finite float".to_string());
     }
+    Ok(value)
 }
 
-fn parse_timestamp(s: &str) -> u64 {
-    s.parse().unwrap_or(0)
+/// 解析成交时间戳：字符串 → u64。
+///
+/// 失败返回 `Err`，不静默转成 Unix epoch 0。
+fn parse_timestamp(s: &str) -> Result<u64, String> {
+    s.parse::<u64>().map_err(|_| format!("invalid timestamp: {s}"))
 }
 
 fn now_secs() -> u64 {
@@ -595,13 +634,36 @@ mod tests {
     #[test]
     fn test_parse_f64_string() {
         let v = serde_json::json!("0.55");
-        assert!((parse_f64(&v) - 0.55).abs() < 0.001);
+        assert!((parse_f64(&v).unwrap() - 0.55).abs() < 0.001);
     }
 
     #[test]
     fn test_parse_f64_number() {
         let v = serde_json::json!(0.72);
-        assert!((parse_f64(&v) - 0.72).abs() < 0.001);
+        assert!((parse_f64(&v).unwrap() - 0.72).abs() < 0.001);
+    }
+
+    /// P0-009 数值安全：非法数据不得静默转 0.0，必须返回 Err。
+    #[test]
+    fn test_parse_f64_invalid_string_returns_err() {
+        assert!(parse_f64(&serde_json::json!("abc")).is_err());
+    }
+
+    #[test]
+    fn test_parse_f64_null_returns_err() {
+        assert!(parse_f64(&serde_json::Value::Null).is_err());
+    }
+
+    #[test]
+    fn test_parse_f64_non_finite_returns_err() {
+        // serde_json 的 Number 无法表示 NaN/Inf，用字符串 "NaN" 触发有限性检查
+        assert!(parse_f64(&serde_json::json!("NaN")).is_err());
+    }
+
+    #[test]
+    fn test_parse_timestamp_invalid_returns_err() {
+        assert!(parse_timestamp("abc").is_err());
+        assert!(parse_timestamp("").is_err());
     }
 
     #[test]
@@ -669,6 +731,14 @@ mod tests {
     #[test]
     fn test_attribute_order_taker_empty_returns_none() {
         assert_eq!(attribute_order("TAKER", "", &[], None), None);
+    }
+
+    /// P0-016/审计：maker_orders 里 order_id 为空串时，不能产生 Some("")，须返回 None。
+    #[test]
+    fn test_attribute_order_maker_empty_order_id_returns_none() {
+        let makers = vec![mkr("", "0xAAA")];
+        assert_eq!(attribute_order("MAKER", "taker-1", &makers, None), None);
+        assert_eq!(attribute_order("MAKER", "taker-1", &makers, Some("0xAAA")), None);
     }
 
     #[test]
