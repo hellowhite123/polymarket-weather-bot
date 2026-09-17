@@ -202,9 +202,21 @@
 
 ### G1 风控三闸接线（P0-RISK-001/002/003）
 
-- **Status**: TODO（**已授权 2026-09-17**；CONSENSUS_ROUND_04 确认 P0-RISK-001/002/003 = CONFIRMED/P0）
+- **Status**: 🚧 IN_PROGRESS（已授权 2026-09-17；CONSENSUS_ROUND_04 确认 P0-RISK-001/002/003 = CONFIRMED/P0）
+  - G1-003 Gas 保护：🔧 **FIXED（09-17）**
+  - G1-001 日亏熔断：⬜ TODO（依赖结算/PnL 链）
+  - G1-002 结算窗口：⬜ TODO（需先出 `UpdateSettlementTimes` 接口方案待批）
 - **Owner**: Work Buddy
 - **Goal**: 让已实现但未接入生产路径的三项风控真正生效——① 日亏熔断（`post_check`→`report_pnl`）；② 结算前 2h 禁开 Buy；③ Gas 费保护。仅接线，**不改任何阈值/语义**。
+- **G1-003 实现说明（09-17）**：`place_order` 在 `check_and_reserve` 前调用 `gas_gwei_for_risk()`——经 `FastExecutor::rpc_pool().rpc_call("eth_gasPrice")` 取价并解析为 gwei（`parse_gas_price_hex_to_gwei`，向下取整）。
+  - 未挂载执行器/未配 RpcPool（mock/paper）→ `Ok(0)` 不阻塞（此类订单随后因「FastExecutor 未初始化」被拒）。
+  - 已挂载但 RPC 调用/解析失败 → **FAIL-CLOSED**，`mark_rejected` + 返回 `Rejected`；不再把 gas 硬编码为 0 绕过上限检查。
+  - 改动仅 `service.rs`（未改 `risk_engine.rs` 阈值/逻辑）。
+- **G1-003 测试**（实际落地名，全部在 `service.rs` tests）:
+  - `test_parse_gas_price_hex_to_gwei` / `test_parse_gas_price_invalid_returns_err`
+  - `test_gas_protection_rejects_high_gwei`（501 gwei 拒、500 放行）
+  - `test_place_order_fails_closed_when_gas_fetch_fails`（RPC 不可达 → 拒单，错误含「Gas 费获取失败」）
+  - **鉴别力验证**：将失败分支改回放行、解析器改恒 0 后，后 2 个测试必 FAILED。
 - **Allowed Files**:
   - `polymarket-rust/polymarket-rust/src/grpc/service.rs`
   - `polymarket-rust/polymarket-rust/src/bin/server.rs`
@@ -213,11 +225,11 @@
   - `strategy_engine/`
   - `polymarket-rust/polymarket-rust/src/fast/risk_engine.rs`（**阈值与判定逻辑不改**；如确需新增 getter 须先申请）
 - **Required Tests**:
-  - `test_daily_loss_halts_after_threshold_integration`（结算/盈亏回填后达阈值 → `check_gates` 拒单）
-  - `test_settlement_window_blocks_buy_when_registered`（注册结算时间后，2h 内 Buy 被拒、Sell 放行）
-  - `test_unknown_settlement_fail_closed`（未注册结算时间 → 按约定拒绝并告警）
-  - `test_gas_protection_rejects_high_gwei`（gas 超上限 → 拒单；gas 未知 → fail-closed）
-- **Acceptance**: 三项在真实 `place_order` 调用链上可触发并拒绝；`get_risk_state` 的熔断标志与 `RiskEngine` 权威状态一致（002 的 fail-closed 策略需伯森先生先确认「未注册结算时间」的处置口径）。
+  - `test_daily_loss_halts_after_threshold_integration`（结算/盈亏回填后达阈值 → `check_gates` 拒单）— 待 G1-001
+  - `test_settlement_window_blocks_buy_when_registered`（注册结算时间后，2h 内 Buy 被拒、Sell 放行）— 待 G1-002
+  - `test_unknown_settlement_fail_closed`（未注册结算时间 → 按约定拒绝并告警）— 待 G1-002
+  - ~~`test_gas_protection_rejects_high_gwei`~~ ✅ 已完成
+- **Acceptance**: 三项在真实 `place_order` 调用链上可触发并拒绝；`get_risk_state` 的熔断标志与 `RiskEngine` 权威状态一致（002 的 fail-closed 策略需伯森先生先确认「未注册结算时间」的处置口径）。**当前验证**：Rust 330 + 4 + 18 + 1 全绿。
 
 ### G2 实时成交链可用性（P0-EXEC-004）
 

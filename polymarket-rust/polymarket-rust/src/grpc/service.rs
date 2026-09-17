@@ -472,6 +472,30 @@ impl ExecutionServiceImpl {
         plan.actions.len()
     }
 
+    /// G1-003 / P0-RISK-003：获取当前 gas 价（gwei）供风控预检。
+    ///
+    /// - 未挂载 `FastExecutor` 或未配 `RpcPool`（mock / paper / 未接线）→ `Ok(0)`：不阻塞；
+    ///   此类订单随后会因「FastExecutor 未初始化」被拒，不存在真实链上 Gas 风险。
+    /// - 已挂载但 RPC 调用/解析失败 → `Err`：调用方 FAIL-CLOSED 拒绝下单（不低估 Gas 风险）。
+    async fn gas_gwei_for_risk(&self) -> Result<u64, String> {
+        let fe = match self.fast_executor.as_ref() {
+            Some(fe) => fe,
+            None => return Ok(0),
+        };
+        let pool = match fe.rpc_pool() {
+            Some(p) => p,
+            None => return Ok(0),
+        };
+        let result = pool
+            .rpc_call("eth_gasPrice", serde_json::json!([]))
+            .await
+            .map_err(|e| format!("eth_gasPrice 调用失败: {e}"))?;
+        let hex = result
+            .as_str()
+            .ok_or_else(|| format!("eth_gasPrice 返回非字符串: {result}"))?;
+        parse_gas_price_hex_to_gwei(hex)
+    }
+
     /// P1-031：重建远端仍 open 的 BUY 订单的预留额度。
     ///
     /// 对账恢复时 `sync_position` 会清空各市场的 reserved（幽灵预留），但远端
@@ -714,8 +738,34 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
 
         let notional = order.quantity * order.target_price;
 
+        // G1-003 / P0-RISK-003：取实时 gas 价供风控预检。有执行器但取价失败 → FAIL-CLOSED。
+        let gas_gwei = match self.gas_gwei_for_risk().await {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::error!(
+                    "Gas 费获取失败，FAIL-CLOSED 拒绝下单: order_id={}, {}",
+                    order.order_id,
+                    e
+                );
+                self.order_store.mark_rejected(&order.order_id);
+                return Ok(Response::new(pb::OrderResult {
+                    order_id: order.order_id.clone(),
+                    success: false,
+                    exchange_order_id: String::new(),
+                    error_message: format!("Gas 费获取失败，禁止下单: {}", e),
+                    timestamp: Utc::now().to_rfc3339(),
+                    filled_price: 0.0,
+                    filled_size: 0.0,
+                    status: pb::ExecutionStatus::Rejected as i32,
+                    ..Default::default()
+                }));
+            }
+        };
+
         // ★ P0-008：原子「检查 + 预留」——并发下单不会同时通过仓位上限。
-        if let Err(e) = re.check_and_reserve(&order.token_id, side, notional, order.quantity, 0) {
+        if let Err(e) =
+            re.check_and_reserve(&order.token_id, side, notional, order.quantity, gas_gwei)
+        {
             tracing::warn!("风控预检拦截: token={}, {}", order.token_id, e);
 
             self.order_store.mark_rejected(&order.order_id);
@@ -1116,6 +1166,21 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
 // ============================================================================
 // 测试
 // ============================================================================
+
+/// G1-003：把 `eth_gasPrice` 的十六进制 Wei 解析为 gwei（向下取整，避免低估）。
+fn parse_gas_price_hex_to_gwei(hex: &str) -> Result<u64, String> {
+    let trimmed = hex.trim();
+    let digits = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    if digits.is_empty() {
+        return Err(format!("gasPrice 空值: {hex}"));
+    }
+    let wei = u128::from_str_radix(digits, 16)
+        .map_err(|e| format!("gasPrice 解析失败 ({hex}): {e}"))?;
+    Ok((wei / 1_000_000_000) as u64)
+}
 
 #[cfg(test)]
 mod tests {
@@ -1858,5 +1923,99 @@ mod tests {
                 bad_id
             );
         }
+    }
+
+    /// G1-003：eth_gasPrice 十六进制 Wei → gwei 解析（向下取整）。
+    #[test]
+    fn test_parse_gas_price_hex_to_gwei() {
+        assert_eq!(
+            parse_gas_price_hex_to_gwei(&format!("0x{:x}", 1_000_000_000u128)).unwrap(),
+            1
+        );
+        assert_eq!(
+            parse_gas_price_hex_to_gwei(&format!("0x{:x}", 1_000_000_000_000u128)).unwrap(),
+            1000
+        );
+        assert_eq!(
+            parse_gas_price_hex_to_gwei(&format!("0x{:x}", 1_500_000_000u128)).unwrap(),
+            1,
+            "不足 1 gwei 的部分应向下取整"
+        );
+        assert_eq!(parse_gas_price_hex_to_gwei("0x0").unwrap(), 0);
+    }
+
+    /// G1-003：非法 gasPrice 必须报错，不能静默当 0。
+    #[test]
+    fn test_parse_gas_price_invalid_returns_err() {
+        assert!(parse_gas_price_hex_to_gwei("").is_err());
+        assert!(parse_gas_price_hex_to_gwei("0x").is_err());
+        assert!(parse_gas_price_hex_to_gwei("zzz").is_err());
+    }
+
+    /// G1-003 / P0-RISK-003：Gas 超上限必须被风控拒绝（阈值逻辑不变，仅验证接线所依赖的门）。
+    #[test]
+    fn test_gas_protection_rejects_high_gwei() {
+        let mut cfg = RiskConfig::default();
+        cfg.max_gas_gwei = 500;
+        let engine = RiskEngine::new(cfg);
+        assert!(
+            engine
+                .check_and_reserve("t-gas", Side::Buy, 10.0, 10.0, 501)
+                .is_err(),
+            "gas 501 gwei 超上限应拒单"
+        );
+        assert!(
+            engine
+                .check_and_reserve("t-gas", Side::Buy, 10.0, 10.0, 500)
+                .is_ok(),
+            "gas 500 gwei 等于上限应放行"
+        );
+    }
+
+    /// G1-003：已挂载执行器但 gas 取价失败（RPC 不可达）→ FAIL-CLOSED 拒绝下单。
+    #[tokio::test]
+    async fn test_place_order_fails_closed_when_gas_fetch_fails() {
+        use crate::fast::order_state::OrderStateStatus;
+        use crate::fast::rpc_pool::RpcPool;
+        use crate::fast::trading_gate::TradingGateState;
+        use pb::execution_service_server::ExecutionService;
+
+        let mgr = Arc::new(WalletManager::new("gas_test_ks.json"));
+        let fe = FastExecutor::new(mgr, crate::clob::client::ClobConfig::default())
+            .unwrap()
+            .with_rpc_pool(Arc::new(RpcPool::new(&["http://127.0.0.1:1"])));
+
+        let mut service = ExecutionServiceImpl::new_mock();
+        service.trading_gate.set_state(TradingGateState::Ready);
+        service.set_risk_engine(Arc::new(RiskEngine::new(RiskConfig::default())));
+        service.set_fast_executor(Arc::new(fe));
+
+        let req = pb::AggregatedOrder {
+            order_id: "o-gas".to_string(),
+            token_id: "t1".to_string(),
+            direction: pb::Direction::BuyYes as i32,
+            quantity: 10.0,
+            status: pb::OrderStatus::Open as i32,
+            target_price: 0.5,
+            paper_trading: false,
+            ..Default::default()
+        };
+
+        let result = service
+            .place_order(Request::new(req))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(!result.success);
+        assert!(
+            result.error_message.contains("Gas 费获取失败"),
+            "应因 gas 取价失败被拒，实际: {}",
+            result.error_message
+        );
+        assert_eq!(
+            service.order_store.get("o-gas").map(|s| s.status),
+            Some(OrderStateStatus::Rejected)
+        );
     }
 }
