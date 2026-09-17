@@ -204,8 +204,9 @@
 
 - **Status**: 🚧 IN_PROGRESS（已授权 2026-09-17；CONSENSUS_ROUND_04 确认 P0-RISK-001/002/003 = CONFIRMED/P0）
   - G1-003 Gas 保护：🔧 **FIXED（09-17）**
-  - G1-001 日亏熔断：⬜ TODO（依赖结算/PnL 链）— 方案 `docs/design/settlement_pnl_risk_wiring.md`（Draft，待审）
-  - G1-002 结算窗口：⬜ TODO（需先出 `UpdateSettlementTimes` 接口方案待批）— 方案 `docs/design/update_settlement_times_rpc.md`（Draft，待审）
+  - G1-001 日亏熔断：⬜ TODO（依赖结算/PnL 链）— 方案 `docs/design/settlement_pnl_risk_wiring.md` **Draft v2，待第二轮审查**（首轮 CHANGES_REQUESTED；含 identifier→token_id POC 前置）
+  - G1-002 结算窗口：⬜ TODO（需先出 `UpdateSettlementTimes` 接口方案待批）— 方案 `docs/design/update_settlement_times_rpc.md` **Draft v2，待第二轮审查**（首轮 CHANGES_REQUESTED；unknown settlement 基线 fail-closed）
+  - 设计审查记录：`docs/design/CONSENSUS_DESIGN_ROUND_01.md`；审查清单：`docs/design/REVIEW_CHECKLIST_DESIGN.md`
 - **Owner**: Work Buddy
 - **Goal**: 让已实现但未接入生产路径的三项风控真正生效——① 日亏熔断（`post_check`→`report_pnl`）；② 结算前 2h 禁开 Buy；③ Gas 费保护。仅接线，**不改任何阈值/语义**。
 - **G1-003 实现说明（09-17）**：`place_order` 在 `check_and_reserve` 前调用 `gas_gwei_for_risk()`——经 `FastExecutor::rpc_pool().rpc_call("eth_gasPrice")` 取价并解析为 gwei（`parse_gas_price_hex_to_gwei`，向下取整）。
