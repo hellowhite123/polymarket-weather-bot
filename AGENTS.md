@@ -26,7 +26,9 @@
   （需 `PROTOC=C:/Users/32389/tools/protoc/bin/protoc.exe`；protoc v25.1）
 - **Rust 测试**：`cargo test --target x86_64-pc-windows-msvc`（历史基线 337 passed / 0 failed）
 - **Python venv**：`C:\Users\32389\.workbuddy\binaries\python\envs\default\Scripts\python.exe`
-- **Python 测试**：`pytest`（strategy_engine 等）
+- **Python 依赖**：`python -m pip install -r requirements-dev.txt`（含 pytest / pytest-asyncio）
+- **Python 测试**：`python -m pytest -q`（基线 94 passed / 0 failed / 0 error）
+  - `test_grpc.py` 的 async 用例在 pytest 下会挂起（gRPC async 生命周期根因在 `grpc_bridge`），已从 pytest 收集排除，须单独验证：`python test_grpc.py`
 - 验收：Rust 编译 0 error；Python `pytest` 全绿；改动前先 `git status` 确认无在途未提交工作。
 
 ## 关键工程约定
