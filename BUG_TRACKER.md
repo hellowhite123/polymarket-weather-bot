@@ -109,6 +109,23 @@
 
 ---
 
+## 二-C、Round 04 独立共识确认的 P0（09-17）
+
+> 来源：`audits/round_04/audit_opencode_round_04.md` + 独立共识审查（`audits/round_04/CONSENSUS_ROUND_04.md`）。
+> 状态口径：**CONFIRMED / P0**；已授权进入 `MASTER_TASKS.md` 对应任务组（`Status: TODO`）。总体 **LIVE = NO-GO**。
+
+| 编号 | 问题 | 共识 | 任务组 |
+|------|------|------|--------|
+| P0-RISK-001 | 日亏熔断从未触发（`post_check` 生产零调用） | CONFIRMED / P0 | G1 |
+| P0-RISK-002 | 结算窗口（2h 禁开 Buy）未接线，且未知即放行 | CONFIRMED / P0 | G1 |
+| P0-RISK-003 | Gas 费保护被硬编码 `0` 绕过 | CONFIRMED / P0 | G1 |
+| P0-EXEC-004 | 实时成交链不生效（`/data/trades` 无 L2 认证 + token 列表恒空 + 错误吞没） | CONFIRMED / P0 | G2 |
+| P0-EXEC-005 | Maker 成交未按 `trader_side`/`maker_orders` 归属本方方向 | CONFIRMED / P0 | G3 |
+
+> 独立审查方另确认：P1-035 维持 `FIXED / Verification Pending`，不得由实施者自证 VERIFIED。
+
+---
+
 ## 三、P1 清单（10 项，全部完成 09-10）
 
 | 新编号 | 问题 | 处置 | 落地 |
@@ -146,7 +163,7 @@
 | P1（未编号） | P1-032 | Background StateSync 不自动降级 TradingGate | 🟢 FIXED（09-16） | 后台对账发现差异/恢复动作/对账失败时，先 `reconcile_complete` 降级 Ready→Reconciling（停新单，`ensure_ready` 拦截）；恢复后重新快照 + 复核对账，一致才回 Ready，仍不一致/复核失败保持 Reconciling（FAIL-CLOSED）；halt 闩锁不被覆盖；+2 测试（降级→恢复回 Ready 全闭环 + 持续差异保持 Reconciling） |
 | P1（未编号） | P1-033 | Reserve Rollback Lifecycle | 🟢 FIXED（09-16） | ① `check_and_reserve` 集中度失败后回滚预留（仅 Buy）；② HTTP 200+`success=false` 释放预留 + mark_rejected；③ 网络超时/5xx 判为「未知结果」→ `is_unknown_outcome()` 保留预留 + 返回 Pending（保守，不低估暴露），确定失败（4xx/本地）才释放；+4 测试（集中度回滚 + is_unknown_outcome 分类×2）。指纹级精确确认留待后续 |
 | P1（未编号） | P1-034 | `consume_trade_events` 把 `Lagged` 当致命错误 | 🟢 FIXED（09-16） | 旧实现 `while let Ok(...)` 遇 `broadcast::RecvError::Lagged(n)` 直接退出循环且无日志 → 成交链路静默永久停摆（现场仍在交易但成交不记账）。改为 `loop + match`：`Lagged` → `tracing::error!` 告警（含丢失条数，需 StateSync 兜底）+ continue；`Closed` → 告警后 return。保留「仅消费 Trade」+「幂等由下层单点」；+3 测试（Lagged 不致命 / Closed 才退出 / 非 Trade 不记账）。**已做回归验证：还原旧实现后 `test_consume_trade_events_lagged_not_fatal` 必 FAILED**，证明测试有鉴别力 |
-| P1（未编号） | P1-035 | 空 `trade_id` 绕过 fill 幂等（P0-015 残余边界风险） | 🟢 FIXED（09-16） | 保持 `claim_trade()` 原语义不变；`poll_trades()` 循环入口对空/空白 `t.id` 告警并丢弃；StateSync `build_recovery_plan()` 对空/空白远端 trade ID 不生成 `MarkOrderFilled`；`apply_recovery()` 再加最终 fail-closed 防线，拒绝空/空白 `trade_id` 进入 `on_market_trade`。正常成交事件必须拥有非空唯一 trade_id。全量 Rust 测试 317 + 集成 18 + 文档 1 全绿；+3 针对性测试（`test_poll_trades_drops_empty_trade_id` / `test_build_recovery_plan_skips_empty_trade_id` / `test_apply_recovery_rejects_empty_trade_id`），**已做鉴别力验证：三处守卫置否后 3 测试必 FAILED** |
+| P1（未编号） | P1-035 | 空 `trade_id` 绕过 fill 幂等（P0-015 残余边界风险） | 🟡 FIXED / Verification Pending（09-17 Round04 独立审查：未升 VERIFIED） | 保持 `claim_trade()` 原语义不变；`poll_trades()` 循环入口对空/空白 `t.id` 告警并丢弃；StateSync `build_recovery_plan()` 对空/空白远端 trade ID 不生成 `MarkOrderFilled`；`apply_recovery()` 再加最终 fail-closed 防线，拒绝空/空白 `trade_id` 进入 `on_market_trade`。正常成交事件必须拥有非空唯一 trade_id。全量 Rust 测试 317 + 集成 18 + 文档 1 全绿；+3 针对性测试（`test_poll_trades_drops_empty_trade_id` / `test_build_recovery_plan_skips_empty_trade_id` / `test_apply_recovery_rejects_empty_trade_id`），**已做鉴别力验证：三处守卫置否后 3 测试必 FAILED**。**Round04 结论：代码+测试在，但不得由实施者自证 → 维持 FIXED，待独立方补三重证据后升 VERIFIED** |
 
 **P1-035 定级待伯森先生裁决**：原文判断「是否构成 P0 取决于上游能否产生空 trade_id」。查证显示代码层面**允许**空 id 产生（serde(default) 且反序列化不失败），但 API 实际是否返回无 id trade 属外部事实。鉴于后果严重（仓位无限累加）而修复成本极低（几行 fail-closed），倾向按 P0 处理；若确认 API 保证非空 id，则降为 P1 防御性校验。
 

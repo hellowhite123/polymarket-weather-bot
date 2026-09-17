@@ -196,14 +196,13 @@
 ## 候选任务（Round 04 审查产出）
 
 > 来源：`audits/round_04/audit_opencode_round_04.md`（OpenCode，commit `21fdcf8`）。
-> **状态说明**：以下为候选条目，**尚未授权实施**。按 `docs/CODE_REVIEW_STANDARD.md` §5，
-> 须由独立审查员（Human / 另一 AI）在 `audits/round_04/CONSENSUS_ROUND_04.md` 逐条判定
-> `CONFIRMED` 后，才将 `Status` 置为 `TODO` 并开工。一次只做一个 Task Group。
+> **状态说明**：Round 04 独立共识审查已完成（2026-09-17）：`P0-RISK-001/002/003`、`P0-EXEC-004`、`P0-EXEC-005` 均 **CONFIRMED / P0**；G1/G2/G3 与 ENV-001 **已授权**，`Status` 置为 `TODO`。一次只做一个 Task Group。
+> ⚠️ **总体状态 LIVE = NO-GO**：任何 P0 未闭环前禁止实盘。CONSENSUS 原件：`audits/round_04/CONSENSUS_ROUND_04.md`。
 > 红线不变：不得改交易语义 / Risk Model 阈值 / Strategy / 资金控制逻辑；本批**仅做接线与 fail-closed**。
 
 ### G1 风控三闸接线（P0-RISK-001/002/003）
 
-- **Status**: TODO（候选；待 CONSENSUS 确认）
+- **Status**: TODO（**已授权 2026-09-17**；CONSENSUS_ROUND_04 确认 P0-RISK-001/002/003 = CONFIRMED/P0）
 - **Owner**: Work Buddy
 - **Goal**: 让已实现但未接入生产路径的三项风控真正生效——① 日亏熔断（`post_check`→`report_pnl`）；② 结算前 2h 禁开 Buy；③ Gas 费保护。仅接线，**不改任何阈值/语义**。
 - **Allowed Files**:
@@ -222,7 +221,7 @@
 
 ### G2 实时成交链可用性（P0-EXEC-004）
 
-- **Status**: TODO（候选；待 CONSENSUS 确认）
+- **Status**: TODO（**已授权 2026-09-17**；CONSENSUS_ROUND_04 确认 P0-EXEC-004 = CONFIRMED/P0）
 - **Owner**: Work Buddy
 - **Goal**: 启用 `MARKET_EVENTS_ENABLED=1` 后，`poll_trades → Trade → on_market_trade` 真正闭环——补 L2 认证头、从注册表填充监控 token、`tick` 不再吞错。
 - **Allowed Files**:
@@ -237,7 +236,7 @@
 
 ### G3 Maker 成交方向归一化（P0-EXEC-005）
 
-- **Status**: TODO（候选；**定级待独立审查员按 Polymarket 官方 data-api 文档确认 `side` 视角**）
+- **Status**: TODO（**已授权 2026-09-17**；P0-EXEC-005 = CONFIRMED/P0。外部事实已确认：Polymarket Trade schema 同时含 `side`/`trader_side`/`maker_address`/`maker_orders`/`taker_order_id`，**不得仅凭顶层 `side` 归属本方成交方向**）
 - **Owner**: Work Buddy
 - **Goal**: `trader_side == "MAKER"` 时把成交 `side` 归一化到本方视角（BUY↔SELL），使 `RiskEngine`/`risk_state`/`FillLedger` 方向正确。
 - **Allowed Files**:
@@ -251,7 +250,7 @@
 
 ### ENV-001 Python 测试门禁修复（流程/测试基础设施）
 
-- **Status**: TODO（候选；待 CONSENSUS 确认）
+- **Status**: TODO（**已授权 2026-09-17**）
 - **Owner**: Work Buddy
 - **Goal**: 让 `AGENTS.md` 承诺的 Python 验证门禁**真实可用且可复现**：修复 pytest 依赖缺失、async 用例挂起、脚本式测试误收集、fixture 缺失四项，并让文档与命令一致。不改任何业务代码逻辑。
 - **背景证据**: 见 `audits/round_04/audit_opencode_round_04.md` §六 ENV-001——venv 未装 pytest 且 `requirements.txt` 未声明；装上后 `test_grpc.py` 在 pytest 下挂起（自带 `main()` 脚本跑法全绿）；`test_mock.py::test_formatter` 缺 `noaa_fc/caiyun_fc` fixture。
