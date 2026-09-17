@@ -123,6 +123,8 @@
 | P0-EXEC-005 | Maker 成交未按 `trader_side`/`maker_orders` 归属本方方向 | CONFIRMED / P0 → 🔧 FIXED（09-17，G3；待独立判 VERIFIED） | G3 |
 
 > 独立审查方另确认：P1-035 维持 `FIXED / Verification Pending`，不得由实施者自证 VERIFIED。
+>
+> **Round 04 P1 实施登记（G4，09-17）**：`P1-RISK-006`（取消不释放预留）🔧 FIXED（G4，待 VERIFIED）；`P1-RISK-007`（后台不重建 open 预留）🔧 FIXED（G4，待 VERIFIED）；`P1-RISK-008`（成交价优于限价的预留残余）、`P1-EXEC-009`（未知结果订单被对账输入集排除）⬜ 需设计/显式授权（涉及 Risk Model 记账 / 对账语义）。
 
 ---
 

@@ -270,6 +270,31 @@
 - **验证**：全量 Rust `322 + 4 + 18 + 1` 全绿；**鉴别力验证**：关闭两处归一化后 3 个 maker 测试必 FAILED、taker 测试仍绿。
 - **Acceptance**: Maker/Taker 两种角色下仓位方向与 `risk_state` 一致；回归全绿。**待独立审查员判 VERIFIED**。
 
+### G4 预留生命周期（P1-RISK-006/007；008/009 需设计）
+
+- **Status**: 🚧 IN_PROGRESS（2026-09-17 伯森先生授权）
+  - P1-RISK-006 取消订单释放预留 + OrderStore 原子取消：🔧 FIXED（09-17）
+  - P1-RISK-007 后台对账后重建 open 预留：🔧 FIXED（09-17）
+  - P1-RISK-008 成交价优于限价时的预留残余：⬜ **需设计/显式授权**（须改 `risk_engine.rs` 预留记账 = Risk Model 红线）
+  - P1-EXEC-009 未知结果订单被对账输入集排除：⬜ **需设计/显式授权**（对账语义变更）
+- **Owner**: Work Buddy
+- **Goal**: 消除预留（reserve）泄漏：① 取消订单时释放该单剩余预留并标记 OrderStore；② 后台对账触发仓位重建后重建远端 open 订单预留（避免暴露漏计）。
+- **实现说明（09-17）**：
+  - `order_state.rs`：`OrderState` 新增 `limit_price`；`OrderStore` 新增 `set_limit_price` / 原子 `mark_cancelled`（终态保护）/ `mark_cancelled_by_exchange_order_id` / `active_orders`。
+  - `service.rs`：下单 claim 后记录 `limit_price`；新增 `settle_cancel`（按 `remaining_size × limit_price` 释放预留 + 原子取消）；`cancel_order`/`cancel_all` 成功后调用（cancel_all 同时修正 `cancelled_count`）；`apply_recovery::MarkOrderNonFilled` 改用原子取消；`rebuild_open_order_reserves` 增加 `_filtered` 变体（只重建指定 token，规避 `rebuild_reserve` 累加语义的双计）。
+  - `server.rs`：后台 30s 对账中，若有 `RebuildPosition` 动作 → `fetch_open_orders` + 只对这些 token `rebuild_open_order_reserves_filtered`。
+- **Allowed Files**:
+  - `polymarket-rust/polymarket-rust/src/grpc/service.rs`
+  - `polymarket-rust/polymarket-rust/src/fast/order_state.rs`
+  - `polymarket-rust/polymarket-rust/src/bin/server.rs`
+- **Forbidden**: `strategy_engine/`、`fast/risk_engine.rs`（**阈值/记账逻辑不改**）、`fast/fill_records.rs`、交易语义
+- **Required Tests**（实际落地名）:
+  - `test_cancel_order_releases_reserve`、`test_cancel_all_releases_reserves`
+  - `test_mark_cancelled_atomic_terminal_protection`、`test_mark_cancelled_by_exchange_order_id`、`test_active_orders_excludes_terminal`
+- **验证**: 全量 Rust `335 + 4 + 18 + 1` 全绿；**鉴别力验证**——禁用预留释放后取消类测试必 FAILED；去掉终态保护后 `test_mark_cancelled_atomic_terminal_protection` 必 FAILED。
+- **Acceptance**: 取消成功后该单预留被释放、OrderStore 转 Cancelled；后台恢复后只对仓位重建 token 重建预留。**待独立审查员判 VERIFIED**。
+- **未纳入本批（原因）**: P1-RISK-008 需要「按 order_id 的预留台账」才能精确释放残余，属 Risk Model 记账变更；P1-EXEC-009 需要重新定义 `Received` 订单的对账语义。两者须先出设计并经授权。
+
 ### ENV-001 Python 测试门禁修复（流程/测试基础设施）
 
 - **Status**: 🔧 FIXED（2026-09-17）
@@ -293,6 +318,27 @@
   - `python test_grpc.py`（脚本 runner，含 9 个 async 用例）→ 全部 PASS
 - **Acceptance**: 已达成；`AGENTS.md` 门禁命令与实际一致。
 - **遗留（未在本次授权范围）**: `test_grpc.py` async 用例在 pytest 下挂起的**根因修复**需改动 `strategy_engine/grpc_bridge`（client/mock_server 的 gRPC async 生命周期），建议单列后续任务。
+
+---
+
+### TST-001 test_grpc.py async 用例 pytest 挂起根因修复
+
+- **Status**: TODO（2026-09-17 伯森先生授权）
+- **Owner**: Work Buddy
+- **Goal**: 修复 `test_grpc.py` 的 9 个 async 用例在 pytest 下挂起的**根因**（`strategy_engine/grpc_bridge` 的 gRPC async 生命周期 / event loop 处理），使其可被 pytest 正常收集执行，随后移除 ENV-001 中的 `__test__ = False` 规避标记。
+- **背景**: ENV-001 实测——`pytest -o asyncio_mode=auto test_grpc.py` 90s 未返回；而 `python test_grpc.py`（`asyncio.run(main)` 单 loop 顺序执行）全绿。根因在 `MockExecutionServer`/`GrpcExecutionClient` 的 `grpc.aio` 启停在「每测试独立 event loop」下的行为（疑为 `server.stop()`/`wait_for_termination()` 或 channel close 挂起）。详见 `MASTER_TASKS.md` ENV-001「遗留」段。
+- **Allowed Files**:
+  - `strategy_engine/grpc_bridge/client.py`
+  - `strategy_engine/grpc_bridge/mock_server.py`
+  - `test_grpc.py`
+  - `pytest.ini`、`conftest.py`
+- **Forbidden**: 业务逻辑（converter 转换语义、proto 契约、下单业务规则）一律不改
+- **Required Tests**:
+  - `python -m pytest -q test_grpc.py` 的 9 个 async 用例被收集且**在限定时间内完成**（0 hang / 0 error）
+  - `python test_grpc.py` 脚本 runner 仍全绿
+  - `python -m pytest -q`（全量）仍 0 failed / 0 error
+- **Acceptance**: 移除 `__test__ = False` 后 pytest 可稳定跑完 test_grpc async；根因有明确记录（commit message / 注释）；无业务行为变化。
+- **诊断建议**: 用 `pytest -p no:cacheprovider -o asyncio_mode=auto --timeout` 或对单个 async 用例加 `faulthandler` 定位；对比单 loop（脚本）与 per-test loop 的差异，重点查 `MockExecutionServer.__aexit__` 与 `GrpcExecutionClient.__aexit__`。
 
 ---
 

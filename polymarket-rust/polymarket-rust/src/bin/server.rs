@@ -257,6 +257,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             );
                         }
 
+                        // G4 / P1-RISK-007：若发生仓位重建（sync_position 清空了这些 token
+                        // 的 reserved），按远端 open 订单**只重建这些 token** 的预留，
+                        // 避免对未清空 token 重复累加（rebuild_reserve 为累加语义）。
+                        let rebuilt_tokens: std::collections::HashSet<String> = recovery
+                            .actions
+                            .iter()
+                            .filter_map(|a| match a {
+                                polymarket_rust::fast::state_sync::RecoveryAction::RebuildPosition {
+                                    token_id,
+                                    ..
+                                } => Some(token_id.clone()),
+                                _ => None,
+                            })
+                            .collect();
+                        if !rebuilt_tokens.is_empty() {
+                            match ss.fetch_open_orders().await {
+                                Ok(open_orders) => svc.rebuild_open_order_reserves_filtered(
+                                    &open_orders,
+                                    Some(&rebuilt_tokens),
+                                ),
+                                Err(e) => tracing::warn!(
+                                    "StateSync 后台重建 open 订单预留失败（预留可能偏保守）: {e}"
+                                ),
+                            }
+                        }
+
                         // P1-032：发生过差异或恢复动作后，复核对账确认一致才回 Ready。
                         // apply_recovery 改了本地状态，需重新快照后再对账，否则拿的是旧快照。
                         if !pos.in_sync || !ord.in_sync || applied > 0 || recovery.has_unresolved()

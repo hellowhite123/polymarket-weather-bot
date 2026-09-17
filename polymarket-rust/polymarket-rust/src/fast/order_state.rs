@@ -64,6 +64,8 @@ pub struct OrderState {
     pub requested_size: f64,
     pub filled_size: f64,
     pub remaining_size: f64,
+    /// G4 / P1-RISK-006：下单价（limit price），用于取消时按 remaining×price 释放预留。
+    pub limit_price: f64,
     pub status: OrderStateStatus,
     pub created_at: u64,
     pub updated_at: u64,
@@ -86,6 +88,7 @@ impl OrderState {
             requested_size,
             filled_size: 0.0,
             remaining_size: requested_size,
+            limit_price: 0.0,
             status: OrderStateStatus::Received,
             created_at: now,
             updated_at: now,
@@ -289,6 +292,89 @@ impl OrderStore {
                 | OrderStateStatus::Expired => {}
             }
         }
+    }
+
+    /// G4 / P1-RISK-006：记录下单价（limit price），供取消时按
+    /// `remaining_size × limit_price` 计算并释放剩余预留。
+    pub fn set_limit_price(&self, client_order_id: &str, price: f64) {
+        if !price.is_finite() || price < 0.0 {
+            return;
+        }
+        let mut orders = self.orders.write().unwrap();
+        if let Some(st) = orders.get_mut(client_order_id) {
+            st.limit_price = price;
+        }
+    }
+
+    /// G4 / P1-RISK-006：原子标记取消（终态保护，不覆盖已 `Filled` 等终态）。
+    ///
+    /// 与 `mark_rejected` 同样在单次写锁内完成「定位 + 状态转换」，避免
+    /// `get → mark_cancelled → upsert` 的读-改-写竞争把并发成交覆盖回 Cancelled。
+    pub fn mark_cancelled(&self, client_order_id: &str) -> Option<OrderState> {
+        let mut orders = self.orders.write().unwrap();
+        let st = orders.get_mut(client_order_id)?;
+        match st.status {
+            OrderStateStatus::Received
+            | OrderStateStatus::Submitted
+            | OrderStateStatus::Live
+            | OrderStateStatus::PartialFilled => {
+                st.mark_cancelled();
+                Some(st.clone())
+            }
+            OrderStateStatus::Filled
+            | OrderStateStatus::Cancelled
+            | OrderStateStatus::Rejected
+            | OrderStateStatus::Expired => None,
+        }
+    }
+
+    /// G4 / P1-RISK-006：按交易所订单 ID 原子标记取消（终态保护）。
+    pub fn mark_cancelled_by_exchange_order_id(
+        &self,
+        exchange_order_id: &str,
+    ) -> Option<OrderState> {
+        if exchange_order_id.is_empty() {
+            return None;
+        }
+        let mut orders = self.orders.write().unwrap();
+        for st in orders.values_mut() {
+            if st.exchange_order_id.as_deref() == Some(exchange_order_id) {
+                return match st.status {
+                    OrderStateStatus::Received
+                    | OrderStateStatus::Submitted
+                    | OrderStateStatus::Live
+                    | OrderStateStatus::PartialFilled => {
+                        st.mark_cancelled();
+                        Some(st.clone())
+                    }
+                    OrderStateStatus::Filled
+                    | OrderStateStatus::Cancelled
+                    | OrderStateStatus::Rejected
+                    | OrderStateStatus::Expired => None,
+                };
+            }
+        }
+        None
+    }
+
+    /// G4 / P1-RISK-006：返回所有活动（非终态）订单快照，供 `cancel_all`
+    /// 逐一释放预留并标记取消。
+    pub fn active_orders(&self) -> Vec<OrderState> {
+        self.orders
+            .read()
+            .unwrap()
+            .values()
+            .filter(|s| {
+                matches!(
+                    s.status,
+                    OrderStateStatus::Received
+                        | OrderStateStatus::Submitted
+                        | OrderStateStatus::Live
+                        | OrderStateStatus::PartialFilled
+                )
+            })
+            .cloned()
+            .collect()
     }
 
     /// 幂等占位（支持重试）：`client_order_id` 不存在、或处于可重试终态
@@ -728,5 +814,60 @@ mod tests {
         assert!(store
             .claim_or_retry("o1".to_string(), "t1".to_string(), "BUY".to_string(), 10.0)
             .is_none());
+    }
+
+    /// G4 / P1-RISK-006：原子取消带终态保护，不覆盖 Filled。
+    #[test]
+    fn test_mark_cancelled_atomic_terminal_protection() {
+        let store = OrderStore::new();
+        store.create("c1".to_string(), "t1".to_string(), "BUY".to_string(), 10.0);
+        store.set_limit_price("c1", 0.5);
+        // 未成交 → 可取消
+        let cancelled = store.mark_cancelled("c1").unwrap();
+        assert_eq!(cancelled.status, OrderStateStatus::Cancelled);
+        // 已 Cancelled → 再取消返回 None（终态不覆盖）
+        assert!(store.mark_cancelled("c1").is_none());
+
+        // Filled 不可被取消（不倒退）
+        store.create("c2".to_string(), "t1".to_string(), "BUY".to_string(), 10.0);
+        if let Some(mut st) = store.get("c2") {
+            st.update_fill(10.0);
+            store.upsert(st);
+        }
+        assert!(store.mark_cancelled("c2").is_none());
+        assert_eq!(
+            store.get("c2").map(|s| s.status),
+            Some(OrderStateStatus::Filled)
+        );
+    }
+
+    /// G4 / P1-RISK-006：按 exchange_order_id 原子取消 + set_limit_price。
+    #[test]
+    fn test_mark_cancelled_by_exchange_order_id() {
+        let store = OrderStore::new();
+        store.create("c1".to_string(), "t1".to_string(), "BUY".to_string(), 10.0);
+        store.set_limit_price("c1", 0.4);
+        if let Some(mut st) = store.get("c1") {
+            st.mark_submitted("ex-1".to_string());
+            store.upsert(st);
+        }
+        assert_eq!(store.get("c1").map(|s| s.limit_price), Some(0.4));
+
+        let st = store.mark_cancelled_by_exchange_order_id("ex-1").unwrap();
+        assert_eq!(st.status, OrderStateStatus::Cancelled);
+        assert!(store.mark_cancelled_by_exchange_order_id("ex-1").is_none());
+        assert!(store.mark_cancelled_by_exchange_order_id("").is_none());
+    }
+
+    /// G4 / P1-RISK-006：active_orders 只返回非终态订单。
+    #[test]
+    fn test_active_orders_excludes_terminal() {
+        let store = OrderStore::new();
+        store.create("a".to_string(), "t".to_string(), "BUY".to_string(), 1.0);
+        store.create("b".to_string(), "t".to_string(), "BUY".to_string(), 1.0);
+        store.mark_cancelled("b");
+        let active = store.active_orders();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].client_order_id, "a");
     }
 }

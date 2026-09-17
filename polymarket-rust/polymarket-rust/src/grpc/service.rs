@@ -443,12 +443,10 @@ impl ExecutionServiceImpl {
                     self.on_market_trade(&trade).await;
                 }
                 RecoveryAction::MarkOrderNonFilled { order_id } => {
-                    // P0-016：order_id 是交易所订单 ID（来自 pending_exchange_order_ids），
-                    //    需按 exchange_order_id 反查
-                    if let Some(mut st) = self.order_store.get_by_exchange_order_id(order_id) {
-                        st.mark_cancelled();
-                        self.order_store.upsert(st);
-                    }
+                    // P0-016 / G4：order_id 是交易所订单 ID；单写锁内原子取消
+                    //（终态保护，不覆盖并发成交）。
+                    self.order_store
+                        .mark_cancelled_by_exchange_order_id(order_id);
                 }
                 RecoveryAction::RebuildPosition {
                     token_id,
@@ -496,6 +494,23 @@ impl ExecutionServiceImpl {
         parse_gas_price_hex_to_gwei(hex)
     }
 
+    /// G4 / P1-RISK-006：取消成功后释放该单剩余预留并原子标记 `Cancelled`。
+    ///
+    /// 预留额按 `remaining_size × limit_price`（仅 BUY）；`limit_price` 未知（0）时
+    /// 跳过释放（保守：宁可少释放，不平白扣减其它订单的预留）。终态订单不会被覆盖。
+    fn settle_cancel(&self, client_order_id: &str) {
+        let st = match self.order_store.get(client_order_id) {
+            Some(st) => st,
+            None => return,
+        };
+        if st.side == "BUY" && st.limit_price > 0.0 && st.remaining_size > 0.0 {
+            if let Some(re) = self.risk_engine.as_ref() {
+                re.release_reserve(&st.token_id, st.remaining_size * st.limit_price);
+            }
+        }
+        self.order_store.mark_cancelled(client_order_id);
+    }
+
     /// P1-031：重建远端仍 open 的 BUY 订单的预留额度。
     ///
     /// 对账恢复时 `sync_position` 会清空各市场的 reserved（幽灵预留），但远端
@@ -505,6 +520,19 @@ impl ExecutionServiceImpl {
     /// 匹配远端 open order 的 price，计算剩余 notional = remaining_size × price，
     /// 按 token 聚合后回填 RiskEngine.reserved。
     pub fn rebuild_open_order_reserves(&self, remote_open_orders: &[serde_json::Value]) {
+        self.rebuild_open_order_reserves_filtered(remote_open_orders, None);
+    }
+
+    /// G4 / P1-RISK-007：只重建 `token_filter` 内 token 的预留。
+    ///
+    /// 后台对账在 `sync_position` 清空**这些** token 的 `reserved` 后调用本方法，
+    /// 避免对未清空 token 重复累加（`rebuild_reserve` 是累加语义）。
+    /// `token_filter == None` 表示全部 token（启动时 `reserved` 为 0，安全）。
+    pub fn rebuild_open_order_reserves_filtered(
+        &self,
+        remote_open_orders: &[serde_json::Value],
+        token_filter: Option<&std::collections::HashSet<String>>,
+    ) {
         let re = match self.risk_engine.as_ref() {
             Some(re) => re,
             None => return,
@@ -532,6 +560,11 @@ impl ExecutionServiceImpl {
             };
             if st.side != "BUY" || st.remaining_size <= 0.0 {
                 continue;
+            }
+            if let Some(filter) = token_filter {
+                if !filter.contains(&st.token_id) {
+                    continue;
+                }
             }
             let Some(price) = price_by_id.get(&ex_id) else {
                 continue;
@@ -629,6 +662,12 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
                     return Ok(Response::new(existing_order_result(&existing)));
                 }
             }
+        }
+
+        // G4 / P1-RISK-006：记录下单价，供取消时按 remaining×price 释放预留。
+        if !order.order_id.is_empty() {
+            self.order_store
+                .set_limit_price(&order.order_id, order.target_price);
         }
 
         // 只执行 OPEN 状态的指令
@@ -973,11 +1012,25 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
             .cancel_order(&self.wallet_address, &self.password, &req.order_id)
             .await
         {
-            Ok(()) => Ok(Response::new(pb::CancelResult {
-                success: true,
-                message: format!("已取消订单 {}", req.order_id),
-                cancelled_count: 1,
-            })),
+            Ok(()) => {
+                // G4 / P1-RISK-006：取消成功后释放预留并标记 OrderStore。
+                // req.order_id 可能是 client_order_id 或 exchange_order_id，两者都尝试。
+                match self.order_store.get(&req.order_id) {
+                    Some(st) => self.settle_cancel(&st.client_order_id),
+                    None => {
+                        if let Some(st) =
+                            self.order_store.get_by_exchange_order_id(&req.order_id)
+                        {
+                            self.settle_cancel(&st.client_order_id);
+                        }
+                    }
+                }
+                Ok(Response::new(pb::CancelResult {
+                    success: true,
+                    message: format!("已取消订单 {}", req.order_id),
+                    cancelled_count: 1,
+                }))
+            }
             Err(e) => Ok(Response::new(pb::CancelResult {
                 success: false,
                 message: format!("取消失败: {}", e),
@@ -996,11 +1049,19 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
         let flow = self.order_flow.lock().await;
 
         match flow.cancel_all(&self.wallet_address, &self.password).await {
-            Ok(()) => Ok(Response::new(pb::CancelResult {
-                success: true,
-                message: "已取消全部未成交订单，持仓保持不变".to_string(),
-                cancelled_count: 0,
-            })),
+            Ok(()) => {
+                // G4 / P1-RISK-006：释放所有活动订单预留并标记取消。
+                let active = self.order_store.active_orders();
+                let count = active.len();
+                for st in active {
+                    self.settle_cancel(&st.client_order_id);
+                }
+                Ok(Response::new(pb::CancelResult {
+                    success: true,
+                    message: "已取消全部未成交订单，持仓保持不变".to_string(),
+                    cancelled_count: count as i32,
+                }))
+            }
             Err(e) => Ok(Response::new(pb::CancelResult {
                 success: false,
                 message: format!("取消全部失败: {}", e),
@@ -2017,5 +2078,104 @@ mod tests {
             service.order_store.get("o-gas").map(|s| s.status),
             Some(OrderStateStatus::Rejected)
         );
+    }
+
+    /// G4 / P1-RISK-006：取消订单释放该单剩余预留并标记 Cancelled。
+    #[tokio::test]
+    async fn test_cancel_order_releases_reserve() {
+        use crate::fast::order_state::OrderStateStatus;
+
+        let mut service = ExecutionServiceImpl::new_mock();
+        let mut cfg = RiskConfig::default();
+        cfg.max_position_per_market = 100.0;
+        cfg.max_global_exposure = 100.0;
+        let engine = Arc::new(RiskEngine::new(cfg));
+        service.set_risk_engine(engine.clone());
+
+        // BUY 挂单：requested 100、未成交、限价 0.5 → 预留 50
+        service.order_store.create(
+            "c1".to_string(),
+            "tok-c".to_string(),
+            "BUY".to_string(),
+            100.0,
+        );
+        service.order_store.set_limit_price("c1", 0.5);
+        if let Some(mut st) = service.order_store.get("c1") {
+            st.mark_submitted("ex-c".to_string());
+            st.mark_live();
+            service.order_store.upsert(st);
+        }
+        engine
+            .check_and_reserve("tok-c", Side::Buy, 50.0, 100.0, 0)
+            .unwrap();
+        // 预留占满：再要 60 → 拒
+        assert!(engine
+            .check_and_reserve("tok-c", Side::Buy, 60.0, 60.0, 0)
+            .is_err());
+
+        service.settle_cancel("c1");
+
+        // 预留已释放：发布 100 应可满额通过（未释放则 50+100>100 被拒）
+        assert!(
+            engine
+                .check_and_reserve("tok-c", Side::Buy, 100.0, 100.0, 0)
+                .is_ok(),
+            "取消后预留必须已释放"
+        );
+        assert_eq!(
+            service.order_store.get("c1").map(|s| s.status),
+            Some(OrderStateStatus::Cancelled)
+        );
+    }
+
+    /// G4 / P1-RISK-006：cancel_all 场景对全部活动订单释放预留。
+    #[tokio::test]
+    async fn test_cancel_all_releases_reserves() {
+        use crate::fast::order_state::OrderStateStatus;
+
+        let mut service = ExecutionServiceImpl::new_mock();
+        let mut cfg = RiskConfig::default();
+        cfg.max_position_per_market = 100.0;
+        cfg.max_global_exposure = 1000.0;
+        let engine = Arc::new(RiskEngine::new(cfg));
+        service.set_risk_engine(engine.clone());
+
+        service.order_store.create(
+            "c1".to_string(),
+            "tok-1".to_string(),
+            "BUY".to_string(),
+            100.0,
+        );
+        service.order_store.set_limit_price("c1", 0.5);
+        service.order_store.create(
+            "c2".to_string(),
+            "tok-2".to_string(),
+            "BUY".to_string(),
+            100.0,
+        );
+        service.order_store.set_limit_price("c2", 0.5);
+        engine
+            .check_and_reserve("tok-1", Side::Buy, 50.0, 100.0, 0)
+            .unwrap();
+        engine
+            .check_and_reserve("tok-2", Side::Buy, 50.0, 100.0, 0)
+            .unwrap();
+
+        for st in service.order_store.active_orders() {
+            service.settle_cancel(&st.client_order_id);
+        }
+
+        assert!(service.order_store.active_orders().is_empty());
+        assert_eq!(
+            service.order_store.get("c1").map(|s| s.status),
+            Some(OrderStateStatus::Cancelled)
+        );
+        // 预留已全部释放：两 token 均可再满额
+        assert!(engine
+            .check_and_reserve("tok-1", Side::Buy, 100.0, 100.0, 0)
+            .is_ok());
+        assert!(engine
+            .check_and_reserve("tok-2", Side::Buy, 100.0, 100.0, 0)
+            .is_ok());
     }
 }
