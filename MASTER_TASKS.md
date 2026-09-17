@@ -236,17 +236,21 @@
 
 ### G3 Maker 成交方向归一化（P0-EXEC-005）
 
-- **Status**: TODO（**已授权 2026-09-17**；P0-EXEC-005 = CONFIRMED/P0。外部事实已确认：Polymarket Trade schema 同时含 `side`/`trader_side`/`maker_address`/`maker_orders`/`taker_order_id`，**不得仅凭顶层 `side` 归属本方成交方向**）
+- **Status**: 🔧 FIXED（2026-09-17；P0-EXEC-005 = CONFIRMED/P0。外部事实已确认：Polymarket Trade schema 同时含 `side`/`trader_side`/`maker_address`/`maker_orders`/`taker_order_id`，**不得仅凭顶层 `side` 归属本方成交方向**）
 - **Owner**: Work Buddy
 - **Goal**: `trader_side == "MAKER"` 时把成交 `side` 归一化到本方视角（BUY↔SELL），使 `RiskEngine`/`risk_state`/`FillLedger` 方向正确。
+- **实现说明（09-17）**：归一化落在**事件产生处**而非入账处——实时路径 `market_events::own_side()`（`poll_trades` 构造 `TradeEvent.side` 时按 `trader_side` 取反）；恢复路径 `state_sync::own_recovery_side()`（按 `taker_order_id`/`maker_order_id` 判定本方角色后取反）。`on_market_trade` 仍是唯一入账点，`TradeEvent.side` 语义统一为「本方视角」。
 - **Allowed Files**:
-  - `polymarket-rust/polymarket-rust/src/grpc/service.rs`（`on_market_trade` 内归一化）
-  - `polymarket-rust/polymarket-rust/src/fast/market_events.rs`（如需在事件层归一化）
+  - `polymarket-rust/polymarket-rust/src/fast/market_events.rs`（新增 `own_side` + `poll_trades` 归一化）
+  - `polymarket-rust/polymarket-rust/src/fast/state_sync.rs`（新增 `own_recovery_side` + `build_recovery_plan` 归一化）
+  - （`service.rs` 无需改动——入账点未变）
 - **Forbidden**: `strategy_engine/`、`risk_engine.rs`、交易语义（不改 token 路由决策 DEC-0001/0002）
-- **Required Tests**:
-  - `test_on_market_trade_maker_side_inverted`（MAKER + API side=SELL → 本地记账为 Buy/减仓方向正确）
-  - `test_on_market_trade_taker_side_unchanged`（TAKER 不受影响）
-- **Acceptance**: Maker/Taker 两种角色下仓位方向与 `risk_state` 一致；回归全绿。
+- **Required Tests**（实际落地名）:
+  - `test_own_side_maker_inverts` / `test_own_side_taker_unchanged`（纯函数）
+  - `test_poll_trades_maker_side_inverted`（wiremock：MAKER + side=SELL → 事件 side=BUY，order_id 归属正确）
+  - `test_build_recovery_plan_maker_side_inverted` / `test_build_recovery_plan_taker_side_unchanged`
+- **验证**：全量 Rust `322 + 4 + 18 + 1` 全绿；**鉴别力验证**：关闭两处归一化后 3 个 maker 测试必 FAILED、taker 测试仍绿。
+- **Acceptance**: Maker/Taker 两种角色下仓位方向与 `risk_state` 一致；回归全绿。**待独立审查员判 VERIFIED**。
 
 ### ENV-001 Python 测试门禁修复（流程/测试基础设施）
 

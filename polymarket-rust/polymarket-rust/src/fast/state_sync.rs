@@ -885,6 +885,25 @@ pub fn classify_vanished_order(order_id: &str, trades: &[RemoteTrade]) -> OrderT
     }
 }
 
+/// P0-EXEC-005：恢复成交方向归一化到本方视角。
+///
+/// `RemoteTrade.side` 是顶层（taker）方向。若该成交通过 `taker_order_id` 引用
+/// 我们的订单 → 我们是 taker，方向不变；若通过 `maker_order_id` 引用 → 我们是
+/// maker，方向取反。其他情况保持原值（正常不会发生）。
+fn own_recovery_side(order_id: &str, trade: &RemoteTrade) -> String {
+    if trade.taker_order_id == order_id {
+        trade.side.clone()
+    } else if trade.maker_order_id == order_id {
+        match trade.side.to_ascii_uppercase().as_str() {
+            "BUY" => "SELL".to_string(),
+            "SELL" => "BUY".to_string(),
+            _ => trade.side.clone(),
+        }
+    } else {
+        trade.side.clone()
+    }
+}
+
 /// 由对账输入构建恢复计划。
 ///
 /// - 订单恢复：本地 pending 但远端已消失的订单，若有 trade 引用 → `MarkOrderFilled`
@@ -930,7 +949,8 @@ pub fn build_recovery_plan(
                         plan.actions.push(RecoveryAction::MarkOrderFilled {
                             order_id: order_id.clone(),
                             token_id: t.asset_id.clone(),
-                            side: t.side.clone(),
+                            // P0-EXEC-005：按本方角色归一化方向（maker 取反）
+                            side: own_recovery_side(order_id, t),
                             price: t.price(),
                             size: t.size(),
                             trade_id: t.id.clone(),
@@ -1308,6 +1328,61 @@ mod tests {
             plan.actions
         );
         assert!(plan.unresolved_orders.is_empty());
+    }
+
+    /// P0-EXEC-005：恢复路径中本方为 maker（订单通过 maker_order_id 引用）时方向取反。
+    #[test]
+    fn test_build_recovery_plan_maker_side_inverted() {
+        let local_pos: HashMap<String, f64> = HashMap::new();
+        let remote_positions: Vec<RemotePosition> = Vec::new();
+        let local_pending: std::collections::HashSet<String> = ["o-mine".to_string()].into();
+        let remote_open: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // taker side=SELL，我方是 maker（maker_order_id=o-mine）→ 本方应为 BUY
+        let trades = vec![remote_trade("t1", "o-taker", "o-mine", "tok-1", "SELL")];
+
+        let plan = build_recovery_plan(
+            &local_pos,
+            &remote_positions,
+            &local_pending,
+            &remote_open,
+            Some(&trades),
+            1.0,
+        );
+
+        assert_eq!(plan.actions.len(), 1);
+        match &plan.actions[0] {
+            RecoveryAction::MarkOrderFilled { side, .. } => {
+                assert_eq!(side, "BUY", "maker 成交方向应取反")
+            }
+            other => panic!("期望 MarkOrderFilled，得到 {:?}", other),
+        }
+    }
+
+    /// P0-EXEC-005：恢复路径中本方为 taker（订单通过 taker_order_id 引用）时方向不变。
+    #[test]
+    fn test_build_recovery_plan_taker_side_unchanged() {
+        let local_pos: HashMap<String, f64> = HashMap::new();
+        let remote_positions: Vec<RemotePosition> = Vec::new();
+        let local_pending: std::collections::HashSet<String> = ["o-mine".to_string()].into();
+        let remote_open: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let trades = vec![remote_trade("t1", "o-mine", "o-taker", "tok-1", "SELL")];
+
+        let plan = build_recovery_plan(
+            &local_pos,
+            &remote_positions,
+            &local_pending,
+            &remote_open,
+            Some(&trades),
+            1.0,
+        );
+
+        assert_eq!(plan.actions.len(), 1);
+        match &plan.actions[0] {
+            RecoveryAction::MarkOrderFilled { side, .. } => {
+                assert_eq!(side, "SELL", "taker 成交方向应保持不变")
+            }
+            other => panic!("期望 MarkOrderFilled，得到 {:?}", other),
+        }
     }
 
     /// P1-030：find_trades_for_order 返回引用该订单的全部 trades（多笔 partial fill）。

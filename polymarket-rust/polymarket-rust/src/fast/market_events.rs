@@ -346,7 +346,8 @@ impl MarketEventPoller {
                 token_id: token_id.to_string(),
                 trade_id: t.id.clone(),
                 order_id,
-                side: t.side.clone(),
+                // P0-EXEC-005：顶层 side 是 taker 方向，需按 trader_side 归一到本方视角
+                side: own_side(&t.trader_side, &t.side),
                 price,
                 size,
                 timestamp,
@@ -598,6 +599,23 @@ fn attribute_order(
     order_id.filter(|oid| !oid.is_empty())
 }
 
+/// P0-EXEC-005：把成交方向归一化到**本方视角**。
+///
+/// Polymarket 顶层 `side` 是 taker 方向；当 `trader_side == "MAKER"` 时，
+/// 本方（maker）方向与其相反（taker 买 = maker 卖）。TAKER 成交保持原方向。
+/// 非 BUY/SELL 的未知值原样返回，交由下游校验。
+fn own_side(trader_side: &str, taker_side: &str) -> String {
+    if trader_side.eq_ignore_ascii_case("MAKER") {
+        match taker_side.to_ascii_uppercase().as_str() {
+            "BUY" => "SELL".to_string(),
+            "SELL" => "BUY".to_string(),
+            _ => taker_side.to_string(),
+        }
+    } else {
+        taker_side.to_string()
+    }
+}
+
 /// 解析成交价/数量：字符串或数字 → f64。
 ///
 /// 失败（非字符串/数字、非法字符串、非有限数）返回 `Err`，**绝不静默转 0.0**
@@ -738,6 +756,60 @@ mod tests {
         assert_eq!(events.len(), 1, "仅合法 trade_id 的成交应被保留");
         assert_eq!(events[0].trade_id, "t-valid");
         assert_eq!(events[0].order_id, "o-valid");
+    }
+
+    /// P0-EXEC-005：顶层 `side` 是 taker 方向；MAKER 成交须取反到本方视角。
+    #[test]
+    fn test_own_side_maker_inverts() {
+        assert_eq!(own_side("MAKER", "BUY"), "SELL");
+        assert_eq!(own_side("MAKER", "SELL"), "BUY");
+        assert_eq!(own_side("maker", "buy"), "SELL");
+    }
+
+    /// P0-EXEC-005：TAKER 成交方向不变；未知 trader_side 不取反。
+    #[test]
+    fn test_own_side_taker_unchanged() {
+        assert_eq!(own_side("TAKER", "BUY"), "BUY");
+        assert_eq!(own_side("TAKER", "SELL"), "SELL");
+        assert_eq!(own_side("", "BUY"), "BUY");
+    }
+
+    /// P0-EXEC-005：MAKER 成交的 TradeEvent.side 必须是本方方向。
+    #[tokio::test]
+    async fn test_poll_trades_maker_side_inverted() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = serde_json::json!([
+            {
+                "id": "t-mk",
+                "side": "SELL",
+                "price": "0.5",
+                "size": "10",
+                "createdAt": "1700000000",
+                "takerOrderId": "o-taker",
+                "traderSide": "MAKER",
+                "makerOrders": [
+                    {"orderId": "o-mine", "makerAddress": "0xMe"},
+                    {"orderId": "o-other", "makerAddress": "0xOther"}
+                ]
+            }
+        ]);
+
+        Mock::given(method("GET"))
+            .and(path("/data/trades"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        let poller = MarketEventPoller::new(&server.uri()).with_owner_address("0xMe".to_string());
+        let events = poller.poll_trades("tok-1").await.unwrap();
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].order_id, "o-mine");
+        assert_eq!(events[0].trader_side, "MAKER");
+        assert_eq!(events[0].side, "BUY", "maker 成交方向应取反（taker SELL → 本方 BUY）");
     }
 
     #[test]
