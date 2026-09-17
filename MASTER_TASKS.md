@@ -249,6 +249,27 @@
   - `test_on_market_trade_taker_side_unchanged`（TAKER 不受影响）
 - **Acceptance**: Maker/Taker 两种角色下仓位方向与 `risk_state` 一致；回归全绿。
 
+### ENV-001 Python 测试门禁修复（流程/测试基础设施）
+
+- **Status**: TODO（候选；待 CONSENSUS 确认）
+- **Owner**: Work Buddy
+- **Goal**: 让 `AGENTS.md` 承诺的 Python 验证门禁**真实可用且可复现**：修复 pytest 依赖缺失、async 用例挂起、脚本式测试误收集、fixture 缺失四项，并让文档与命令一致。不改任何业务代码逻辑。
+- **背景证据**: 见 `audits/round_04/audit_opencode_round_04.md` §六 ENV-001——venv 未装 pytest 且 `requirements.txt` 未声明；装上后 `test_grpc.py` 在 pytest 下挂起（自带 `main()` 脚本跑法全绿）；`test_mock.py::test_formatter` 缺 `noaa_fc/caiyun_fc` fixture。
+- **Allowed Files**:
+  - `pytest.ini`（新建）
+  - `conftest.py`（新建）
+  - `requirements-dev.txt`（新建）
+  - `test_grpc.py`、`test_mock.py`（仅加 pytest 适配标记 / fixture，不改断言与业务）
+  - `AGENTS.md`（仅修正「Python 验证门禁」命令描述）
+  - `.gitignore`（如新增缓存/产物需忽略）
+- **Forbidden**: `strategy_engine/`、`weather_data_ingestion/`、`market_discovery/`、`polymarket-rust/`（业务逻辑一律不改）
+- **Required Tests**:
+  - `python -m pytest -q` 在干净 venv（按 `requirements-dev.txt` 安装后）→ **0 failed / 0 error**
+  - `test_grpc.py` 的 9 个 async 用例纳入 pytest 后不挂起（设 `asyncio_mode=auto` 或显式 `@pytest.mark.asyncio`）
+  - `test_mock.py::test_formatter` 通过 `conftest.py` fixture 或显式标注脚本式跳过，二选一
+- **Acceptance**: 新环境执行 `pip install -r requirements-dev.txt && python -m pytest -q` 可复现全绿；`AGENTS.md` 中的门禁命令与实际一致；脚本式与 pytest 式测试不互相污染。
+- **备注**: 属健壮性/可复现性任务，非资金风险；建议在 G1~G3 之前或并行完成，以恢复后续 Python 验证的可信度。
+
 ---
 
 ### 后续候选（P1/P2，待 G1~G3 后再排期）
