@@ -119,7 +119,7 @@
 | P0-RISK-001 | 日亏熔断从未触发（`post_check` 生产零调用） | CONFIRMED / P0 | G1 |
 | P0-RISK-002 | 结算窗口（2h 禁开 Buy）未接线，且未知即放行 | CONFIRMED / P0 | G1 |
 | P0-RISK-003 | Gas 费保护被硬编码 `0` 绕过 | CONFIRMED / P0 | G1 |
-| P0-EXEC-004 | 实时成交链不生效（`/data/trades` 无 L2 认证 + token 列表恒空 + 错误吞没） | CONFIRMED / P0 | G2 |
+| P0-EXEC-004 | 实时成交链不生效（`/data/trades` 无 L2 认证 + token 列表恒空 + 错误吞没） | CONFIRMED / P0 → 🔧 FIXED（09-17，G2；待独立判 VERIFIED） | G2 |
 | P0-EXEC-005 | Maker 成交未按 `trader_side`/`maker_orders` 归属本方方向 | CONFIRMED / P0 → 🔧 FIXED（09-17，G3；待独立判 VERIFIED） | G3 |
 
 > 独立审查方另确认：P1-035 维持 `FIXED / Verification Pending`，不得由实施者自证 VERIFIED。

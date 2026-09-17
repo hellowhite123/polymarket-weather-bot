@@ -19,8 +19,10 @@
 //!                                      └──→ EventsSnapshot
 //! ```
 
+use crate::clob::auth::{create_l2_headers, L2HeaderArgs};
 use crate::fast::fill_records::FillLedger;
-use crate::types::clob_types::OrderBookSummary;
+use crate::types::clob_types::{ApiKeyCreds, OrderBookSummary};
+use ethers::signers::LocalWallet;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -197,6 +199,12 @@ pub struct OpenOrderSnapshot {
 // MarketEventPoller
 // ============================================================================
 
+/// L2 认证上下文：对需认证的 `/data/*` 端点签名（P0-EXEC-004）。
+struct L2Auth {
+    wallet: LocalWallet,
+    creds: ApiKeyCreds,
+}
+
 /// 市场事件轮询器
 ///
 /// 在每个 tick 中通过 HTTP 拉取最新数据，与上次快照对比，
@@ -220,6 +228,8 @@ pub struct MarketEventPoller {
     fill_ledger: Option<Arc<FillLedger>>,
     /// 自己的钱包地址（P0-013：归属 MAKER 成交时在 maker_orders 里匹配）。
     owner_address: Option<String>,
+    /// P0-EXEC-004：L2 认证上下文（未配置时 `/data/*` 会 401）。
+    l2_auth: Option<L2Auth>,
 }
 
 impl MarketEventPoller {
@@ -244,6 +254,7 @@ impl MarketEventPoller {
             settled_markets: RwLock::new(HashSet::new()),
             fill_ledger: None,
             owner_address: None,
+            l2_auth: None,
         }
     }
 
@@ -259,6 +270,13 @@ impl MarketEventPoller {
         self
     }
 
+    /// P0-EXEC-004：挂载 L2 认证上下文。`/data/trades`、`/data/orders` 需 L2 HMAC 头，
+    /// 未挂载时这些请求将返回 401（由 `tick` 上报为错误）。
+    pub fn with_l2_auth(mut self, wallet: LocalWallet, creds: ApiKeyCreds) -> Self {
+        self.l2_auth = Some(L2Auth { wallet, creds });
+        self
+    }
+
     /// 获取事件订阅者 (broadcast receiver)
     pub fn subscribe(&self) -> broadcast::Receiver<MarketEvent> {
         self.tx.subscribe()
@@ -266,13 +284,34 @@ impl MarketEventPoller {
 
     /// 轮询单次 trades（对指定 token_id）
     pub async fn poll_trades(&self, token_id: &str) -> Result<Vec<TradeEvent>, String> {
-        let url = format!("{}/data/trades?token_id={}", self.host, token_id);
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
+        // P0-EXEC-004：/data/trades 需 L2 认证；path 含 query，须一并签名。
+        let request_path = format!("/data/trades?token_id={}", token_id);
+        let url = format!("{}{}", self.host, request_path);
+
+        let mut req = self.client.get(&url);
+        if let Some(auth) = &self.l2_auth {
+            let args = L2HeaderArgs {
+                method: "GET".to_string(),
+                request_path,
+                body: None,
+            };
+            let headers = create_l2_headers(&auth.wallet, &auth.creds, &args, now_secs())
+                .map_err(|e| format!("L2 签名失败: {e}"))?;
+            for (k, v) in headers {
+                req = req.header(k, v);
+            }
+        }
+
+        let resp = req.send().await.map_err(|e| e.to_string())?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!(
+                "trades API request failed: status={}, body={}",
+                status, body
+            ));
+        }
 
         let trades: Vec<TradeApiResponse> = resp.json().await.map_err(|e| e.to_string())?;
 
@@ -417,13 +456,35 @@ impl MarketEventPoller {
 
     /// 轮询 open orders
     pub async fn poll_open_orders(&self) -> Result<Vec<OpenOrderSnapshot>, String> {
-        let url = format!("{}/data/orders", self.host);
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
+        // P0-EXEC-004：/data/orders 需 L2 认证。
+        let request_path = "/data/orders".to_string();
+        let url = format!("{}{}", self.host, request_path);
+
+        let mut req = self.client.get(&url);
+        if let Some(auth) = &self.l2_auth {
+            let args = L2HeaderArgs {
+                method: "GET".to_string(),
+                request_path,
+                body: None,
+            };
+            let headers = create_l2_headers(&auth.wallet, &auth.creds, &args, now_secs())
+                .map_err(|e| format!("L2 签名失败: {e}"))?;
+            for (k, v) in headers {
+                req = req.header(k, v);
+            }
+        }
+
+        let resp = req.send().await.map_err(|e| e.to_string())?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(format!(
+                "orders API request failed: status={}, body={}",
+                status, body
+            ));
+        }
+
         let orders: Vec<OpenOrderSnapshot> = resp.json().await.map_err(|e| e.to_string())?;
         Ok(orders)
     }
@@ -431,60 +492,108 @@ impl MarketEventPoller {
     /// 执行一轮完整的市场事件轮询（trades + book + orders）
     ///
     /// `token_ids`: 需要监控的市场列表
-    pub async fn tick(&self, token_ids: &[String]) {
+    ///
+    /// P0-EXEC-004：不再静默吞错——每类失败计入 `TickOutcome.poll_errors` 并
+    /// `tracing::error!`，调用方据此 FAIL-CLOSED 降级 `TradingGate`。
+    pub async fn tick(&self, token_ids: &[String]) -> TickOutcome {
         self.poll_count.fetch_add(1, Ordering::Relaxed);
+
+        let mut outcome = TickOutcome {
+            tokens: token_ids.len(),
+            ..Default::default()
+        };
+
+        if token_ids.is_empty() {
+            tracing::warn!(
+                "market_events: tick 未配置任何监控 token（token_ids 为空），本轮不会产生事件"
+            );
+        }
 
         for tid in token_ids {
             // Trades
-            if let Ok(trades) = self.poll_trades(tid).await {
-                for t in trades {
-                    let _ = self.tx.send(MarketEvent::Trade(t));
-                    self.event_count.fetch_add(1, Ordering::Relaxed);
+            match self.poll_trades(tid).await {
+                Ok(trades) => {
+                    for t in trades {
+                        if self.tx.send(MarketEvent::Trade(t)).is_err() {
+                            tracing::warn!(
+                                "market_events: Trade 事件无订阅者，已丢弃（需 StateSync 兜底） token_id={}",
+                                tid
+                            );
+                        }
+                        self.event_count.fetch_add(1, Ordering::Relaxed);
+                        outcome.events += 1;
+                    }
+                }
+                Err(e) => {
+                    outcome.poll_errors += 1;
+                    tracing::error!("market_events: poll_trades 失败 token_id={}: {}", tid, e);
                 }
             }
 
             // Order book
-            if let Ok(book) = self.poll_order_book(tid).await {
-                let _ = self.tx.send(MarketEvent::OrderBookUpdate(book));
-                self.event_count.fetch_add(1, Ordering::Relaxed);
+            match self.poll_order_book(tid).await {
+                Ok(book) => {
+                    let _ = self.tx.send(MarketEvent::OrderBookUpdate(book));
+                    self.event_count.fetch_add(1, Ordering::Relaxed);
+                    outcome.events += 1;
+                }
+                Err(e) => {
+                    outcome.poll_errors += 1;
+                    tracing::warn!(
+                        "market_events: poll_order_book 失败 token_id={}: {}",
+                        tid,
+                        e
+                    );
+                }
             }
         }
 
         // Open orders
-        if let Ok(orders) = self.poll_open_orders().await {
-            let prev = self.last_order_snapshot.read().unwrap().clone();
-            let current: HashMap<String, Vec<OpenOrderSnapshot>> =
-                orders.into_iter().fold(HashMap::new(), |mut acc, o| {
-                    acc.entry(o.asset_id.clone()).or_default().push(o);
-                    acc
-                });
-
-            // 比对变更
-            for (tid, orders) in &current {
-                let prev_orders = prev.get(tid);
-                for o in orders {
-                    let changed = prev_orders.map_or(true, |po| {
-                        !po.iter().any(|p| {
-                            p.id == o.id && p.status == o.status && p.size_matched == o.size_matched
-                        })
+        match self.poll_open_orders().await {
+            Ok(orders) => {
+                let prev = self.last_order_snapshot.read().unwrap().clone();
+                let current: HashMap<String, Vec<OpenOrderSnapshot>> =
+                    orders.into_iter().fold(HashMap::new(), |mut acc, o| {
+                        acc.entry(o.asset_id.clone()).or_default().push(o);
+                        acc
                     });
-                    if changed {
-                        let event = OrderStateEvent {
-                            order_id: o.id.clone(),
-                            token_id: tid.clone(),
-                            status: o.status.clone(),
-                            filled_size: o.size_matched.parse().unwrap_or(0.0),
-                            remaining_size: o.size.parse().unwrap_or(0.0),
-                            avg_price: o.price.parse().ok(),
-                        };
-                        let _ = self.tx.send(MarketEvent::OrderStateChange(event));
-                        self.event_count.fetch_add(1, Ordering::Relaxed);
+
+                // 比对变更
+                for (tid, orders) in &current {
+                    let prev_orders = prev.get(tid);
+                    for o in orders {
+                        let changed = prev_orders.map_or(true, |po| {
+                            !po.iter().any(|p| {
+                                p.id == o.id
+                                    && p.status == o.status
+                                    && p.size_matched == o.size_matched
+                            })
+                        });
+                        if changed {
+                            let event = OrderStateEvent {
+                                order_id: o.id.clone(),
+                                token_id: tid.clone(),
+                                status: o.status.clone(),
+                                filled_size: o.size_matched.parse().unwrap_or(0.0),
+                                remaining_size: o.size.parse().unwrap_or(0.0),
+                                avg_price: o.price.parse().ok(),
+                            };
+                            let _ = self.tx.send(MarketEvent::OrderStateChange(event));
+                            self.event_count.fetch_add(1, Ordering::Relaxed);
+                            outcome.events += 1;
+                        }
                     }
                 }
-            }
 
-            *self.last_order_snapshot.write().unwrap() = current;
+                *self.last_order_snapshot.write().unwrap() = current;
+            }
+            Err(e) => {
+                outcome.poll_errors += 1;
+                tracing::error!("market_events: poll_open_orders 失败: {}", e);
+            }
         }
+
+        outcome
     }
 
     /// 标记市场已结算
@@ -533,6 +642,52 @@ impl MarketEventPoller {
     /// CLOB Host
     pub fn host(&self) -> &str {
         &self.host
+    }
+
+    /// P0-EXEC-004：从 MarketDiscovery 注册表 JSON 读取需监控的 token 列表（YES+NO）。
+    ///
+    /// 注册表格式：`{ "<condition_id>": { "yes_token_id":..., "no_token_id":..., ... }, ... }`
+    /// （见 Python `market_discovery/registry.py`，默认 `./data/market_registry.json`）。
+    /// 文件不存在/解析失败时返回 `Err`，由调用方决定处置（server 侧选择告警 + 空列表）。
+    pub fn load_token_ids_from_registry(path: &str) -> Result<Vec<String>, String> {
+        let text =
+            std::fs::read_to_string(path).map_err(|e| format!("读取注册表 {path} 失败: {e}"))?;
+        let value: serde_json::Value =
+            serde_json::from_str(&text).map_err(|e| format!("解析注册表 {path} 失败: {e}"))?;
+        let obj = value
+            .as_object()
+            .ok_or_else(|| format!("注册表 {path} 顶层不是对象"))?;
+        let mut ids = Vec::new();
+        for rec in obj.values() {
+            for key in ["yes_token_id", "no_token_id"] {
+                if let Some(s) = rec.get(key).and_then(|v| v.as_str()) {
+                    if !s.trim().is_empty() {
+                        ids.push(s.to_string());
+                    }
+                }
+            }
+        }
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
+    }
+}
+
+/// 单轮 `tick` 结果（P0-EXEC-004：供调用方判断是否 FAIL-CLOSED 降级）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TickOutcome {
+    /// 本轮配置监控的 token 数
+    pub tokens: usize,
+    /// 轮询失败次数（trades/book/orders 任一失败各计一次）
+    pub poll_errors: usize,
+    /// 本轮产生的事件数
+    pub events: usize,
+}
+
+impl TickOutcome {
+    /// 出现任何轮询失败即应降级（FAIL-CLOSED）。
+    pub fn should_degrade(&self) -> bool {
+        self.poll_errors > 0
     }
 }
 
@@ -810,6 +965,155 @@ mod tests {
         assert_eq!(events[0].order_id, "o-mine");
         assert_eq!(events[0].trader_side, "MAKER");
         assert_eq!(events[0].side, "BUY", "maker 成交方向应取反（taker SELL → 本方 BUY）");
+    }
+
+    /// P0-EXEC-004：构造测试用 L2 认证上下文（不联网）。
+    fn test_l2_auth() -> (LocalWallet, ApiKeyCreds) {
+        let wallet: LocalWallet =
+            "bd8024c85d743569c738586185ca743b40af25c0144f8bf1cc7c719bd987a56b"
+                .parse()
+                .unwrap();
+        let creds = ApiKeyCreds {
+            key: "k".into(),
+            secret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+            passphrase: "p".into(),
+        };
+        (wallet, creds)
+    }
+
+    /// P0-EXEC-004：`/data/trades` 请求必须携带完整 L2 HMAC 头（否则线上 401）。
+    #[tokio::test]
+    async fn test_poll_trades_attaches_l2_headers() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/data/trades"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+
+        let (wallet, creds) = test_l2_auth();
+        let poller = MarketEventPoller::new(&server.uri()).with_l2_auth(wallet, creds);
+        let events = poller.poll_trades("tok-1").await.unwrap();
+        assert!(events.is_empty());
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        for name in [
+            "poly_address",
+            "poly_signature",
+            "poly_timestamp",
+            "poly_api_key",
+            "poly_passphrase",
+        ] {
+            assert!(
+                requests[0].headers.contains_key(name),
+                "缺少 L2 认证头 {}",
+                name
+            );
+        }
+    }
+
+    /// P0-EXEC-004：轮询失败必须上报（不再静默），并触发降级判定。
+    #[tokio::test]
+    async fn test_tick_reports_errors_and_degrades_on_poll_failure() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/data/trades"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        // book / orders 正常，隔离出「仅 trades 失败」场景
+        Mock::given(method("GET"))
+            .and(path("/book"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "market": "m",
+                "asset_id": "tok-1",
+                "timestamp": "0",
+                "bids": [],
+                "asks": [],
+                "min_order_size": "1",
+                "tick_size": "0.01",
+                "neg_risk": false
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/data/orders"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+
+        let poller = MarketEventPoller::new(&server.uri());
+        let outcome = poller.tick(&["tok-1".to_string()]).await;
+
+        assert_eq!(outcome.tokens, 1);
+        assert_eq!(
+            outcome.poll_errors, 1,
+            "仅 trades 失败应恰好上报 1 次错误，不能静默或重复计数"
+        );
+        assert!(outcome.should_degrade(), "轮询失败应触发 FAIL-CLOSED 降级");
+    }
+
+    /// P0-EXEC-004：tick 必须按传入的 token 列表轮询（而非恒空列表）。
+    #[tokio::test]
+    async fn test_tick_uses_configured_token_ids() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/data/trades"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([])))
+            .mount(&server)
+            .await;
+
+        let poller = MarketEventPoller::new(&server.uri());
+        let tokens = vec!["tok-a".to_string(), "tok-b".to_string()];
+        let outcome = poller.tick(&tokens).await;
+        assert_eq!(outcome.tokens, 2);
+
+        let reqs = server.received_requests().await.unwrap();
+        let trade_queries: Vec<String> = reqs
+            .iter()
+            .filter(|r| r.url.path() == "/data/trades")
+            .map(|r| r.url.query().unwrap_or_default().to_string())
+            .collect();
+        assert!(
+            trade_queries.iter().any(|q| q.contains("token_id=tok-a")),
+            "未轮询 tok-a: {:?}",
+            trade_queries
+        );
+        assert!(
+            trade_queries.iter().any(|q| q.contains("token_id=tok-b")),
+            "未轮询 tok-b: {:?}",
+            trade_queries
+        );
+    }
+
+    /// P0-EXEC-004：从 MarketDiscovery 注册表 JSON 提取 YES/NO token 列表。
+    #[test]
+    fn test_load_token_ids_from_registry() {
+        let path = std::env::temp_dir().join("wb_registry_test.json");
+        let body = serde_json::json!({
+            "c1": {"yes_token_id": "y1", "no_token_id": "n1"},
+            "c2": {"yes_token_id": "y2", "no_token_id": "n2"}
+        });
+        std::fs::write(&path, body.to_string()).unwrap();
+
+        let ids = MarketEventPoller::load_token_ids_from_registry(path.to_str().unwrap()).unwrap();
+        assert_eq!(ids, vec!["n1", "n2", "y1", "y2"]);
+
+        // 缺失文件 → Err（调用方 fail-closed 处置）
+        let missing = std::env::temp_dir().join("wb_registry_missing_xyz.json");
+        assert!(MarketEventPoller::load_token_ids_from_registry(missing.to_str().unwrap()).is_err());
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

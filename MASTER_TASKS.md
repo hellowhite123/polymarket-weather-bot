@@ -221,18 +221,24 @@
 
 ### G2 实时成交链可用性（P0-EXEC-004）
 
-- **Status**: TODO（**已授权 2026-09-17**；CONSENSUS_ROUND_04 确认 P0-EXEC-004 = CONFIRMED/P0）
+- **Status**: 🔧 FIXED（2026-09-17；CONSENSUS_ROUND_04 确认 P0-EXEC-004 = CONFIRMED/P0）
 - **Owner**: Work Buddy
 - **Goal**: 启用 `MARKET_EVENTS_ENABLED=1` 后，`poll_trades → Trade → on_market_trade` 真正闭环——补 L2 认证头、从注册表填充监控 token、`tick` 不再吞错。
+- **实现说明（09-17）**：
+  - **L2 认证**：`MarketEventPoller` 新增 `.with_l2_auth(wallet, creds)`；`poll_trades`（`/data/trades`）与 `poll_open_orders`（`/data/orders`）按 `{ts}{METHOD}{path}` 签名并注入 `POLY_*` 头，非 2xx 显式返回 `Err`。
+  - **监控 token 来源**：`MarketEventPoller::load_token_ids_from_registry(path)` 读取 MarketDiscovery 注册表 JSON 的 `yes_token_id`/`no_token_id`；server 侧支持 `MARKET_EVENTS_TOKEN_IDS`（CSV）覆盖、`MARKET_EVENTS_REGISTRY` 指定路径。
+  - **不再吞错 + fail-closed**：`tick` 返回 `TickOutcome { tokens, poll_errors, events }`，trades/book/orders 任一失败计数并 `tracing::error!/warn!`；server 轮询循环在 `outcome.should_degrade()` 时调用 `trading_gate.reconcile_complete(false,false)` 降级。
 - **Allowed Files**:
   - `polymarket-rust/polymarket-rust/src/fast/market_events.rs`
   - `polymarket-rust/polymarket-rust/src/bin/server.rs`
 - **Forbidden**: `strategy_engine/`、`risk_engine.rs`、交易语义
-- **Required Tests**:
-  - `test_poll_trades_attaches_l2_headers`（wiremock 断言 POLY_* 头齐备）
-  - `test_tick_logs_and_degrades_on_poll_failure`（非 2xx/网络错误 → 告警 + 触发对账降级，不静默）
-  - `test_tick_uses_configured_token_ids`（非空 token 列表被轮询）
-- **Acceptance**: 用 wiremock 复现 401→修复后 200；错误可见且 fail-closed（触发 `reconcile_complete(false,false)`），不再静默永久停摆。
+- **Required Tests**（实际落地名）:
+  - `test_poll_trades_attaches_l2_headers`（wiremock 断言 POLY_ADDRESS/SIGNATURE/TIMESTAMP/API_KEY/PASSPHRASE 齐备）
+  - `test_tick_reports_errors_and_degrades_on_poll_failure`（仅 trades 500 → `poll_errors==1` + `should_degrade()`）
+  - `test_tick_uses_configured_token_ids`（tick 按传入 token 列表请求 `/data/trades`）
+  - `test_load_token_ids_from_registry`（注册表解析 + 缺失文件 Err）
+- **验证**：全量 Rust `326 + 4 + 18 + 1` 全绿；**鉴别力验证**：分别关闭 L2 头挂载 / 错误计数 / token 遍历后，对应 3 测试必 FAILED，还原后转绿。
+- **Acceptance**: 认证头齐备、错误可见且 fail-closed、token 列表来自配置/注册表。**待独立审查员判 VERIFIED**。
 
 ### G3 Maker 成交方向归一化（P0-EXEC-005）
 

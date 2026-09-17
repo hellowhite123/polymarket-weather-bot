@@ -147,8 +147,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &clob_host,
         "https://data-api.polymarket.com",
         &address,
-        wallet,
-        api_creds,
+        wallet.clone(),
+        api_creds.clone(),
     );
     // ★ 获取启动时本地仓位与远端活动订单快照
     let local_positions = service.snapshot_positions().await;
@@ -304,8 +304,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         env::var("MARKET_EVENTS_ENABLED").as_deref(),
         Ok("1") | Ok("true")
     ) {
+        // P0-EXEC-004：监控 token 列表来源（env 覆盖优先，其次 MarketDiscovery 注册表）
+        let token_ids: Vec<String> = match env::var("MARKET_EVENTS_TOKEN_IDS") {
+            Ok(csv) => csv
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            Err(_) => {
+                let registry_path = env::var("MARKET_EVENTS_REGISTRY")
+                    .unwrap_or_else(|_| "./data/market_registry.json".to_string());
+                match MarketEventPoller::load_token_ids_from_registry(&registry_path) {
+                    Ok(ids) => ids,
+                    Err(e) => {
+                        tracing::error!(
+                            "MarketEventPoller: 读取监控 token 注册表失败（本轮无监控标的）: {e}"
+                        );
+                        Vec::new()
+                    }
+                }
+            }
+        };
+        tracing::info!("MarketEventPoller 监控 token 数: {}", token_ids.len());
+
+        // P0-EXEC-004：挂载 L2 认证（/data/trades、/data/orders 需 HMAC 头）
         let poller = Arc::new(
             MarketEventPoller::new(&clob_host)
+                .with_l2_auth(wallet.clone(), api_creds.clone())
                 .with_owner_address(address.clone())
                 .with_fill_ledger(service.fill_ledger().clone()),
         );
@@ -317,16 +342,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tokio::spawn(consume_trade_events(svc, rx));
         }
 
-        // 轮询循环：每 2s tick 一次（token_ids 后续接 MarketDiscovery 注册表）
+        // 轮询循环：每 2s tick 一次；轮询失败 FAIL-CLOSED 降级 TradingGate
         {
             let p = poller.clone();
+            let tg = trading_gate.clone();
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
                 loop {
                     tick.tick().await;
-                    // TODO: 从 MarketDiscovery 注册表取监控 token 列表
-                    let token_ids: Vec<String> = Vec::new();
-                    p.tick(&token_ids).await;
+                    let outcome = p.tick(&token_ids).await;
+                    if outcome.should_degrade() {
+                        tracing::error!(
+                            "MarketEventPoller 轮询失败 {} 次（{} tokens），FAIL-CLOSED 降级 TradingGate",
+                            outcome.poll_errors,
+                            outcome.tokens
+                        );
+                        tg.reconcile_complete(false, false);
+                    }
                 }
             });
         }
