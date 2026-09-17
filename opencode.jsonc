@@ -1,0 +1,44 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "autoupdate": false,
+
+  // ── 模型（暂未定，下面为占位示例）──
+  // 保留一行并替换为你实际可用的 provider/model；也可不写 model，
+  // 启动后用 `opencode auth login` 或 `/connect` 交互选择。
+  // 需要对应环境变量：ANTHROPIC_API_KEY / OPENAI_API_KEY / GEMINI_API_KEY
+  // "model": "openai/gpt-5",
+  // "model": "google/gemini-2.5-pro",
+  "model": "anthropic/claude-sonnet-4-5",
+
+  // ── 权限：匹配项目「人工总闸」约束 ──
+  // 资金逻辑 / 不可逆操作前必须人工确认（ask）。
+  "permission": {
+    "edit": "ask",
+    "bash": "ask",
+    "webfetch": "ask"
+  },
+
+  // ── LSP：Rust + Python 智能提示 ──
+  "lsp": {
+    "rust": { "enabled": true },
+    "python": { "enabled": true }
+  },
+
+  // ── MCP：从 WorkBuddy 的 mcp.json 迁移 ──
+  // 把下面的注释块替换为实际 server；密钥一律用 {env:VAR}，不要硬编码。
+  // 命令示例：
+  //   opencode mcp add <name> -- <command> <args...>
+  // 或直接在此书写（结构与 WorkBuddy mcp.json 的 servers 字段一致）。
+  "mcp": {
+    // "github": {
+    //   "type": "local",
+    //   "command": ["npx", "-y", "@modelcontextprotocol/server-github"],
+    //   "environment": { "GITHUB_PERSONAL_ACCESS_TOKEN": "{env:GITHUB_TOKEN}" },
+    //   "enabled": false
+    // }
+  },
+
+  // ── 自定义目录 ──
+  // OpenCode 会自动搜索项目根 .opencode/ 目录（skills / agents / commands），
+  // 无需在此显式配置。
+}
