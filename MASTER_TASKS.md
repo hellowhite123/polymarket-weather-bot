@@ -190,3 +190,71 @@
 | 后台对账循环（旧 P0-14 → P1-007） | 已实现每 30s full_reconcile + 差异告警；无资金直接暴露，属健壮性增强 |
 
 > ⚠️ 以上 3 项涉及资金/仓位安全的降级，是否同意归档，请伯森先生明示。
+
+---
+
+## 候选任务（Round 04 审查产出）
+
+> 来源：`audits/round_04/audit_opencode_round_04.md`（OpenCode，commit `21fdcf8`）。
+> **状态说明**：以下为候选条目，**尚未授权实施**。按 `docs/CODE_REVIEW_STANDARD.md` §5，
+> 须由独立审查员（Human / 另一 AI）在 `audits/round_04/CONSENSUS_ROUND_04.md` 逐条判定
+> `CONFIRMED` 后，才将 `Status` 置为 `TODO` 并开工。一次只做一个 Task Group。
+> 红线不变：不得改交易语义 / Risk Model 阈值 / Strategy / 资金控制逻辑；本批**仅做接线与 fail-closed**。
+
+### G1 风控三闸接线（P0-RISK-001/002/003）
+
+- **Status**: TODO（候选；待 CONSENSUS 确认）
+- **Owner**: Work Buddy
+- **Goal**: 让已实现但未接入生产路径的三项风控真正生效——① 日亏熔断（`post_check`→`report_pnl`）；② 结算前 2h 禁开 Buy；③ Gas 费保护。仅接线，**不改任何阈值/语义**。
+- **Allowed Files**:
+  - `polymarket-rust/polymarket-rust/src/grpc/service.rs`
+  - `polymarket-rust/polymarket-rust/src/bin/server.rs`
+  - `polymarket-rust/polymarket-rust/src/fast/executor.rs`（仅取 gas price 调用，若需要）
+- **Forbidden**:
+  - `strategy_engine/`
+  - `polymarket-rust/polymarket-rust/src/fast/risk_engine.rs`（**阈值与判定逻辑不改**；如确需新增 getter 须先申请）
+- **Required Tests**:
+  - `test_daily_loss_halts_after_threshold_integration`（结算/盈亏回填后达阈值 → `check_gates` 拒单）
+  - `test_settlement_window_blocks_buy_when_registered`（注册结算时间后，2h 内 Buy 被拒、Sell 放行）
+  - `test_unknown_settlement_fail_closed`（未注册结算时间 → 按约定拒绝并告警）
+  - `test_gas_protection_rejects_high_gwei`（gas 超上限 → 拒单；gas 未知 → fail-closed）
+- **Acceptance**: 三项在真实 `place_order` 调用链上可触发并拒绝；`get_risk_state` 的熔断标志与 `RiskEngine` 权威状态一致（002 的 fail-closed 策略需伯森先生先确认「未注册结算时间」的处置口径）。
+
+### G2 实时成交链可用性（P0-EXEC-004）
+
+- **Status**: TODO（候选；待 CONSENSUS 确认）
+- **Owner**: Work Buddy
+- **Goal**: 启用 `MARKET_EVENTS_ENABLED=1` 后，`poll_trades → Trade → on_market_trade` 真正闭环——补 L2 认证头、从注册表填充监控 token、`tick` 不再吞错。
+- **Allowed Files**:
+  - `polymarket-rust/polymarket-rust/src/fast/market_events.rs`
+  - `polymarket-rust/polymarket-rust/src/bin/server.rs`
+- **Forbidden**: `strategy_engine/`、`risk_engine.rs`、交易语义
+- **Required Tests**:
+  - `test_poll_trades_attaches_l2_headers`（wiremock 断言 POLY_* 头齐备）
+  - `test_tick_logs_and_degrades_on_poll_failure`（非 2xx/网络错误 → 告警 + 触发对账降级，不静默）
+  - `test_tick_uses_configured_token_ids`（非空 token 列表被轮询）
+- **Acceptance**: 用 wiremock 复现 401→修复后 200；错误可见且 fail-closed（触发 `reconcile_complete(false,false)`），不再静默永久停摆。
+
+### G3 Maker 成交方向归一化（P0-EXEC-005）
+
+- **Status**: TODO（候选；**定级待独立审查员按 Polymarket 官方 data-api 文档确认 `side` 视角**）
+- **Owner**: Work Buddy
+- **Goal**: `trader_side == "MAKER"` 时把成交 `side` 归一化到本方视角（BUY↔SELL），使 `RiskEngine`/`risk_state`/`FillLedger` 方向正确。
+- **Allowed Files**:
+  - `polymarket-rust/polymarket-rust/src/grpc/service.rs`（`on_market_trade` 内归一化）
+  - `polymarket-rust/polymarket-rust/src/fast/market_events.rs`（如需在事件层归一化）
+- **Forbidden**: `strategy_engine/`、`risk_engine.rs`、交易语义（不改 token 路由决策 DEC-0001/0002）
+- **Required Tests**:
+  - `test_on_market_trade_maker_side_inverted`（MAKER + API side=SELL → 本地记账为 Buy/减仓方向正确）
+  - `test_on_market_trade_taker_side_unchanged`（TAKER 不受影响）
+- **Acceptance**: Maker/Taker 两种角色下仓位方向与 `risk_state` 一致；回归全绿。
+
+---
+
+### 后续候选（P1/P2，待 G1~G3 后再排期）
+
+> 明细见 `audits/round_04/audit_opencode_round_04.md` 第四、五节。建议分组：
+> G4 预留生命周期（P1-RISK-006/007/008、P1-EXEC-009）；G5 对账数据完整性（P1-CONSIST-011、P1-DATA-012）；
+> G6 认证防御（P1-SEC-013）；G7 OrderStore 记账一致性（P1-CONSIST-010）；
+> G8 Mempool/Nonce 潜伏缺陷（P1-EXEC-014 及 P2 潜伏项，**接入生产前必须修**）。
+> 另有流程项 **ENV-001**：Python `pytest` 门禁实际不可用，建议补 `pytest.ini`/`conftest.py` 与 dev 依赖清单。
