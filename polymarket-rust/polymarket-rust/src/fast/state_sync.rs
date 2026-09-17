@@ -919,6 +919,14 @@ pub fn build_recovery_plan(
                         .push(RecoveryAction::MarkOrderNonFilled { order_id: order_id.clone() });
                 } else {
                     for t in matched {
+                        if t.id.trim().is_empty() {
+                            tracing::warn!(
+                                "state_sync: 丢弃缺少 trade_id 的恢复成交 order_id={}",
+                                order_id
+                            );
+                            continue;
+                        }
+
                         plan.actions.push(RecoveryAction::MarkOrderFilled {
                             order_id: order_id.clone(),
                             token_id: t.asset_id.clone(),
@@ -1270,6 +1278,36 @@ mod tests {
             }
             other => panic!("期望 MarkOrderFilled，得到 {:?}", other),
         }
+    }
+
+    /// P1-035：远端 trade 缺少 trade_id 时，恢复计划不得生成 MarkOrderFilled
+    ///（fail-closed：既不补记成交，也不误标 NonFilled，订单保持未决）。
+    #[test]
+    fn test_build_recovery_plan_skips_empty_trade_id() {
+        let local_pos: HashMap<String, f64> = HashMap::new();
+        let remote_positions: Vec<RemotePosition> = Vec::new();
+        let local_pending: std::collections::HashSet<String> = ["o1".to_string()].into();
+        let remote_open: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let trades = vec![
+            remote_trade("", "o1", "", "tok-1", "BUY"),
+            remote_trade("   ", "o1", "", "tok-1", "BUY"),
+        ];
+
+        let plan = build_recovery_plan(
+            &local_pos,
+            &remote_positions,
+            &local_pending,
+            &remote_open,
+            Some(&trades),
+            1.0,
+        );
+
+        assert!(
+            plan.actions.is_empty(),
+            "空/空白 trade_id 不应生成任何恢复动作，实际 {:?}",
+            plan.actions
+        );
+        assert!(plan.unresolved_orders.is_empty());
     }
 
     /// P1-030：find_trades_for_order 返回引用该订单的全部 trades（多笔 partial fill）。

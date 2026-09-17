@@ -281,6 +281,15 @@ impl MarketEventPoller {
         let mut new_events = Vec::new();
 
         for t in trades {
+            // 成交 identity 缺失时无法安全幂等，拒绝进入真实成交链。
+            if t.id.trim().is_empty() {
+                tracing::warn!(
+                    "market_events: 丢弃缺少 trade_id 的成交响应 token_id={}",
+                    token_id
+                );
+                continue;
+            }
+
             // 去重
             if let Some(known_set) = known {
                 if known_set.contains(&t.id) && !t.id.is_empty() {
@@ -678,6 +687,57 @@ mod tests {
         let poller = MarketEventPoller::new("https://clob.polymarket.com");
         let rx = poller.subscribe();
         assert!(!rx.is_empty() == false); // Initially empty
+    }
+
+    /// P1-035：poll_trades 必须丢弃空/空白 trade_id，只放行合法成交。
+    #[tokio::test]
+    async fn test_poll_trades_drops_empty_trade_id() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = serde_json::json!([
+            {
+                "id": "",
+                "side": "BUY",
+                "price": "0.5",
+                "size": "10",
+                "createdAt": "1700000000",
+                "takerOrderId": "o-empty",
+                "traderSide": "TAKER"
+            },
+            {
+                "id": "   ",
+                "side": "BUY",
+                "price": "0.5",
+                "size": "10",
+                "createdAt": "1700000000",
+                "takerOrderId": "o-blank",
+                "traderSide": "TAKER"
+            },
+            {
+                "id": "t-valid",
+                "side": "BUY",
+                "price": "0.5",
+                "size": "10",
+                "createdAt": "1700000000",
+                "takerOrderId": "o-valid",
+                "traderSide": "TAKER"
+            }
+        ]);
+
+        Mock::given(method("GET"))
+            .and(path("/data/trades"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+
+        let poller = MarketEventPoller::new(&server.uri());
+        let events = poller.poll_trades("tok-1").await.unwrap();
+
+        assert_eq!(events.len(), 1, "仅合法 trade_id 的成交应被保留");
+        assert_eq!(events[0].trade_id, "t-valid");
+        assert_eq!(events[0].order_id, "o-valid");
     }
 
     #[test]

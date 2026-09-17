@@ -418,6 +418,14 @@ impl ExecutionServiceImpl {
                     size,
                     trade_id,
                 } => {
+                    if trade_id.trim().is_empty() {
+                        tracing::warn!(
+                            "apply_recovery: 拒绝缺少 trade_id 的成交恢复 order_id={}",
+                            order_id
+                        );
+                        continue;
+                    }
+
                     let trade = TradeEvent {
                         token_id: token_id.clone(),
                         trade_id: trade_id.clone(),
@@ -1795,5 +1803,60 @@ mod tests {
             service.order_store.get("client-fill").map(|s| s.status),
             Some(OrderStateStatus::Filled)
         );
+    }
+
+    /// P1-035：apply_recovery 对空/空白 trade_id 的 MarkOrderFilled 必须 fail-closed，
+    /// 不产生任何记账副作用（FillLedger / RiskEngine 仓位 / OrderStore 均不变）。
+    #[tokio::test]
+    async fn test_apply_recovery_rejects_empty_trade_id() {
+        use crate::fast::order_state::OrderStateStatus;
+        use crate::fast::state_sync::{RecoveryAction, RecoveryPlan};
+
+        for bad_id in ["", "   "] {
+            let mut service = ExecutionServiceImpl::new_mock();
+            service.set_risk_engine(Arc::new(RiskEngine::new(RiskConfig::default())));
+
+            service
+                .order_store
+                .create("client-fill".to_string(), "tok-1".to_string(), "BUY".to_string(), 10.0);
+            if let Some(mut st) = service.order_store.get("client-fill") {
+                st.mark_submitted("exchange-fill".to_string());
+                st.mark_live();
+                service.order_store.upsert(st);
+            }
+
+            let plan = RecoveryPlan {
+                actions: vec![RecoveryAction::MarkOrderFilled {
+                    order_id: "exchange-fill".to_string(),
+                    token_id: "tok-1".to_string(),
+                    side: "BUY".to_string(),
+                    price: 0.5,
+                    size: 10.0,
+                    trade_id: bad_id.to_string(),
+                }],
+                unresolved_orders: Vec::new(),
+            };
+
+            service.apply_recovery(&plan).await;
+
+            assert!(
+                service.fill_ledger().list().is_empty(),
+                "trade_id={:?} 不应写入 FillLedger",
+                bad_id
+            );
+            let rs = service.risk_state.lock().await;
+            assert!(
+                !rs.positions.contains_key("tok-1"),
+                "trade_id={:?} 不应更新仓位",
+                bad_id
+            );
+            drop(rs);
+            assert_ne!(
+                service.order_store.get("client-fill").map(|s| s.status),
+                Some(OrderStateStatus::Filled),
+                "trade_id={:?} 不应把订单标记为 Filled",
+                bad_id
+            );
+        }
     }
 }
