@@ -1,7 +1,8 @@
-# 测试依赖（ENV-001）
+# 测试依赖（ENV-001 / TST-001）
 # 安装：python -m pip install -r requirements-dev.txt
 #
 # 用途：让 AGENTS.md 的 Python 验证门禁可复现（详见 audits/round_04 ENV-001）。
 pytest>=8.0,<10
 pytest-asyncio>=0.24
+pytest-timeout>=2.3
 anyio>=4.0

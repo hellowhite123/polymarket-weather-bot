@@ -437,28 +437,6 @@ async def test_end_to_end_aggregation_to_execution():
 
 
 # ============================================================
-# ENV-001：pytest 适配标记
-# ============================================================
-# 以下 async 用例在 pytest 的 per-test event loop 下会挂起（根因在
-# strategy_engine/grpc_bridge 的 gRPC async 生命周期），而其自带的
-# asyncio.run(main) 脚本跑法完全正常。故从 pytest 收集中排除，
-# 仍由 `python test_grpc.py` 全量验证；上面的同步转换器用例保留给 pytest。
-for _async_test in (
-    test_health_check,
-    test_place_order,
-    test_place_orders_batch,
-    test_skip_non_actionable,
-    test_get_risk_state,
-    test_cancel_order,
-    test_cancel_all,
-    test_connection_failure,
-    test_end_to_end_aggregation_to_execution,
-):
-    _async_test.__test__ = False
-del _async_test
-
-
-# ============================================================
 # 主函数
 # ============================================================
 
