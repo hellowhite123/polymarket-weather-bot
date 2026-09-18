@@ -276,8 +276,8 @@
 - **Status**: 🚧 IN_PROGRESS（2026-09-17 伯森先生授权）
   - P1-RISK-006 取消订单释放预留 + OrderStore 原子取消：🔧 FIXED（09-17）
   - P1-RISK-007 后台对账后重建 open 预留：🔧 FIXED（09-17）
-  - P1-RISK-008 成交价优于限价时的预留残余：⬜ **需设计/显式授权**（须改 `risk_engine.rs` 预留记账 = Risk Model 红线）
-  - P1-EXEC-009 未知结果订单被对账输入集排除：⬜ **需设计/显式授权**（对账语义变更）
+  - P1-RISK-008 成交价优于限价时的预留残余：⬜ **需设计/显式授权**（须改 `risk_engine.rs` 预留记账 = Risk Model 红线）— 方案 `docs/design/reserve_release_accounting.md`（Draft v1，待审）
+  - P1-EXEC-009 未知结果订单被对账输入集排除：⬜ **需设计/显式授权**（对账语义变更）— 方案 `docs/design/indoubt_order_reconciliation.md`（Draft v1，待审）
 - **Owner**: Work Buddy
 - **Goal**: 消除预留（reserve）泄漏：① 取消订单时释放该单剩余预留并标记 OrderStore；② 后台对账触发仓位重建后重建远端 open 订单预留（避免暴露漏计）。
 - **实现说明（09-17）**：
