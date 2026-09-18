@@ -4,7 +4,7 @@
 
 | 文档 | 关联任务 | 状态 | 需审批要点 |
 |------|----------|------|-----------|
-| [`update_settlement_times_rpc.md`](./update_settlement_times_rpc.md) | G1-002 / P0-RISK-002 | **Draft v2，待第二轮审查** | Unknown settlement fail-closed；atomic snapshot replacement；freshness；cleanup 生命周期；RPC 语义；`risk_engine.rs` 最小 Allowed |
+| [`update_settlement_times_rpc.md`](./update_settlement_times_rpc.md) | G1-002 / P0-RISK-002 | **Draft v3，待审查** | Unknown/STALE fail-closed 落在 `place_order::settlement_gate`（不动 TimeWindowGuard 窗口计算）；双 freshness；replace_all 原子语义；增长保护；Human Acceptance 冻结 |
 | [`settlement_pnl_risk_wiring.md`](./settlement_pnl_risk_wiring.md) | G1-001 / P0-RISK-001 | **Draft v2，待第二轮审查** | settlement authority POC；identifier→token_id；outcome encoding；PnL/fee/UTC；并发幂等；Rust 唯一 authority |
 | [`reserve_release_accounting.md`](./reserve_release_accounting.md) | G4 / P1-RISK-008 | **Draft v1，待审** | 预留释放额改按「成交增量 × 订单限价」；是否授权改 `on_fill`/`post_check` 记账接口；过期路径释放 |
 | [`indoubt_order_reconciliation.md`](./indoubt_order_reconciliation.md) | G4 / P1-EXEC-009 | **Draft v1，待审** | in-doubt（Received）订单可见性 + fail-closed；远端匹配收敛；是否用 client order id；TTL/停新单范围 |
