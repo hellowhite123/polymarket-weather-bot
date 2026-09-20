@@ -408,7 +408,7 @@ UMA/Settlement Authority
 | HA-003 | Cross-day 归属 | 使用 `settlement_ts` 的 UTC 日 | 待确认 |
 | HA-004 | Rust 唯一 Risk Authority | 是 | 待确认 |
 | HA-005 | 历史 bucket / 迟到结算 | 是否需历史 bucket（否则记 RETRYABLE/FAILED+alert）；涉及 Risk Model 授权 | 待确认 |
-| HA-006 | 持久化方案（WAL/SQLite）+ 新增依赖 | 架构变更授权 | 待批准 |
+| HA-006 | 持久化方案（WAL/SQLite）+ 新增依赖 | 架构变更授权；**Human 倾向 D1 SQLite**（待复审后正式冻结） | 待冻结 |
 | **HA-007** | **提供 UMA 原始事件 fixture / RPC 环境** | 解除 P0-2 POC BLOCKED | **待提供** |
 
 ---
