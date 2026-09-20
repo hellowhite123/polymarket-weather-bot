@@ -5,7 +5,7 @@
 | 文档 | 关联任务 | 状态 | 需审批要点 |
 |------|----------|------|-----------|
 | [`update_settlement_times_rpc.md`](./update_settlement_times_rpc.md) | G1-002 / P0-RISK-002 | **Draft v3，待审查** | Unknown/STALE fail-closed 落在 `place_order::settlement_gate`（不动 TimeWindowGuard 窗口计算）；双 freshness；replace_all 原子语义；增长保护；Human Acceptance 冻结 |
-| [`settlement_pnl_risk_wiring.md`](./settlement_pnl_risk_wiring.md) | G1-001 / P0-RISK-001 | **Draft v3，待审查（P0-2 POC 未完成）** | PnL 权威=现有 net 公式；crash-safe SettlementRecord 状态机；settlement_id 幂等；settlement_ts 入链；UMA 映射/编码 POC 门禁（缺 fixture 阻断） |
+| [`settlement_pnl_risk_wiring.md`](./settlement_pnl_risk_wiring.md) | G1-001 / P0-RISK-001 | **Draft v4，待审查（P0-2 POC BLOCKED）** | PnL 权威=现有 net 公式（措辞冻结）；crash-safe：accounting_effect_id + commit point + Case A–E；report_pnl 幂等（含重启）；settlement_ts；restart=idempotency 四件套；Test A/B；POC BLOCKED 需 HA-007 |
 | [`reserve_release_accounting.md`](./reserve_release_accounting.md) | G4 / P1-RISK-008 | **Draft v1，待审** | 预留释放额改按「成交增量 × 订单限价」；是否授权改 `on_fill`/`post_check` 记账接口；过期路径释放 |
 | [`indoubt_order_reconciliation.md`](./indoubt_order_reconciliation.md) | G4 / P1-EXEC-009 | **Draft v1，待审** | in-doubt（Received）订单可见性 + fail-closed；远端匹配收敛；是否用 client order id；TTL/停新单范围 |
 | [`REVIEW_CHECKLIST_DESIGN.md`](./REVIEW_CHECKLIST_DESIGN.md) | 通用 | 有效 | 独立审查核对项 |
