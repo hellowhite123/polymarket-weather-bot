@@ -13,6 +13,7 @@
 | [`REVIEW_CHECKLIST_DESIGN_V3.md`](./REVIEW_CHECKLIST_DESIGN_V3.md) | **全部 4 份提案（当前版本）** | **待第三轮复审** | G1-002 v3 / G1-001 v3 / P1-RISK-008 v1 / P1-EXEC-009 v1 的统一复审 + 证据核验 + Human Acceptance 汇总 |
 | [`REVIEW_CHECKLIST_DESIGN_V5.md`](./REVIEW_CHECKLIST_DESIGN_V5.md) | G1-001 v5 | **待复审（v4→v5 五处定点修改）** | Durable Txn Boundary / settlement_id 前置 / effect identity 比较 / late-settlement gate / Test A-B 断言 |
 | [`CONSENSUS_DESIGN_ROUND_01.md`](./CONSENSUS_DESIGN_ROUND_01.md) | 通用 | 已归档 | 第一轮独立审查结论（CHANGES_REQUESTED ×2） |
+| [`CONSENSUS_DESIGN_ROUND_05.md`](./CONSENSUS_DESIGN_ROUND_05.md) | G1-001 v5 | 自审记录（非独立批准） | 必改 1（§5.6 Durable Txn Boundary）= **CHANGES_REQUESTED**；其余 4 项挂起 |
 
 ## 流程状态
 
