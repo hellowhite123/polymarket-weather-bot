@@ -1,6 +1,6 @@
-# 设计方案：结算 / 已实现盈亏 → 日亏熔断接线（P0-RISK-001）— Draft v5
+# 设计方案：结算 / 已实现盈亏 → 日亏熔断接线（P0-RISK-001）— Draft v6
 
-- **状态**：**Draft v5** — 在 v4 基础上**仅做 5 处定点修改**（Durable Txn Boundary / settlement_id 前置依赖 / effect identity 比较 / late-settlement gate / Test A/B 断言），**待独立审查**。
+- **状态**：**Draft v6** — 仅重做 **§5.6**（+ §5.5/§6/§14 联动），回答 7 问并定义 I1–I3；其余章节沿用 v5，**待独立审查**。
 - **作者**：OpenCode（工程实施者）
 - **日期**：2026-09-18
 - **关联**：`MASTER_TASKS.md` G1-001、`BUG_TRACKER.md` P0-RISK-001、`docs/design/REVIEW_CHECKLIST_DESIGN_V3.md`
@@ -163,28 +163,68 @@ S6  status=ACCOUNTED                                         [持久化]
 | **E** | ACCOUNTED + 冲突 outcome | 同 id 异 outcome | reject + alert + **no PnL mutation** |
 
 > Case C 是设计关键：**靠 `accounting_effect_id` 识别 effect 已应用**，而非仅靠 status。
+> 恢复判定与唯一恢复模块见 **§5.6（Q5/Q6）**。
 
-### 5.6 Durable Transaction Boundary（必改1，冻结）
+### 5.6 Durable Transaction Boundary（v6：7 问 + I1–I3）
 
-S5 的「同一 durable 原子提交」**边界** = 以下三者必须**一起生效或一起不生效**：
-1. `SettlementRecord.pnl_delta` / `status`（S4/S6）；
-2. `AccountingEffect { settlement_id, pnl_delta, settlement_ts, applied_at }`（S5 写入）；
-3. `RiskEngine.daily_pnl` 的增量（S5 修改）。
+**Q1｜谁是 durable accounting authority？**
+`SettlementJournal`（持久 store：D1 SQLite 表 / D2 WAL 文件）是**唯一 durable accounting authority**。`RiskEngine` / `daily_pnl` **不是** authority。
 
-实现二选一（由 HA-006 冻结）：
+**Q2｜daily_pnl 是 A 还是 B？**
+**选 A：effect replay projection**。持久 store 为权威；`daily_pnl(day) = Σ pnl_delta(committed effects, 其 UTC 日)`；内存 `DailyLossLimit.daily_pnl` 仅为**缓存**，启动由 journal 重建。→ 由此**消除 v5「把内存变更与磁盘提交绑原子」的不可实现矛盾**。
 
-- **Option D1（推荐）SQLite 事务**：三者写入同一 `BEGIN IMMEDIATE … COMMIT`；`AccountingEffect.settlement_id` 建 **UNIQUE** 约束提供幂等。重启后读 `AccountingEffect` 判定「effect 是否已应用」；`daily_pnl` 由持久表加载（或按 effect 重放重建）。
-- **Option D2 WAL commit/replay protocol**：
-  ```
-  append prepare(settlement_id)
-  append effect(settlement_id, pnl_delta, settlement_ts)   // 写 effect 数据
-  append commit(settlement_id)                              // ★ effect 生效的权威点
-  ```
-  - **`commit` 记录存在 ⇔ effect 已生效**；
-  - 崩溃恢复：顺序重放；见 `commit` → **跳过 effect（no-op）**，仅补 `status=ACCOUNTED`；见 `prepare/effect` 无 `commit` → 重放 effect 后再写 `commit`；
-  - `commit` 集合持久化 ⇒ 跨重启幂等。
+**Q3｜transaction boundary 是什么？**
+durable 事务**只覆盖持久产物**：`AccountingEffect(settlement_id, pnl_delta, settlement_ts, applied_at)` + `SettlementRecord.status/pnl_delta`。**内存 daily_pnl 不在边界内**（它是 committed effects 的派生投影）。
+- D1：同一 `BEGIN IMMEDIATE … COMMIT`。
+- D2：`append EFFECT_COMMIT` 后 `fsync` 为边界点。
 
-无论哪种：**`daily_pnl` 必须可持久恢复**（加载或按 effect 重放），否则重启丢失跨日累计。
+**Q4｜什么标记定义「effect 已生效」？**
+**committed `AccountingEffect` 记录**（D1：`effects` 表行；D2：`EFFECT_COMMIT` 记录）。
+
+**Q5｜crash 后如何判定？**
+| 观测 | 判定 |
+|------|------|
+| 无 committed effect（仅 PENDING/prepare） | effect **未生效** |
+| 有 committed effect | effect **已生效** |
+| 尾部半写/CRC 失败（D2）或未提交事务（D1 自动回滚） | **transaction incomplete** → 丢弃尾部至最后有效 commit |
+
+**Q6｜restart recovery 由哪个唯一模块执行？**
+唯一模块 **`SettlementRecovery`**，启动时执行一次、先于 `TradingGate` Ready：读 journal → 建 committed 集合 C → **重建 daily_pnl 投影** → 续处理未提交项 → 设置 Gate。**RiskEngine 不自恢复。**
+
+**Q7｜如何证明（I1–I3）？**
+- **I1 PnL consistency**：任意静止点 `daily_pnl(day) == Σ_{committed e, UTCday(e)==day} e.pnl_delta`；内存缓存必须等于该投影（恢复后强制成立）。
+- **I2 settlement_id uniqueness**：∀ `settlement_id`，committed effect 数 **≤ 1**（D1 `UNIQUE(settlement_id)` / D2 append-once）。
+- **I3 replay determinism**：`rebuild` 是 committed 集合的**纯函数**；`rebuild(journal)` 多次 == 一次；**重放只读、不产生新 effect**。
+
+**D1｜SQLite 协议**
+```
+-- 表
+settlements(settlement_id TEXT PRIMARY KEY, token_id, outcome, settlement_ts, pnl_delta, status)
+effects    (settlement_id TEXT PRIMARY KEY, pnl_delta, settlement_ts, applied_at)   -- UNIQUE 即 I2
+-- 提交（Q4 的 commit marker）
+BEGIN IMMEDIATE;
+  INSERT INTO effects(settlement_id,pnl_delta,settlement_ts,applied_at) VALUES(...); -- 唯一冲突→conflict
+  UPDATE settlements SET status='ACCOUNTED', pnl_delta=? WHERE settlement_id=?;
+COMMIT;
+-- 重建投影（I1/I3）
+SELECT settlement_ts, SUM(pnl_delta) FROM effects GROUP BY utc_day(settlement_ts);
+```
+
+**D2｜WAL 协议**
+```
+record := [len:u32][crc32:u32][type:u8][json]
+append(SETTLE_PENDING, settlement_id, token_id, outcome, settlement_ts)
+append(EFFECT_COMMIT, settlement_id, pnl_delta, settlement_ts); fsync()   -- ★ durability + commit(Q4)
+replay: 顺序读；遇 len/crc 校验失败 → truncate 自此(Q5 incomplete)；
+        C = 所有 EFFECT_COMMIT 的 (id, delta, ts)
+重建 daily_pnl = Σ_{C} delta 按 UTC 日（只读，不 append → I3）
+```
+
+**运行时顺序（修正 v5）**：**先 durable commit（写 journal）→ 再更新内存缓存**。若两步间 crash，恢复期由 journal 重建缓存 ⇒ I1 恢复成立。
+
+**与 §5.5 绑定**：A/B/C 的判定即 Q5 表（无 commit→续提交；有 commit→跳过 effect、仅补 `ACCOUNTED`）；D/E 由 **I2 + conflict 检测**处理。
+
+无论哪种实现：`daily_pnl` 必须由 committed effects **可重建**（I1/I3），不以内存为权威。
 
 ---
 
@@ -208,6 +248,8 @@ X / -10  然后  X / -20
 - 幂等**不能只靠** `HashSet/RwLock/HashMap`；必须由**持久化 effect 身份（`accounting_effect_id`）**支撑：
   - 应用前检查：该 `settlement_id` 是否已有持久化 effect → 有则 no-op；
   - 应用与 effect_id 写入**原子提交**。
+
+> 落地以 **§5.6 的 commit marker** 为准：**先 durable commit，再更新内存投影**（§5.6 Q2-A/Q4）；`daily_pnl` 由 committed effects 可重建（I1/I3），内存非权威。
 - `pnl_delta` 本身可选持久化（S4），用于审计与重放校验。
 
 ### 6.4 Effect Identity 比较（必改3，冻结）
@@ -327,9 +369,11 @@ UMA/Settlement Authority
 | 14.8 | `test_restart_duplicate_event` | ACCOUNTED + 重启 + 重复事件 → 额外 PnL=0 |
 | 14.9 | `test_daily_loss_circuit_breaker_integration` | 全链 Settlement→…→`check_gates` 拒单 |
 | 14.10 | `test_risk_state_projection_daily_pnl` | 引擎/投影/Python 一致，非 0 |
+| 14.11 | `test_settlement_recovery_replay_idempotent` | `SettlementRecovery` 重放 N 次：`daily_pnl` 不变（I1）、不新增 effect（I3）、journal 只读 |
 
 鉴别力：短路 effect 幂等 / 去掉持久化恢复 → 14.1/14.6/14.7 必 FAILED。
 `effect_count` 定义：持久化 `AccountingEffect` / WAL `commit` 中该 `settlement_id` 的记录条数（**必须恰为 1**）。
+并断言 **I1–I3**：`daily_pnl(day) == Σ committed delta`（I1）、`effect_count == 1`（I2）、`SettlementRecovery` 重放多次 == 一次且不新增 effect（I3）。
 
 ---
 
