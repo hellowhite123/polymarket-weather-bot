@@ -1,6 +1,6 @@
-# 设计方案：结算 / 已实现盈亏 → 日亏熔断接线（P0-RISK-001）— Draft v4
+# 设计方案：结算 / 已实现盈亏 → 日亏熔断接线（P0-RISK-001）— Draft v5
 
-- **状态**：**Draft v4** — 已按「G1-001 V3 定点整改意见」修订（保留 V3 正确设计，补齐 P0-2/3/4 与 P1 缺口），**待独立审查**。
+- **状态**：**Draft v5** — 在 v4 基础上**仅做 5 处定点修改**（Durable Txn Boundary / settlement_id 前置依赖 / effect identity 比较 / late-settlement gate / Test A/B 断言），**待独立审查**。
 - **作者**：OpenCode（工程实施者）
 - **日期**：2026-09-18
 - **关联**：`MASTER_TASKS.md` G1-001、`BUG_TRACKER.md` P0-RISK-001、`docs/design/REVIEW_CHECKLIST_DESIGN_V3.md`
@@ -98,6 +98,15 @@ POC-3 Settlement identity: BLOCKED
 
 > **需 Human 提供 RPC / fixture / 链上数据环境（HA-007）。**
 
+### 4.5 前置依赖链（必改2，冻结）
+```
+P0-2 POC 未完成
+   → settlement_id 未经 POC-3 验证（唯一性/稳定性未证）
+   → P0-4（report_pnl 幂等）只能“设计冻结”，不可实现
+   → 禁止进入 production implementation
+```
+即：`settlement_id` 未经验证前，任何依赖它的幂等/恢复实现**一律不得落地**。
+
 ---
 
 ## 5. P0-3：Crash-Safe Settlement Accounting（**核心整改**）
@@ -155,6 +164,28 @@ S6  status=ACCOUNTED                                         [持久化]
 
 > Case C 是设计关键：**靠 `accounting_effect_id` 识别 effect 已应用**，而非仅靠 status。
 
+### 5.6 Durable Transaction Boundary（必改1，冻结）
+
+S5 的「同一 durable 原子提交」**边界** = 以下三者必须**一起生效或一起不生效**：
+1. `SettlementRecord.pnl_delta` / `status`（S4/S6）；
+2. `AccountingEffect { settlement_id, pnl_delta, settlement_ts, applied_at }`（S5 写入）；
+3. `RiskEngine.daily_pnl` 的增量（S5 修改）。
+
+实现二选一（由 HA-006 冻结）：
+
+- **Option D1（推荐）SQLite 事务**：三者写入同一 `BEGIN IMMEDIATE … COMMIT`；`AccountingEffect.settlement_id` 建 **UNIQUE** 约束提供幂等。重启后读 `AccountingEffect` 判定「effect 是否已应用」；`daily_pnl` 由持久表加载（或按 effect 重放重建）。
+- **Option D2 WAL commit/replay protocol**：
+  ```
+  append prepare(settlement_id)
+  append effect(settlement_id, pnl_delta, settlement_ts)   // 写 effect 数据
+  append commit(settlement_id)                              // ★ effect 生效的权威点
+  ```
+  - **`commit` 记录存在 ⇔ effect 已生效**；
+  - 崩溃恢复：顺序重放；见 `commit` → **跳过 effect（no-op）**，仅补 `status=ACCOUNTED`；见 `prepare/effect` 无 `commit` → 重放 effect 后再写 `commit`；
+  - `commit` 集合持久化 ⇒ 跨重启幂等。
+
+无论哪种：**`daily_pnl` 必须可持久恢复**（加载或按 effect 重放），否则重启丢失跨日累计。
+
 ---
 
 ## 6. P0-4：`report_pnl` 幂等契约（冻结）
@@ -178,6 +209,12 @@ X / -10  然后  X / -20
   - 应用前检查：该 `settlement_id` 是否已有持久化 effect → 有则 no-op；
   - 应用与 effect_id 写入**原子提交**。
 - `pnl_delta` 本身可选持久化（S4），用于审计与重放校验。
+
+### 6.4 Effect Identity 比较（必改3，冻结）
+
+- `same settlement_id` + `same canonical pnl_delta` + `same settlement_ts` → **no-op**（幂等）。
+- `same settlement_id` + **任一不同**（`pnl_delta` / `settlement_ts` / `token_id` / `outcome`）→ **conflict**：`reject + alert + no PnL mutation`（**不累加、不覆盖**）。
+- **canonical 定义**：按持久化字段的**确定性规范序列化**比较（`pnl_delta` 用固定精度/定点字符串，避免浮点歧义）。重算必须 **bit-exact** 复现；否则视为 conflict，禁止“近似相等”放行。
 
 ---
 
@@ -215,6 +252,11 @@ received_at   = 2026-09-18 00:00:05 UTC
   - **不得**自行改 Risk Model；
   - 必须提出 **Human Acceptance / Risk Model authorization**（HA-005）。
 - 在不改 Risk Model 的前提下，备选：迟到结算写对应历史日 bucket，并**不影响当日 gate**；无历史 bucket 能力时，记为 `RETRYABLE/FAILED` 并 alert（保守，不静默错桶入当日）。
+- **Gate 行为（必改4，冻结）**：若迟到结算**无法正确归入其 `settlement_ts` 的 UTC 日 bucket**：
+  - 状态记 `RETRYABLE`（可重试）或超限后 `FAILED`；
+  - **FAIL-CLOSED：`TradingGate` 停新单（`reconcile_complete(false,false)` 或等价），直到该结算被正确入账或人工处置**；
+  - **不得只 alert 后静默继续**；**不得**把历史 PnL 错桶进当日 gate；
+  - 该 gate 行为涉及 Risk Model 授权（HA-005）；未批准前默认按此最保守执行。
 
 ---
 
@@ -280,13 +322,14 @@ UMA/Settlement Authority
 | 14.3 | `test_multiple_fills_settle_pnl` | 多 fill 聚合 = 权威（引用 `test_ledger_multi_fill_settle_by_token`） |
 | 14.4 | `test_partial_fill_pnl` | requested/filled/unfilled/settled 正确 |
 | 14.5 | `test_cross_utc_day_bucket` | 23:59:59 vs 00:00:00 分桶正确（归属 settlement_ts 日） |
-| **14.6** | **Test A：`test_crash_after_risk_effect`** | effect 提交后 crash → 重启 **恰好一笔** PnL |
-| **14.7** | **Test B：`test_crash_before_risk_effect`** | effect 前 crash → 重启后 **成功且恰好一笔** |
+| **14.6** | **Test A：`test_crash_after_risk_effect`** | effect 提交后 crash → 重启**恰好一笔** PnL。断言：`effect_count == 1`；持久化 effect 存在（`accounting_effect_id`/WAL `commit`）；`status == ACCOUNTED`；重启重放为 **no-op**；`daily_pnl` 增量 == 该 `pnl_delta` |
+| **14.7** | **Test B：`test_crash_before_risk_effect`** | effect 前 crash → 重启后**成功且恰好一笔**。断言：`effect_count == 1`；持久化 effect 存在；`status == ACCOUNTED`；再次重启重放为 **no-op**；无重复 PnL |
 | 14.8 | `test_restart_duplicate_event` | ACCOUNTED + 重启 + 重复事件 → 额外 PnL=0 |
 | 14.9 | `test_daily_loss_circuit_breaker_integration` | 全链 Settlement→…→`check_gates` 拒单 |
 | 14.10 | `test_risk_state_projection_daily_pnl` | 引擎/投影/Python 一致，非 0 |
 
 鉴别力：短路 effect 幂等 / 去掉持久化恢复 → 14.1/14.6/14.7 必 FAILED。
+`effect_count` 定义：持久化 `AccountingEffect` / WAL `commit` 中该 `settlement_id` 的记录条数（**必须恰为 1**）。
 
 ---
 
