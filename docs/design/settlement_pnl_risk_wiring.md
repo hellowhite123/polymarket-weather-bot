@@ -416,7 +416,7 @@ UMA/Settlement Authority
  → settlement identity (settlement_id)   (POC-3)
  → FillLedger settlement accounting      (fill_records.rs:401-422)
  → authoritative pnl_delta               (需新增返回，§3.4)
- → RiskEngine effect (幂等, 持久)         (§5 S5 / §6)
+ → RiskEngine effect (幂等, 持久)         (§5 S4 / §6)
  → DailyLossLimit                        (risk_engine.rs:555-594)
  → BreachLevel                           (risk_engine.rs:568-577)
  → check_gates                           (risk_engine.rs:986-1005)

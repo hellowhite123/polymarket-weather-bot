@@ -17,6 +17,7 @@
 | [`CONSENSUS_DESIGN_ROUND_01.md`](./CONSENSUS_DESIGN_ROUND_01.md) | 通用 | 已归档 | 第一轮独立审查结论（CHANGES_REQUESTED ×2） |
 | [`CONSENSUS_DESIGN_ROUND_05.md`](./CONSENSUS_DESIGN_ROUND_05.md) | G1-001 v5 | 自审记录（非独立批准） | 必改 1（§5.6 Durable Txn Boundary）= **CHANGES_REQUESTED**；其余 4 项挂起 |
 | [`CONSENSUS_DESIGN_ROUND_06.md`](./CONSENSUS_DESIGN_ROUND_06.md) | G1-001 v6 | 独立复审结论归档 | **CHANGES_REQUESTED**（P0-3 transaction-model consistency：Case C 与 D1 单事务冲突）→ 指令产出 v7 统一 D1 模型 |
+| [`SELF_AUDIT_V7.md`](./SELF_AUDIT_V7.md) | G1-001 v7 | 实施者自审（非独立批准） | 对照 V7 整改指令逐条自审：完成条件 Q1–Q7/I1–I3/14.12 均落点 ✅；主动披露 5 项残余（方案 A/B 未定、D2 简版、测试未实现等） |
 
 ## 流程状态
 
