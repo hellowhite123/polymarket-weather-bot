@@ -204,7 +204,7 @@
 
 - **Status**: 🚧 IN_PROGRESS（已授权 2026-09-17；CONSENSUS_ROUND_04 确认 P0-RISK-001/002/003 = CONFIRMED/P0）
   - G1-003 Gas 保护：🔧 **FIXED（09-17）**
-  - G1-001 日亏熔断：⬜ TODO（依赖结算/PnL 链）— 方案 `docs/design/settlement_pnl_risk_wiring.md` **Draft v6，待审查**（§5.6 重做：7 问 + I1–I3 + D1 SQLite/D2 WAL 协议；联动 §5.5/§6/§14。**P0-2 UMA POC BLOCKED → 实施阻断，需 HA-007**）
+  - G1-001 日亏熔断：⬜ TODO（依赖结算/PnL 链）— 方案 `docs/design/settlement_pnl_risk_wiring.md` **Draft v7，待审查**（统一 D1 SQLite 单事务模型：S4 COMMIT=effect 已生效唯一 durable boundary；Case A–E 区分 D1/D2、D1 无 Case C；durable conflict algorithm；§14.12 原子性测试。**P0-2 UMA POC BLOCKED → 实施阻断，需 HA-007**；HA-006 倾向 D1 SQLite 待冻结）
   - G1-002 结算窗口：⬜ TODO（需先出 `UpdateSettlementTimes` 接口方案待批）— 方案 `docs/design/update_settlement_times_rpc.md` **Draft v3，待审查**（二轮整改：Unknown/STALE gate 落 `place_order::settlement_gate`、双 freshness、replace_all 原子语义、增长保护、Human Acceptance 冻结）
   - 设计审查记录：`docs/design/CONSENSUS_DESIGN_ROUND_01.md`；审查清单：`docs/design/REVIEW_CHECKLIST_DESIGN.md`
 - **Owner**: Work Buddy

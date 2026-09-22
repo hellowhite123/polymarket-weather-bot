@@ -5,7 +5,7 @@
 | 文档 | 关联任务 | 状态 | 需审批要点 |
 |------|----------|------|-----------|
 | [`update_settlement_times_rpc.md`](./update_settlement_times_rpc.md) | G1-002 / P0-RISK-002 | **Draft v3，待审查** | Unknown/STALE fail-closed 落在 `place_order::settlement_gate`（不动 TimeWindowGuard 窗口计算）；双 freshness；replace_all 原子语义；增长保护；Human Acceptance 冻结 |
-| [`settlement_pnl_risk_wiring.md`](./settlement_pnl_risk_wiring.md) | G1-001 / P0-RISK-001 | **Draft v6，待审查（P0-2 POC BLOCKED）** | §5.6 重做：7 问（authority / daily_pnl=A replay projection / txn boundary / commit marker / crash 判定 / 唯一恢复模块 / I1–I3 证明）+ D1 SQLite / D2 WAL 协议；联动 §5.5/§6/§14 |
+| [`settlement_pnl_risk_wiring.md`](./settlement_pnl_risk_wiring.md) | G1-001 / P0-RISK-001 | **Draft v7，待审查（P0-2 POC BLOCKED）** | 统一 D1 SQLite single-transaction semantics（S4 单事务 COMMIT=effect 已生效）；Case A–E 区分 D1/D2（D1 无 Case C）；durable conflict algorithm；新增 14.12 原子性测试 |
 | [`reserve_release_accounting.md`](./reserve_release_accounting.md) | G4 / P1-RISK-008 | **Draft v1，待审** | 预留释放额改按「成交增量 × 订单限价」；是否授权改 `on_fill`/`post_check` 记账接口；过期路径释放 |
 | [`indoubt_order_reconciliation.md`](./indoubt_order_reconciliation.md) | G4 / P1-EXEC-009 | **Draft v1，待审** | in-doubt（Received）订单可见性 + fail-closed；远端匹配收敛；是否用 client order id；TTL/停新单范围 |
 | [`REVIEW_CHECKLIST_DESIGN.md`](./REVIEW_CHECKLIST_DESIGN.md) | 通用 | 有效 | 独立审查核对项 |
@@ -16,6 +16,7 @@
 | [`REVIEW_REQUEST_V6.md`](./REVIEW_REQUEST_V6.md) | G1-001 v6 | 可直接投喂 | 自包含复审请求 + 结论模板（发给独立审查方） |
 | [`CONSENSUS_DESIGN_ROUND_01.md`](./CONSENSUS_DESIGN_ROUND_01.md) | 通用 | 已归档 | 第一轮独立审查结论（CHANGES_REQUESTED ×2） |
 | [`CONSENSUS_DESIGN_ROUND_05.md`](./CONSENSUS_DESIGN_ROUND_05.md) | G1-001 v5 | 自审记录（非独立批准） | 必改 1（§5.6 Durable Txn Boundary）= **CHANGES_REQUESTED**；其余 4 项挂起 |
+| [`CONSENSUS_DESIGN_ROUND_06.md`](./CONSENSUS_DESIGN_ROUND_06.md) | G1-001 v6 | 独立复审结论归档 | **CHANGES_REQUESTED**（P0-3 transaction-model consistency：Case C 与 D1 单事务冲突）→ 指令产出 v7 统一 D1 模型 |
 
 ## 流程状态
 

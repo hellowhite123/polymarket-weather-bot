@@ -1,11 +1,29 @@
-# 设计方案：结算 / 已实现盈亏 → 日亏熔断接线（P0-RISK-001）— Draft v6
+# 设计方案：结算 / 已实现盈亏 → 日亏熔断接线（P0-RISK-001）— Draft v7
 
-- **状态**：**Draft v6** — 仅重做 **§5.6**（+ §5.5/§6/§14 联动），回答 7 问并定义 I1–I3；其余章节沿用 v5，**待独立审查**。
+- **状态**：**Draft v7** — 按「G1-001 v6 独立复审（CHANGES_REQUESTED，P0-3 transaction-model consistency）」定点整改：**统一 D1 SQLite single-transaction semantics，消除 Case C 与 D1 transaction boundary 冲突**。仅改 §5.4/§5.5/§5.6/§6/§6.4/§14.6/§14.7/§14.11 + 新增 §14.12（§11 为必要联动），**待独立复审**。
 - **作者**：OpenCode（工程实施者）
-- **日期**：2026-09-18
-- **关联**：`MASTER_TASKS.md` G1-001、`BUG_TRACKER.md` P0-RISK-001、`docs/design/REVIEW_CHECKLIST_DESIGN_V3.md`
+- **日期**：2026-09-22
+- **关联**：`MASTER_TASKS.md` G1-001、`BUG_TRACKER.md` P0-RISK-001、`docs/design/CONSENSUS_DESIGN_ROUND_06.md`（本轮复审结论）、`docs/design/REVIEW_CHECKLIST_DESIGN_V6.md`
 - **证据基线**：commit `bf68cad`（`file:line` 未经独立核验）。
 - **本阶段仅设计 / POC**；提交后 **STOP**，不进入生产实现。
+
+### v6 → v7 修改摘要（本轮定点整改，仅设计）
+
+**复审结论（CHANGES_REQUESTED，归档于 `CONSENSUS_DESIGN_ROUND_06.md`）**：v6 已正确补齐 Q1/Q2/Q4/Q6/Q7、I1–I3、`SettlementRecovery` 唯一 owner、D1/D2 基本协议、commit marker、§14 I1–I3 与 14.11；但存在必须修正的 **P0-3 transaction-model consistency 问题**：
+
+> §5.4 的 S5/S6 + Case C 描述的「effect 已 durable、status 尚未 ACCOUNTED」状态，与 §5.6 D1 的 SQLite single transaction（`BEGIN IMMEDIATE → INSERT effect → UPDATE settlement → COMMIT`）不一致。D1 采用单事务时：**COMMIT 成功 ⇒ AccountingEffect 与 ACCOUNTED 同时 durable**；**COMMIT 前 crash ⇒ SQLite rollback ⇒ 两者均未提交**。因此 D1 下不存在独立的 `effect committed + status != ACCOUNTED` 状态。V7 必须统一 transaction model。
+
+| 项 | v6 | v7 |
+|----|----|----|
+| §5.4 | S5「改 daily_pnl + 写 effect_id 同一 durable 原子提交」+ S6 ACCOUNTED | **S4 = D1 单事务**（`BEGIN IMMEDIATE` → 验证 identity → `INSERT AccountingEffect` → `UPDATE SettlementRecord{ACCOUNTED, pnl_delta, accounting_effect_id}` → `COMMIT`）；S5 = COMMIT 后更新内存投影；S6 = recovery 验证 |
+| §5.5 | Case A–E 单一表，含 Case C（effect 已提交、未 ACCOUNTED） | **区分 D1 / D2**；**D1 无 Case C**（由单事务 atomicity 排除）；Case C 仅为 D2 多记录 WAL 模型的可能状态 |
+| §5.6 | D1「INSERT effect + UPDATE status 同一事务」简版；conflict 仅靠 UNIQUE | Q1–Q7 对齐 D1 单事务；新增 **durable conflict algorithm**（事务内 SELECT → canonical_compare → INSERT/UPDATE → COMMIT，或 ROLLBACK/reject）；effects 表须支持 §6.4（方案 A / B 二选一） |
+| §6 / §6.4 | 语义已冻结 | 语义不变；commit marker 明确 = D1 `COMMIT` / D2 `EFFECT_COMMIT + fsync`；`UNIQUE` 不单独构成 conflict semantics |
+| §14.6 / 14.7 | 通用断言 | 按 D1 语义重写断言（rollback → retry → 恰一笔；COMMIT → rebuild → no-op） |
+| §14.11 | 重放幂等 | 补 I1/I2/I3 可判定断言 + journal 不 append |
+| §14.12 | 无 | **新增** `test_sqlite_transaction_atomicity`（A 前 COMMIT / B 后 COMMIT / C conflict） |
+
+**未变**：P0-2 UMA POC 仍 **BLOCKED（HA-007）**；HA-006 Human 倾向 **D1 SQLite** 但**未正式冻结**；LIVE = **NO-GO**；未改任何生产代码。
 
 > **诚实声明（关键）**：P0-2 的 UMA POC（`identifier→condition_id→token_id` 映射、outcome encoding、settlement identity）在本环境 **POC BLOCKED**（无链上 RPC / 原始事件 fixture / 外网）。**P0-2 未关闭 ⇒ 禁止生产 settlement 实现**。V4 冻结其余可冻结语义；POC 需 Human 提供环境（HA-007）。**不得用“显然合理 / 应为 0/1 / token 天然唯一”替代证据。**
 
@@ -141,88 +159,135 @@ enum SettlementStatus { PENDING, ACCOUNTING, ACCOUNTED, RETRYABLE, FAILED }
 | RETRYABLE | 当前处理失败，可安全重放 |
 | FAILED | 不可自动恢复，需人工（终态） |
 
-### 5.4 Commit Points（★ 明确“effect 已生效”的权威点）
-```
-S1  durable insert SettlementRecord(status=PENDING)          [持久化]
-S2  status=ACCOUNTING                                        [持久化]
-S3  compute authoritative pnl_delta                          [内存]
-S4  persist pnl_delta                                        [持久化]
-S5  RiskEngine.apply_pnl_effect(settlement_id, pnl_delta, settlement_ts)
-        → 修改 daily_pnl 与 写入 accounting_effect_id   【同一 durable 原子提交】★
-S6  status=ACCOUNTED                                         [持久化]
-```
-> **S5 的原子提交是“PnL effect 已生效”的权威证明**。重启后：`accounting_effect_id` 存在 ⇔ effect 已应用。
+### 5.4 Commit Points（★ 与 D1 单事务一致，冻结）
 
-### 5.5 Crash Case A–E（状态转移表，冻结）
-| Case | 崩溃点 | 重启时观测 | 重启动作 |
-|------|--------|-----------|----------|
-| **A** | claim 前后（PENDING） | 无 effect | 从 S2 继续，最终 exactly-once |
-| **B** | S4 后、S5 前（ACCOUNTING，有 pnl_delta，无 effect） | 无 `accounting_effect_id` | 重放 S5：应用 effect + 写 effect_id |
-| **C** | S5 原子提交后、S6 前（有 effect_id，未 ACCOUNTED） | **有 `accounting_effect_id`** | **不得再次应用**；仅补 S6 标 ACCOUNTED |
-| **D** | ACCOUNTED + 重复事件 | status=ACCOUNTED | no-op，额外 PnL=0 |
-| **E** | ACCOUNTED + 冲突 outcome | 同 id 异 outcome | reject + alert + **no PnL mutation** |
+```
+S1  durable insert SettlementRecord(status=PENDING)                [持久化]
+S2  status = ACCOUNTING                                            [持久化]
+S3  compute authoritative pnl_delta                                [内存]
+S4  durable accounting transaction（D1：单一 SQLite 事务）          [持久化 ★]
+        BEGIN IMMEDIATE;
+          1. validate settlement identity（settlement_id/token_id/outcome 与事件一致）
+          2. 使用 authoritative pnl_delta（S3，§3 权威口径）
+          3. INSERT AccountingEffect
+          4. UPDATE SettlementRecord:
+                 pnl_delta            = authoritative delta
+                 accounting_effect_id = effect identity
+                 status               = ACCOUNTED
+        COMMIT;     ★ COMMIT 是 effect 已生效的唯一 durable boundary
+S5  after COMMIT: update in-memory daily_pnl projection           [内存]
+S6  recovery / reconciliation verification:
+        committed effect exists && SettlementRecord == ACCOUNTED   [读]
+```
 
-> Case C 是设计关键：**靠 `accounting_effect_id` 识别 effect 已应用**，而非仅靠 status。
+> **关键**：`daily_pnl` **不在 durable transaction 中**，由 committed effects 派生（§5.6 Q2-A）。COMMIT 成功 = AccountingEffect committed = settlement accounting committed = **effect 已生效**；COMMIT 前 crash = rollback，两者皆未提交（§5.5 D1 Case A/B）。D1 下**不存在**「effect 已 durable、status 尚未 ACCOUNTED」的中间态。
+
+### 5.5 Crash Case A–E（区分 D1 / D2，冻结）
+
+| Case | D1：SQLite single transaction | D2：WAL / multi-record |
+|------|-------------------------------|-------------------------|
+| **A** | transaction 尚未开始 / 未提交 → rollback → **retry** | pending（无 EFFECT_COMMIT）→ **retry** |
+| **B** | transaction 中途 crash → SQLite rollback → **retry** | pnl 已准备但无 EFFECT_COMMIT → **retry** |
+| **C** | **不存在于 D1 single transaction**（由 atomicity 排除） | EFFECT_COMMIT 已 durable、业务状态 marker 尚未完成 → **不重复 effect，只补状态** |
+| **D** | committed + duplicate → **no-op** | committed + duplicate → **no-op** |
+| **E** | same settlement_id + different canonical payload → **conflict / no mutation** | 同左 |
+
+> **Case C 是 D2 两阶段 / 多记录 WAL 模型的可能状态；D1 single SQLite transaction 中由 atomicity 排除**——D1 下 COMMIT 成功 ⇒ effect 与 ACCOUNTED 同 durable；COMMIT 前 crash ⇒ rollback ⇒ 两者皆未提交。
 > 恢复判定与唯一恢复模块见 **§5.6（Q5/Q6）**。
 
-### 5.6 Durable Transaction Boundary（v6：7 问 + I1–I3）
+### 5.6 Durable Transaction Boundary（v7：7 问 + I1–I3 + D1 单事务 / D2）
 
 **Q1｜谁是 durable accounting authority？**
-`SettlementJournal`（持久 store：D1 SQLite 表 / D2 WAL 文件）是**唯一 durable accounting authority**。`RiskEngine` / `daily_pnl` **不是** authority。
+唯一 **`SettlementJournal`**（持久 store：D1 SQLite 表 / D2 WAL 文件）。`RiskEngine` / `daily_pnl` **不是** authority。
 
 **Q2｜daily_pnl 是 A 还是 B？**
-**选 A：effect replay projection**。持久 store 为权威；`daily_pnl(day) = Σ pnl_delta(committed effects, 其 UTC 日)`；内存 `DailyLossLimit.daily_pnl` 仅为**缓存**，启动由 journal 重建。→ 由此**消除 v5「把内存变更与磁盘提交绑原子」的不可实现矛盾**。
+**选 A：effect replay projection**。`daily_pnl(day) = Σ pnl_delta(committed effects, 其 UTC 日)`；内存 `DailyLossLimit.daily_pnl` 仅为 **cache**，启动由 journal 重建。→ 消除「把内存变更与磁盘提交绑原子」的不可实现矛盾。
 
 **Q3｜transaction boundary 是什么？**
-durable 事务**只覆盖持久产物**：`AccountingEffect(settlement_id, pnl_delta, settlement_ts, applied_at)` + `SettlementRecord.status/pnl_delta`。**内存 daily_pnl 不在边界内**（它是 committed effects 的派生投影）。
-- D1：同一 `BEGIN IMMEDIATE … COMMIT`。
-- D2：`append EFFECT_COMMIT` 后 `fsync` 为边界点。
+- **D1**：`AccountingEffect` + `SettlementRecord.status=ACCOUNTED` 在**同一个** `BEGIN IMMEDIATE … COMMIT` 中完成。**内存 daily_pnl 不在 boundary 内**。
+- **D2**：多记录模型，boundary = `EFFECT_COMMIT + fsync`。
+- **术语不混用**：D1 的 durable boundary = **SQLite COMMIT**；D2 的 durable boundary = **EFFECT_COMMIT + fsync**。
 
 **Q4｜什么标记定义「effect 已生效」？**
-**committed `AccountingEffect` 记录**（D1：`effects` 表行；D2：`EFFECT_COMMIT` 记录）。
+- **D1**：**SQLite COMMIT 成功** = authoritative accounting commit（effects 行 + settlements 行同事务生效）。
+- **D2**：**EFFECT_COMMIT + fsync** = durable accounting boundary。
 
 **Q5｜crash 后如何判定？**
-| 观测 | 判定 |
-|------|------|
-| 无 committed effect（仅 PENDING/prepare） | effect **未生效** |
-| 有 committed effect | effect **已生效** |
-| 尾部半写/CRC 失败（D2）或未提交事务（D1 自动回滚） | **transaction incomplete** → 丢弃尾部至最后有效 commit |
+| 模型 | 观测 | 判定 | 动作 |
+|------|------|------|------|
+| D1 | 无 committed effect（未 COMMIT / rollback） | effect **未生效** | retry accounting（§5.5 A/B） |
+| D1 | 有 committed effect（COMMIT 成功） | effect **已生效**（status 必已 ACCOUNTED） | rebuild projection → **no-op** |
+| D2 | 无 EFFECT_COMMIT | 未生效 | retry |
+| D2 | 有 EFFECT_COMMIT | 已生效 | **不重复 effect**；若业务 marker 未完成仅补状态（§5.5 C） |
 
 **Q6｜restart recovery 由哪个唯一模块执行？**
-唯一模块 **`SettlementRecovery`**，启动时执行一次、先于 `TradingGate` Ready：读 journal → 建 committed 集合 C → **重建 daily_pnl 投影** → 续处理未提交项 → 设置 Gate。**RiskEngine 不自恢复。**
+唯一模块 **`SettlementRecovery`**，启动时执行一次、**先于 `TradingGate` Ready**：读 journal → 建 committed 集合 C → 重建 daily_pnl 投影 → 续处理未提交项 → 设置 Gate。**RiskEngine 不自恢复。**
 
 **Q7｜如何证明（I1–I3）？**
 - **I1 PnL consistency**：任意静止点 `daily_pnl(day) == Σ_{committed e, UTCday(e)==day} e.pnl_delta`；内存缓存必须等于该投影（恢复后强制成立）。
 - **I2 settlement_id uniqueness**：∀ `settlement_id`，committed effect 数 **≤ 1**（D1 `UNIQUE(settlement_id)` / D2 append-once）。
-- **I3 replay determinism**：`rebuild` 是 committed 集合的**纯函数**；`rebuild(journal)` 多次 == 一次；**重放只读、不产生新 effect**。
+- **I3 replay determinism**：`rebuild` 是 committed 集合的**纯函数**；`rebuild(journal)` 多次 == 一次；**重放只读、不产生新 effect、journal 不发生 append**。
 
-**D1｜SQLite 协议**
+**D1｜SQLite 单事务协议（本轮冻结为 single transaction）**
 ```
--- 表
-settlements(settlement_id TEXT PRIMARY KEY, token_id, outcome, settlement_ts, pnl_delta, status)
-effects    (settlement_id TEXT PRIMARY KEY, pnl_delta, settlement_ts, applied_at)   -- UNIQUE 即 I2
--- 提交（Q4 的 commit marker）
+-- 表（effects 保存完整 identity，方案 A，见下）
+settlements(settlement_id TEXT PRIMARY KEY, token_id, outcome,
+            settlement_ts, pnl_delta, status, accounting_effect_id)
+effects    (settlement_id TEXT PRIMARY KEY, token_id, outcome,
+            pnl_delta, settlement_ts, applied_at)
+
+-- S4 durable accounting transaction（★ effect 已生效的唯一 durable boundary）
 BEGIN IMMEDIATE;
-  INSERT INTO effects(settlement_id,pnl_delta,settlement_ts,applied_at) VALUES(...); -- 唯一冲突→conflict
-  UPDATE settlements SET status='ACCOUNTED', pnl_delta=? WHERE settlement_id=?;
+  1. 验证 settlement identity（settlement_id / token_id / outcome 与事件一致）
+  2. 计算 authoritative pnl_delta（§3，内存）
+  3. INSERT INTO effects(settlement_id, token_id, outcome, pnl_delta, settlement_ts, applied_at)
+     VALUES(:id, :token, :outcome, :delta, :ts, :now);
+  4. UPDATE settlements
+     SET status='ACCOUNTED',
+         pnl_delta=:delta,
+         accounting_effect_id=:effect_id
+     WHERE settlement_id=:id;
 COMMIT;
--- 重建投影（I1/I3）
-SELECT settlement_ts, SUM(pnl_delta) FROM effects GROUP BY utc_day(settlement_ts);
+-- COMMIT 成功 = AccountingEffect committed = settlement accounting committed = effect 已生效
+
+-- 重建投影（I1/I3，只读）
+SELECT utc_day(settlement_ts), SUM(pnl_delta) FROM effects GROUP BY utc_day(settlement_ts);
 ```
 
-**D2｜WAL 协议**
+**D1｜durable conflict algorithm（§6.4 的持久落地，冻结）**
+```
+BEGIN IMMEDIATE;
+  existing = SELECT settlement_id, token_id, outcome, pnl_delta, settlement_ts
+             FROM effects WHERE settlement_id = :id;
+  IF existing == NONE:
+      validate canonical payload（§6.4）
+      INSERT effects / UPDATE settlements → ACCOUNTED
+      COMMIT;
+  ELSE:
+      canonical_compare(settlement_id, token_id, outcome, pnl_delta, settlement_ts)
+      IF identical: COMMIT;  -- no-op
+      ELSE: ROLLBACK; reject conflict;  -- 不累加、不覆盖、无第二笔 effect
+```
+> `PRIMARY KEY(settlement_id)` / `UNIQUE(settlement_id)` **只能保证唯一行**，**不能单独替代 payload conflict semantics**。
+
+**Effects 表必须支持 §6.4（二选一，必须明确）**
+- **方案 A**：effects 保存完整 identity：`settlement_id, token_id, outcome, pnl_delta, settlement_ts, applied_at`。
+- **方案 B**：effects 不保存 token/outcome，但**事务内**从 settlements 读取 `token_id, outcome, pnl_delta, settlement_ts` 完成 deterministic canonical comparison。
+- **不得**只写 UNIQUE 就宣称 conflict semantics 已闭合。
+
+**D2｜WAL 协议（保留，术语与 D1 不混用）**
 ```
 record := [len:u32][crc32:u32][type:u8][json]
 append(SETTLE_PENDING, settlement_id, token_id, outcome, settlement_ts)
-append(EFFECT_COMMIT, settlement_id, pnl_delta, settlement_ts); fsync()   -- ★ durability + commit(Q4)
-replay: 顺序读；遇 len/crc 校验失败 → truncate 自此(Q5 incomplete)；
+append(EFFECT_COMMIT, settlement_id, pnl_delta, settlement_ts); fsync()   -- ★ D2 的 durable accounting boundary
+replay: 顺序读；遇 len/crc 校验失败 → truncate 自此（半写/无效尾部）；
         C = 所有 EFFECT_COMMIT 的 (id, delta, ts)
 重建 daily_pnl = Σ_{C} delta 按 UTC 日（只读，不 append → I3）
 ```
 
-**运行时顺序（修正 v5）**：**先 durable commit（写 journal）→ 再更新内存缓存**。若两步间 crash，恢复期由 journal 重建缓存 ⇒ I1 恢复成立。
+**运行时顺序（冻结）**：**先 durable COMMIT（journal）→ 再更新 in-memory daily_pnl cache**。若两步间 crash，恢复期由 journal 重建缓存 ⇒ I1 恢复成立。
 
-**与 §5.5 绑定**：A/B/C 的判定即 Q5 表（无 commit→续提交；有 commit→跳过 effect、仅补 `ACCOUNTED`）；D/E 由 **I2 + conflict 检测**处理。
+**与 §5.5 绑定**：A/B/C 的判定即 Q5 表；D/E 由 **I2 + durable conflict algorithm** 处理。
 
 无论哪种实现：`daily_pnl` 必须由 committed effects **可重建**（I1/I3），不以内存为权威。
 
@@ -252,11 +317,16 @@ X / -10  然后  X / -20
 > 落地以 **§5.6 的 commit marker** 为准：**先 durable commit，再更新内存投影**（§5.6 Q2-A/Q4）；`daily_pnl` 由 committed effects 可重建（I1/I3），内存非权威。
 - `pnl_delta` 本身可选持久化（S4），用于审计与重放校验。
 
-### 6.4 Effect Identity 比较（必改3，冻结）
+### 6.4 Effect Identity 比较（必改3，冻结；D1 落地见 §5.6 durable conflict algorithm）
 
 - `same settlement_id` + `same canonical pnl_delta` + `same settlement_ts` → **no-op**（幂等）。
-- `same settlement_id` + **任一不同**（`pnl_delta` / `settlement_ts` / `token_id` / `outcome`）→ **conflict**：`reject + alert + no PnL mutation`（**不累加、不覆盖**）。
+- `same settlement_id` + **任一不同**（`pnl_delta` / `settlement_ts` / `token_id` / `outcome`）→ **conflict**：`reject + alert + no PnL mutation`（**不累加、不覆盖、无第二笔 effect**）。
 - **canonical 定义**：按持久化字段的**确定性规范序列化**比较（`pnl_delta` 用固定精度/定点字符串，避免浮点歧义）。重算必须 **bit-exact** 复现；否则视为 conflict，禁止“近似相等”放行。
+- **语义冻结示例**：
+  - Same request：`X / -10 / ts1` 重复三次 → **只产生一个 committed effect**。
+  - Conflict：`X / -10 / ts1` 之后 `X / -20 / ts1` → **reject，no overwrite，no addition，no second effect**。
+  - Restart：committed effect 存在 + 重启 + 同一请求 → **no-op**。
+- **实现约束**：持久落地即 §5.6 的 durable conflict algorithm（事务内 canonical_compare）；`UNIQUE(settlement_id)` 只能保证唯一行，**不得单独**宣称 conflict semantics 已闭合。
 
 ---
 
@@ -314,10 +384,11 @@ Exactly-Once Settlement Accounting
 启动流程（冻结）：
 ```
 ① 读取持久化 SettlementRecord / effect 记录
-② status ∈ {PENDING, ACCOUNTING, RETRYABLE}：
-     - 有 accounting_effect_id → 补标 ACCOUNTED（Case C）
-     - 无 → 重放 effect（Case B/A）
-③ status == ACCOUNTED → 跳过（绝不二次记账）
+② 无 committed effect（D1：未 COMMIT / 已 rollback；status ∈ {PENDING, ACCOUNTING, RETRYABLE}）
+     → 重放 accounting（§5.5 D1 Case A/B；D2 Case B）
+③ 有 committed effect：
+     D1：status 必已 ACCOUNTED（同一事务）→ no-op（§5.5 D1 Case D）
+     D2：业务状态 marker 未完成 → 仅补状态、不重复 effect（§5.5 D2 Case C）
 ④ 需要时重放/加载 FillLedger 持久化以支撑重算（否则以 SettlementRecord 为权威重放源）
 ⑤ 恢复后 TradingGate 遵循既有 FAIL-CLOSED
 ```
@@ -364,16 +435,17 @@ UMA/Settlement Authority
 | 14.3 | `test_multiple_fills_settle_pnl` | 多 fill 聚合 = 权威（引用 `test_ledger_multi_fill_settle_by_token`） |
 | 14.4 | `test_partial_fill_pnl` | requested/filled/unfilled/settled 正确 |
 | 14.5 | `test_cross_utc_day_bucket` | 23:59:59 vs 00:00:00 分桶正确（归属 settlement_ts 日） |
-| **14.6** | **Test A：`test_crash_after_risk_effect`** | effect 提交后 crash → 重启**恰好一笔** PnL。断言：`effect_count == 1`；持久化 effect 存在（`accounting_effect_id`/WAL `commit`）；`status == ACCOUNTED`；重启重放为 **no-op**；`daily_pnl` 增量 == 该 `pnl_delta` |
-| **14.7** | **Test B：`test_crash_before_risk_effect`** | effect 前 crash → 重启后**成功且恰好一笔**。断言：`effect_count == 1`；持久化 effect 存在；`status == ACCOUNTED`；再次重启重放为 **no-op**；无重复 PnL |
+| **14.6** | **Test A：`test_crash_after_risk_effect`**（D1） | COMMIT 成功 → crash → restart：**committed effect == 1**、`status == ACCOUNTED`、rebuild、no-op。断言：`effect_count == 1`；`status == ACCOUNTED`；`daily_pnl == expected delta`；replay **不新增 effect** |
+| **14.7** | **Test B：`test_crash_before_risk_effect`**（D1） | transaction 尚未 COMMIT → crash → SQLite rollback → restart → retry → **恰好一笔 committed effect** → ACCOUNTED。断言：`effect_count == 1`；`status == ACCOUNTED`；`daily_pnl == expected delta`；第二次 restart = **no-op** |
 | 14.8 | `test_restart_duplicate_event` | ACCOUNTED + 重启 + 重复事件 → 额外 PnL=0 |
 | 14.9 | `test_daily_loss_circuit_breaker_integration` | 全链 Settlement→…→`check_gates` 拒单 |
 | 14.10 | `test_risk_state_projection_daily_pnl` | 引擎/投影/Python 一致，非 0 |
-| 14.11 | `test_settlement_recovery_replay_idempotent` | `SettlementRecovery` 重放 N 次：`daily_pnl` 不变（I1）、不新增 effect（I3）、journal 只读 |
+| 14.11 | `test_settlement_recovery_replay_idempotent` | 断言：**I1** `daily_pnl(day) == Σ committed delta`；**I2** 每 `settlement_id` committed effect ≤ 1；**I3** replay N 次 == replay 一次；`effect_count` 不增加；**journal 不发生 append** |
+| **14.12** | **`test_sqlite_transaction_atomicity`**（新增） | 直接证明 D1 transaction boundary：**A** crash before COMMIT → `effect_count == 0`、`status != ACCOUNTED`、`daily_pnl` 不变；**B** COMMIT → `effect_count == 1`、`status == ACCOUNTED`、`daily_pnl` 正确；**C** same settlement_id + different canonical payload → reject、`effect_count` 仍为 1、`daily_pnl` 不变 |
 
-鉴别力：短路 effect 幂等 / 去掉持久化恢复 → 14.1/14.6/14.7 必 FAILED。
-`effect_count` 定义：持久化 `AccountingEffect` / WAL `commit` 中该 `settlement_id` 的记录条数（**必须恰为 1**）。
-并断言 **I1–I3**：`daily_pnl(day) == Σ committed delta`（I1）、`effect_count == 1`（I2）、`SettlementRecovery` 重放多次 == 一次且不新增 effect（I3）。
+鉴别力：短路 effect 幂等 / 去掉持久化恢复 → 14.1/14.6/14.7/14.12 必 FAILED。
+`effect_count` 定义：持久化 `AccountingEffect` / WAL `EFFECT_COMMIT` 中该 `settlement_id` 的记录条数（**必须恰为 1**）。
+并断言 **I1–I3**：`daily_pnl(day) == Σ committed delta`（I1）、`effect_count == 1`（I2）、`SettlementRecovery` 重放多次 == 一次且不新增 effect、journal 不 append（I3）。
 
 ---
 
@@ -419,7 +491,7 @@ UMA/Settlement Authority
 |----|------|
 | P0-1 PnL 权威/net 冻结 | ✅ |
 | P0-2 UMA POC | ❌ **BLOCKED（HA-007）** |
-| P0-3 accounting effect 身份 + commit point + Case A–E | ✅ 语义冻结 |
+| P0-3 accounting effect 身份 + commit point + Case A–E | ✅ 语义冻结（v7 已统一 D1 单事务模型，消除 Case C 冲突；**待独立复审**） |
 | P0-4 report_pnl 幂等（含重启） | ✅ 语义冻结 |
 | Lock≠ExactlyOnce 约束 | ✅（§7） |
 | P1-1 net 措辞 | ✅（§3.3/HA-002） |
@@ -429,4 +501,4 @@ UMA/Settlement Authority
 | Test A/B 自动化 | ✅ 规格（§14.6/14.7） |
 | Allowed/Forbidden | ✅（§15） |
 
-> **P0-2 未关闭 ⇒ G1-001 仍不能进入 implementation。** 提交后 STOP，等待独立审查；请提供 HA-007 环境以解除 POC BLOCKED。
+> **P0-2 未关闭 ⇒ G1-001 仍不能进入 implementation。** v7 提交后 **STOP**，等待独立复审；本表不构成自证 / APPROVED。请提供 HA-007 环境以解除 POC BLOCKED。
