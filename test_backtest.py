@@ -326,6 +326,61 @@ class TestMetricsCalculator(unittest.TestCase):
         self.assertGreater(metrics["sharpe_ratio"], 0)
         self.assertGreaterEqual(metrics["max_drawdown"], 0)
 
+    def test_sharpe_annualization_follows_sampling(self):
+        """R5-007：Sharpe 年化因子应按真实采样间隔缩放，而非硬编码 365×4。"""
+        now = datetime.now(timezone.utc)
+        values = [10000, 10100, 10050, 10200, 10150, 10300]
+        curve = [
+            EquityPoint(
+                timestamp=now + timedelta(hours=i),
+                cash=v,
+                positions_value=0,
+                equity=v,
+                open_positions=0,
+                realized_pnl=0,
+                unrealized_pnl=0,
+            )
+            for i, v in enumerate(values)
+        ]
+        calc = MetricsCalculator()
+
+        # 采样间隔 6h vs 1h → periods_per_year 之比 = 6 → Sharpe 之比 = sqrt(6)
+        m6 = calc.calculate(curve, [], 10000, total_hours=6 * len(curve))
+        m1 = calc.calculate(curve, [], 10000, total_hours=1 * len(curve))
+
+        self.assertGreater(m1["sharpe_ratio"], 0)
+        self.assertAlmostEqual(
+            m1["sharpe_ratio"] / m6["sharpe_ratio"],
+            6 ** 0.5,
+            places=3,
+        )
+
+    def test_avg_hold_time_same_token_multiple_rounds(self):
+        """R5-008：同一 token 多次开平应按 FIFO 一一配对，而非覆盖错配。"""
+        now = datetime.now(timezone.utc)
+
+        def rec(hours, action):
+            return TradeRecord(
+                timestamp=now + timedelta(hours=hours),
+                action=action,
+                token_id="tok",
+                direction="BUY_YES",
+                quantity=10,
+                price=0.4,
+                cost=4,
+            )
+
+        trades = [
+            rec(0, TradeAction.OPEN),
+            rec(10, TradeAction.OPEN),
+            rec(12, TradeAction.SETTLE),
+            rec(20, TradeAction.SETTLE),
+        ]
+        metrics = MetricsCalculator().calculate([], trades, 10000, total_hours=20)
+        # FIFO：SETTLE@12 ↔ OPEN@0 (12h)，SETTLE@20 ↔ OPEN@10 (10h) → 平均 11h。
+        # 旧实现会覆盖 OPEN，只剩 2h 的错误结果。
+        self.assertAlmostEqual(metrics["avg_hold_hours"], 11.0, places=1)
+
     def test_max_drawdown(self):
         """测试最大回撤计算。"""
         now = datetime.now(timezone.utc)

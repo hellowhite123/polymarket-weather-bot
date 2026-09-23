@@ -85,7 +85,7 @@ impl BackgroundDaemon {
             let mut sweep_tick = interval(Duration::from_secs(60));
 
             // 启动时先跑一轮全部
-            let _ = rpc.check_health_all();
+            rpc.check_health_all().await;
 
             loop {
                 tokio::select! {
@@ -186,8 +186,9 @@ impl BackgroundDaemon {
 
     /// 等待后台任务结束（阻塞）
     pub async fn join(&self) {
-        let mut guard = self.handle.lock().unwrap();
-        if let Some(h) = guard.take() {
+        // 取出 JoinHandle 后立即释放锁，避免持锁跨越 await（clippy await_holding_lock）。
+        let handle = self.handle.lock().unwrap().take();
+        if let Some(h) = handle {
             let _ = h.await;
         }
     }
@@ -196,7 +197,7 @@ impl BackgroundDaemon {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clob::{ClobClient, ClobConfig};
+    use crate::clob::ClobConfig;
     use crate::wallet::WalletManager;
     use std::sync::Arc;
     use tempfile::tempdir;
@@ -204,7 +205,7 @@ mod tests {
     fn make_executor() -> Arc<FastExecutor> {
         let dir = tempdir().unwrap();
         let path = dir.path().join("daemon_test.json");
-        let mut mgr = WalletManager::new(&path);
+        let mgr = WalletManager::new(&path);
         let _ = mgr.import_private_key(
             "0xbd8024c85d743569c738586185ca743b40af25c0144f8bf1cc7c719bd987a56b",
             "pw",

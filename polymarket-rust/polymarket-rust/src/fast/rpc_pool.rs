@@ -378,7 +378,7 @@ impl RpcPool {
                         node.mark_dead();
                         false
                     } else {
-                        let block = hex_str_to_u64(&rpc_resp.result.as_str().unwrap_or("0x0"));
+                        let block = hex_str_to_u64(rpc_resp.result.as_str().unwrap_or("0x0"));
                         let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
                         node.record_sample(latency_ms, block);
                         true

@@ -10,7 +10,8 @@
 
 import logging
 import math
-from typing import Dict, List, Optional, Tuple
+from collections import deque
+from typing import Deque, Dict, List, Optional, Tuple
 
 from .models import TradeRecord, EquityPoint, TradeAction
 
@@ -59,8 +60,9 @@ class MetricsCalculator:
         else:
             annualized = roi
 
-        # Sharpe / Sortino
-        sharpe, sortino = self._calc_sharpe_sortino(equity_curve)
+        # Sharpe / Sortino（R5-007：年化因子按实际采样间隔反推）
+        periods_per_year = self._resolve_periods_per_year(equity_curve, total_hours)
+        sharpe, sortino = self._calc_sharpe_sortino(equity_curve, periods_per_year)
 
         # 最大回撤
         max_dd, max_dd_pct = self._calc_max_drawdown(equity_curve)
@@ -112,6 +114,25 @@ class MetricsCalculator:
     # ================================================================
     # 内部计算方法
     # ================================================================
+
+    def _resolve_periods_per_year(
+        self,
+        equity_curve: List[EquityPoint],
+        total_hours: float,
+    ) -> float:
+        """R5-007：由实际采样间隔反推年化因子，替代硬编码 `365 × 4`。
+
+        采样间隔 = `total_hours / len(equity_curve)`（小时）；
+        `periods_per_year = 365.25 × 24 / 采样间隔`。
+
+        信息不足（`total_hours ≤ 0` 或点数 < 2）时回退旧默认（每 6h 一个采样点）。
+        """
+        n = len(equity_curve)
+        if total_hours > 0 and n >= 2:
+            interval_hours = total_hours / n
+            if interval_hours > 0:
+                return (365.25 * 24) / interval_hours
+        return 365 * 4
 
     def _calc_sharpe_sortino(
         self,
@@ -191,20 +212,22 @@ class MetricsCalculator:
     def _calc_avg_hold_time(self, trades: List[TradeRecord]) -> float:
         """计算平均持仓时间 (小时)。
 
-        匹配 OPEN 和 SETTLE 交易, 计算时间差。
+        R5-008：同一 token 可能多次开平。旧实现用 `Dict[token_id] = OPEN` 会互相
+        覆盖，导致同 token 的多笔开仓只剩最后一笔被匹配、持仓时间错配。
+        改为按 token 维护 OPEN 队列、FIFO 匹配最早未平仓的 OPEN，保证一一对应。
         """
-        open_trades: Dict[str, TradeRecord] = {}
+        open_queues: Dict[str, Deque[TradeRecord]] = {}
         hold_times = []
 
         for t in trades:
             if t.action == TradeAction.OPEN:
-                open_trades[t.token_id] = t
+                open_queues.setdefault(t.token_id, deque()).append(t)
             elif t.action == TradeAction.SETTLE:
-                if t.token_id in open_trades:
-                    open_t = open_trades[t.token_id]
+                queue = open_queues.get(t.token_id)
+                if queue:
+                    open_t = queue.popleft()
                     delta = (t.timestamp - open_t.timestamp).total_seconds() / 3600
                     hold_times.append(delta)
-                    del open_trades[t.token_id]
 
         return (sum(hold_times) / len(hold_times)) if hold_times else 0.0
 

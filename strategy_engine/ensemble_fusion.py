@@ -227,15 +227,35 @@ class AdaptiveWeighter:
             brier = max(acc.brier_score, self._epsilon)
             raw_weights[source] = time_decay / brier
 
-        # 确保最低权重
-        for source in raw_weights:
-            raw_weights[source] = max(raw_weights[source], self._min_weight)
-
-        # 归一化
+        # 常规归一化
         total = sum(raw_weights.values())
-        if total > 0:
-            return {s: w / total for s, w in raw_weights.items()}
-        return raw_weights
+        if total <= 0:
+            return raw_weights
+
+        weights = {s: w / total for s, w in raw_weights.items()}
+
+        # R5-004：`min_weight` 语义 = 归一化后的最小占比，而非归一化前的绝对量。
+        # 先抬升低于下限的源，再二次归一化；若多个下限叠加使总和 > 1，则只从
+        # 「高于下限」的源按比例扣回超量，保证最终总和恰为 1 且各源 ≥ 下限。
+        floor = self._min_weight
+        if floor <= 0:
+            return weights
+
+        n = len(weights)
+        # 下限之和 ≥ 1 时无法同时满足，退化为均匀权重
+        if floor * n >= 1.0:
+            return {s: 1.0 / n for s in weights}
+
+        weights = {s: max(w, floor) for s, w in weights.items()}
+        excess = sum(weights.values()) - 1.0
+        if excess > 0:
+            above = {s: w - floor for s, w in weights.items() if w > floor}
+            above_total = sum(above.values())
+            if above_total > 0:
+                scale = (above_total - excess) / above_total
+                for s, extra in above.items():
+                    weights[s] = floor + extra * scale
+        return weights
 
     def compute_initial_weights(self, sources: List[str]) -> Dict[str, float]:
         """无历史数据时的均匀权重。"""

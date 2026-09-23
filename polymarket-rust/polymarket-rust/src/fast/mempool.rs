@@ -873,22 +873,19 @@ impl MempoolMonitor {
         }
 
         // 1. 频率限制（最先做，因为最轻量且能挡住风暴）
-        self.rate_limiter.check(token_id).map_err(|e| {
+        self.rate_limiter.check(token_id).inspect_err(|_e| {
             self.total_blocked.fetch_add(1, Ordering::Relaxed);
-            e
         })?;
 
         // 2. 去重
         let fp = OrderFingerprint::new(token_id, side, price, size, tick);
-        self.dedup.check(&fp).map_err(|e| {
+        self.dedup.check(&fp).inspect_err(|_e| {
             self.total_blocked.fetch_add(1, Ordering::Relaxed);
-            e
         })?;
 
         // 3. Pending 容量
-        self.pending.check_capacity(token_id).map_err(|e| {
+        self.pending.check_capacity(token_id).inspect_err(|_e| {
             self.total_blocked.fetch_add(1, Ordering::Relaxed);
-            e
         })?;
 
         // 4. 抢跑检测
@@ -1168,7 +1165,7 @@ mod tests {
     #[test]
     fn test_pending_capacity_limit() {
         let tracker = PendingOrderTracker::new(Duration::from_secs(30), 2, 100);
-        let make_entry = |i: u32| {
+        let make_entry = |_i: u32| {
             let fp = OrderFingerprint::new("t", Side::Buy, 0.5, 10.0, 0.01);
             PendingEntry {
                 fingerprint: fp,
@@ -1238,11 +1235,13 @@ mod tests {
 
     #[test]
     fn test_monitor_blocks_rate_limit() {
-        let mut cfg = MempoolConfig::default();
-        cfg.global_rate = 1.0; // 1 op/sec
-        cfg.global_burst = 0.002; // burst = 2 tokens
-        cfg.token_rate = 100.0; // per-token rate high enough not to trigger
-        cfg.dedup_window = Duration::from_secs(0); // 关闭去重，单独测限频
+        let cfg = MempoolConfig {
+            global_rate: 1.0, // 1 op/sec
+            global_burst: 0.002, // burst = 2 tokens
+            token_rate: 100.0, // per-token rate high enough not to trigger
+            dedup_window: Duration::from_secs(0), // 关闭去重，单独测限频
+            ..Default::default()
+        };
         let mon = MempoolMonitor::with_config(cfg);
         // 前两笔消耗 burst，第三笔因速率限制被拒绝
         mon.check_before_submit("t", Side::Buy, 0.51, 10.0, 0.01)
@@ -1320,10 +1319,9 @@ mod tests {
 
     #[test]
     fn test_monitor_sweep() {
-        let mon = MempoolMonitor::with_config({
-            let mut c = MempoolConfig::default();
-            c.pending_ttl = Duration::from_millis(10); // 极短 TTL 方便测试
-            c
+        let mon = MempoolMonitor::with_config(MempoolConfig {
+            pending_ttl: Duration::from_millis(10), // 极短 TTL 方便测试
+            ..Default::default()
         });
         mon.on_submitted("tmp-1".to_string(), "t", Side::Buy, 0.5, 10.0, 0.01, None);
         std::thread::sleep(Duration::from_millis(20));

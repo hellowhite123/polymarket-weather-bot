@@ -700,7 +700,7 @@ mod tests {
     fn make_executor() -> (Arc<WalletManager>, FastExecutor) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ks.json");
-        let mut mgr = WalletManager::new(&path);
+        let mgr = WalletManager::new(&path);
         let addr = mgr.import_private_key(TEST_PK, "pw").unwrap();
         let arc = Arc::new(mgr);
         let exec = FastExecutor::new(arc.clone(), ClobConfig::default()).unwrap();
@@ -751,7 +751,7 @@ mod tests {
         // 但本地阶段计时已被记录。
         let (_mgr, exec) = make_executor();
         let addr = exec.hot.cached_addresses()[0].clone();
-        let params = FastOrderParams::buy(&addr, None, "12345", 0.5, 100.0);
+        let _params = FastOrderParams::buy(&addr, None, "12345", 0.5, 100.0);
 
         // 不连网：直接调用内部构建验证签名路径
         let wallet = exec.hot.get(&addr).unwrap();
@@ -786,7 +786,7 @@ mod tests {
     #[test]
     fn test_with_presign_allocates_pool() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = WalletManager::new(dir.path().join("ks.json"));
+        let mgr = WalletManager::new(dir.path().join("ks.json"));
         let _ = mgr.import_private_key(TEST_PK, "pw").unwrap();
         let exec = FastExecutor::new(Arc::new(mgr), ClobConfig::default())
             .unwrap()

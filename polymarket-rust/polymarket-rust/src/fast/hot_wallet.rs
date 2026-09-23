@@ -332,7 +332,7 @@ mod tests {
     fn setup() -> (Arc<WalletManager>, String, tempfile::TempDir) {
         let dir = tempdir().unwrap();
         let path = dir.path().join("keystore.json");
-        let mut mgr = WalletManager::new(&path);
+        let mgr = WalletManager::new(&path);
         let addr = mgr.import_private_key(TEST_PK, "pw").unwrap();
         (Arc::new(mgr), addr, dir)
     }

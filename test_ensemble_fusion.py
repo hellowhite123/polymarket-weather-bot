@@ -7,9 +7,12 @@
 4. 贝叶斯融合在历史数据充足时收敛到数据驱动值
 """
 
+from datetime import datetime, timezone
+
 from strategy_engine.ensemble_fusion import (
     AdaptiveWeighter,
     FusionEngine,
+    SourceAccuracy,
     SourceAccuracyTracker,
 )
 
@@ -67,3 +70,31 @@ def test_adaptive_weighter_uniform_without_history():
     weights = w.compute_initial_weights(["noaa", "ecmwf", "caiyun"])
     assert abs(sum(weights.values()) - 1.0) < 1e-9
     assert abs(weights["noaa"] - 1.0 / 3.0) < 1e-9
+
+
+def test_adaptive_weighter_min_weight_after_normalization():
+    """R5-004：min_weight 应作为「归一化后最小占比」生效，且总和恒为 1。"""
+    now = datetime.now(timezone.utc)
+    accuracies = {
+        "a": SourceAccuracy(source="a", brier_score=0.01, last_updated=now),
+        "b": SourceAccuracy(source="b", brier_score=0.5, last_updated=now),
+        "c": SourceAccuracy(source="c", brier_score=0.9, last_updated=now),
+    }
+    weights = AdaptiveWeighter(min_weight=0.1).compute_weights(accuracies, now=now)
+
+    assert set(weights) == {"a", "b", "c"}
+    assert all(v >= 0.1 - 1e-9 for v in weights.values()), weights
+    assert abs(sum(weights.values()) - 1.0) < 1e-9, weights
+
+
+def test_adaptive_weighter_min_weight_infeasible_falls_back_uniform():
+    """多下限之和 ≥ 1（不可行）时退化为均匀权重，仍满足总和 = 1。"""
+    now = datetime.now(timezone.utc)
+    accuracies = {
+        "a": SourceAccuracy(source="a", brier_score=0.01, last_updated=now),
+        "b": SourceAccuracy(source="b", brier_score=0.5, last_updated=now),
+        "c": SourceAccuracy(source="c", brier_score=0.9, last_updated=now),
+    }
+    weights = AdaptiveWeighter(min_weight=0.5).compute_weights(accuracies, now=now)
+
+    assert all(abs(v - 1.0 / 3.0) < 1e-9 for v in weights.values()), weights

@@ -17,11 +17,11 @@ use crate::clob::client::ClobConfig;
 use crate::fast::executor::FastExecutor;
 use crate::fast::fill_records::{compute_slippage, FillLedger, FillRecord};
 use crate::fast::market_events::{MarketEvent, TradeEvent};
-use crate::fast::order_state::{OrderState, OrderStore};
-use crate::fast::risk_engine::{RiskConfig, RiskEngine};
+use crate::fast::order_state::OrderStore;
+use crate::fast::risk_engine::RiskEngine;
 use crate::fast::state_sync::{RecoveryAction, RecoveryPlan};
 use crate::fast::trading_gate::TradingGate;
-use crate::order::{OrderFlow, PlaceOrderParams};
+use crate::order::OrderFlow;
 use crate::types::enums::{OrderType, Side};
 use crate::wallet::WalletManager;
 
@@ -100,7 +100,7 @@ fn map_execution_status(status: &str, success: bool) -> pb::ExecutionStatus {
 /// - live/pending 等 → 0（未成交）
 fn filled_size_from_status(
     status: &str,
-    requested: f64,
+    _requested: f64,
     side: Side,
     making: &str,
     taking: &str,
@@ -641,8 +641,8 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
 
         // ★ P0-004 幂等：原子 claim_or_retry 占位，并发下只允许一个请求下单；
         // 可重试终态（Rejected/Expired/Cancelled）会被重置并重新下单。
-        if !order.order_id.is_empty() {
-            if self
+        if !order.order_id.is_empty()
+            && self
                 .order_store
                 .claim_or_retry(
                     order.order_id.clone(),
@@ -662,7 +662,6 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
                     return Ok(Response::new(existing_order_result(&existing)));
                 }
             }
-        }
 
         // G4 / P1-RISK-006：记录下单价，供取消时按 remaining×price 释放预留。
         if !order.order_id.is_empty() {
@@ -1040,8 +1039,6 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
     }
 
     /// 取消所有订单。
-
-    /// 取消所有订单。
     async fn cancel_all(
         &self,
         _request: Request<pb::CancelAllRequest>,
@@ -1180,7 +1177,7 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
         &self,
         request: Request<pb::AddWalletRequest>,
     ) -> Result<Response<pb::WalletResult>, Status> {
-        let req = request.into_inner();
+        let _req = request.into_inner();
         tracing::warn!("AddWallet 通过 gRPC 传输私钥（安全红线），已拒绝");
         // 拒绝通过 RPC 导入私钥，强制使用本地 keystore
         return Ok(Response::new(pb::WalletResult {
@@ -1246,6 +1243,8 @@ fn parse_gas_price_hex_to_gwei(hex: &str) -> Result<u64, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // RiskConfig 仅在测试中使用；放在测试模块内可避免 lib 构建下的 unused import 告警。
+    use crate::fast::risk_engine::RiskConfig;
 
     #[test]
     fn test_map_execution_status_matched_is_filled() {
@@ -1649,7 +1648,7 @@ mod tests {
         );
         let rs = service.risk_state.lock().await;
         assert!(
-            rs.positions.get("tok-n").is_none(),
+            !rs.positions.contains_key("tok-n"),
             "非 Trade 事件不应污染 RiskEngine/risk_state 仓位"
         );
         // task 仍存活（非 Trade 事件被安全吞掉，未退出）
@@ -1668,7 +1667,7 @@ mod tests {
         use crate::fast::trading_gate::TradingGateState;
         use pb::execution_service_server::ExecutionService;
 
-        let mut service = ExecutionServiceImpl::new_mock();
+        let service = ExecutionServiceImpl::new_mock();
         service.trading_gate.set_state(TradingGateState::Ready);
         // 不挂载 risk_engine → 走「RiskEngine 未初始化」失败路径
 
@@ -1713,9 +1712,11 @@ mod tests {
         service.trading_gate.set_state(TradingGateState::Ready);
 
         // 挂载一个「单市场上限极小」的风控引擎，并把仓位占满到上限
-        let mut cfg = RiskConfig::default();
-        cfg.max_position_per_market = 100.0;
-        cfg.max_global_exposure = 100_000.0;
+        let cfg = RiskConfig {
+            max_position_per_market: 100.0,
+            max_global_exposure: 100_000.0,
+            ..Default::default()
+        };
         let engine = RiskEngine::new(cfg);
         engine.post_check("t1", Side::Buy, 100.0, 100.0, 0.0, 10_000.0);
         service.set_risk_engine(Arc::new(engine));
@@ -1819,9 +1820,11 @@ mod tests {
     #[tokio::test]
     async fn test_rebuild_open_order_reserves_rebuilds_reserve() {
         let mut service = ExecutionServiceImpl::new_mock();
-        let mut cfg = RiskConfig::default();
-        cfg.max_position_per_market = 100.0;
-        cfg.max_global_exposure = 100.0;
+        let cfg = RiskConfig {
+            max_position_per_market: 100.0,
+            max_global_exposure: 100.0,
+            ..Default::default()
+        };
         let engine = Arc::new(RiskEngine::new(cfg));
         service.set_risk_engine(engine.clone());
 
@@ -1856,9 +1859,11 @@ mod tests {
     #[tokio::test]
     async fn test_rebuild_open_order_reserves_skips_sell() {
         let mut service = ExecutionServiceImpl::new_mock();
-        let mut cfg = RiskConfig::default();
-        cfg.max_position_per_market = 100.0;
-        cfg.max_global_exposure = 100.0;
+        let cfg = RiskConfig {
+            max_position_per_market: 100.0,
+            max_global_exposure: 100.0,
+            ..Default::default()
+        };
         let engine = Arc::new(RiskEngine::new(cfg));
         service.set_risk_engine(engine.clone());
 
@@ -2016,8 +2021,10 @@ mod tests {
     /// G1-003 / P0-RISK-003：Gas 超上限必须被风控拒绝（阈值逻辑不变，仅验证接线所依赖的门）。
     #[test]
     fn test_gas_protection_rejects_high_gwei() {
-        let mut cfg = RiskConfig::default();
-        cfg.max_gas_gwei = 500;
+        let cfg = RiskConfig {
+            max_gas_gwei: 500,
+            ..Default::default()
+        };
         let engine = RiskEngine::new(cfg);
         assert!(
             engine
@@ -2086,9 +2093,11 @@ mod tests {
         use crate::fast::order_state::OrderStateStatus;
 
         let mut service = ExecutionServiceImpl::new_mock();
-        let mut cfg = RiskConfig::default();
-        cfg.max_position_per_market = 100.0;
-        cfg.max_global_exposure = 100.0;
+        let cfg = RiskConfig {
+            max_position_per_market: 100.0,
+            max_global_exposure: 100.0,
+            ..Default::default()
+        };
         let engine = Arc::new(RiskEngine::new(cfg));
         service.set_risk_engine(engine.clone());
 
@@ -2134,9 +2143,11 @@ mod tests {
         use crate::fast::order_state::OrderStateStatus;
 
         let mut service = ExecutionServiceImpl::new_mock();
-        let mut cfg = RiskConfig::default();
-        cfg.max_position_per_market = 100.0;
-        cfg.max_global_exposure = 1000.0;
+        let cfg = RiskConfig {
+            max_position_per_market: 100.0,
+            max_global_exposure: 1000.0,
+            ..Default::default()
+        };
         let engine = Arc::new(RiskEngine::new(cfg));
         service.set_risk_engine(engine.clone());
 

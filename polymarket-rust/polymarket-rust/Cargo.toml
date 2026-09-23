@@ -14,6 +14,7 @@ pbkdf2 = "0.12"           # 密码派生密钥
 rand = "0.8"              # 随机数生成
 base64 = "0.22"            # base64 编解码
 hex = "0.4"               # 十六进制编解码
+zeroize = "1"             # 私钥/派生密钥内存擦除
 
 # 以太坊 / EIP-712 签名
 ethers = { version = "2.0", features = ["rustls"] }

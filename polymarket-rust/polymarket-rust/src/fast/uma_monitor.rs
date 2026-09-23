@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 // ============================================================================
 // 常量
@@ -166,12 +166,15 @@ impl UmaMonitor {
         self.polls.fetch_add(1, Ordering::Relaxed);
 
         let current_block = self.rpc.block_number().await?;
-        let mut last = self.last_block.write().unwrap();
 
-        let from_block = if *last == 0 {
-            current_block.saturating_sub(self.block_range)
-        } else {
-            *last + 1
+        // 读取上次块高后立即释放锁，避免持锁跨越 await（clippy await_holding_lock）。
+        let from_block = {
+            let last = self.last_block.read().unwrap();
+            if *last == 0 {
+                current_block.saturating_sub(self.block_range)
+            } else {
+                *last + 1
+            }
         };
         let to_block = current_block;
 
@@ -180,7 +183,9 @@ impl UmaMonitor {
         }
 
         let events = self.fetch_uma_logs(from_block, to_block).await?;
-        *last = to_block;
+
+        // 轮询成功后再推进游标（失败时保持原值，下次重试同一区间）。
+        *self.last_block.write().unwrap() = to_block;
 
         Ok(events)
     }

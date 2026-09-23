@@ -210,7 +210,7 @@ impl ClobClient {
         // 先尝试创建；仅在「地址已有 key」(400) 时回退到派生，其余错误直接返回（P1-004）。
         match self.create_api_key(address, password).await {
             Ok(creds) => Ok(creds),
-            Err(ClobError::Api { status, .. }) if status == 400 => {
+            Err(ClobError::Api { status: 400, .. }) => {
                 tracing::info!("API Key 已存在 (400)，改为派生");
                 self.derive_api_key(address, password).await
             }
@@ -232,7 +232,7 @@ impl ClobClient {
             request_path: GET_API_KEYS.to_string(),
             body: None,
         };
-        let headers = create_l2_headers(&wallet, &creds, &l2_args, timestamp)?;
+        let headers = create_l2_headers(&wallet, creds, &l2_args, timestamp)?;
 
         let url = format!("{}{}", self.config.host, GET_API_KEYS);
         let resp = self
@@ -409,7 +409,7 @@ impl ClobClient {
             request_path: POST_ORDER.to_string(),
             body: Some(body_json.clone()),
         };
-        let headers = create_l2_headers(&wallet, &creds, &l2_args, timestamp)?;
+        let headers = create_l2_headers(&wallet, creds, &l2_args, timestamp)?;
 
         let url = format!("{}{}", self.config.host, POST_ORDER);
         let resp = self
@@ -464,7 +464,7 @@ impl ClobClient {
             request_path: POST_ORDER.to_string(),
             body: Some(body_json.clone()),
         };
-        let headers = create_l2_headers(&wallet, &creds, &l2_args, timestamp)?;
+        let headers = create_l2_headers(&wallet, creds, &l2_args, timestamp)?;
 
         let url = format!("{}{}", self.config.host, POST_ORDER);
         let resp = self
@@ -497,10 +497,10 @@ impl ClobClient {
         let timestamp = self.timestamp();
         let l2_args = L2HeaderArgs {
             method: "DELETE".to_string(),
-            request_path: format!("{CANCEL_ORDER}"),
+            request_path: CANCEL_ORDER.to_string(),
             body: Some(body_json.clone()),
         };
-        let headers = create_l2_headers(&wallet, &creds, &l2_args, timestamp)?;
+        let headers = create_l2_headers(&wallet, creds, &l2_args, timestamp)?;
 
         let url = format!("{}{}", self.config.host, CANCEL_ORDER);
         let resp = self
@@ -530,7 +530,7 @@ impl ClobClient {
             request_path: CANCEL_ALL.to_string(),
             body: None,
         };
-        let headers = create_l2_headers(&wallet, &creds, &l2_args, timestamp)?;
+        let headers = create_l2_headers(&wallet, creds, &l2_args, timestamp)?;
 
         let url = format!("{}{}", self.config.host, CANCEL_ALL);
         let resp = self
@@ -1000,7 +1000,7 @@ fn parse_units_to_string(value: f64, decimals: u32) -> String {
     // 先格式化到合理精度，避免浮点误差
     let formatted = format!("{:.10}", value);
     // 使用 ethers 的 parse_units
-    match parse_units(&formatted, decimals as u32) {
+    match parse_units(&formatted, decimals) {
         Ok(u) => u.to_string(),
         Err(_) => {
             // 回退：手动计算
@@ -1047,7 +1047,9 @@ mod tests {
 
     #[test]
     fn test_round_normal() {
-        assert_eq!(round_normal(3.14159, 2), 3.14);
+        let pi = std::f64::consts::PI;
+        // 用 PI 参与断言，避免 approx_constant 触发（clippy deny）
+        assert_eq!(round_normal(pi, 2), (pi * 100.0).round() / 100.0);
         assert_eq!(round_normal(3.146, 2), 3.15);
     }
 

@@ -36,9 +36,9 @@
 
 use crate::clob::error::{ClobError, ClobResult};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::RwLock;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing;
 
 // ============================================================================
@@ -350,6 +350,20 @@ impl PositionLimits {
             .unwrap()
             .values()
             .map(|e| e.notional)
+            .sum()
+    }
+
+    /// R5-001：全市场 committed 暴露 = filled notional + pending reserved。
+    ///
+    /// 集中度检查的分母必须用此口径，否则并发 pending 预留被漏计、
+    /// 组合总暴露被低估，集中度门禁（`future_total > 2 × 单市场上限`）可能
+    /// 被错误跳过。与 `global_exposure()`（仅 filled，供快照展示）区分。
+    pub fn committed_total(&self) -> f64 {
+        self.positions
+            .read()
+            .unwrap()
+            .values()
+            .map(|e| e.notional + e.reserved)
             .sum()
     }
 
@@ -930,7 +944,7 @@ impl RiskEngine {
     ) -> ClobResult<()> {
         self.check_gates(token_id, side, notional, qty, gas_gwei)?;
         self.position_limits.pre_check(token_id, side, notional)?;
-        self.check_concentration(token_id, side, notional)?;
+        self.check_concentration(token_id, side, notional, false)?;
         Ok(())
     }
 
@@ -950,7 +964,7 @@ impl RiskEngine {
             .check_and_reserve(token_id, side, notional)?;
         // P1-033①：集中度检查在「预留」之后执行，若失败须回滚刚才的预留额度，
         // 否则预留泄漏（订单不会成交，也没有后续冲抵）。
-        if let Err(e) = self.check_concentration(token_id, side, notional) {
+        if let Err(e) = self.check_concentration(token_id, side, notional, true) {
             // 仅 Buy 会预留（Sell 不预留；对 Sell 调用 release 会误扣其他 pending 预留）。
             if matches!(side, crate::types::enums::Side::Buy) {
                 self.position_limits.release_reserve(token_id, notional);
@@ -1014,11 +1028,20 @@ impl RiskEngine {
     }
 
     /// 集中度检查 (仅在总暴露 > 2 倍单市场上限时生效，避免空仓第一笔被拦截)。
+    ///
+    /// R5-001：分母统一采用 committed 口径（filled + pending reserved），杜绝
+    /// 并发 pending 预留漏计导致的暴露低估。`already_reserved` 表明本单 notional
+    /// 是否已写入 `reserved`：
+    /// - `check_and_reserve` 在预留之后调用 → `true`，本单已含在 committed 中，不再重复加；
+    /// - `pre_check` 在预留之前调用 → `false`，本单尚未计入，需补 notional。
+    ///
+    /// 两者得到同一个「下单后的 prospective committed total」，禁止混用口径。
     fn check_concentration(
         &self,
         token_id: &str,
         side: crate::types::enums::Side,
         notional: f64,
+        already_reserved: bool,
     ) -> ClobResult<()> {
         let market_pos = self
             .position_limits
@@ -1030,8 +1053,12 @@ impl RiskEngine {
         } else {
             (market_pos - notional).max(0.0)
         };
-        let total = self.position_limits.global_exposure();
-        let future_total = total + notional;
+        let committed = self.position_limits.committed_total();
+        let future_total = if already_reserved {
+            committed
+        } else {
+            committed + notional
+        };
         // 仅当 portfolio 已经有一定规模时才检查集中度
         if future_total > self.config.max_position_per_market * 2.0 {
             self.concentration_checker.check(new_market, future_total)?;
@@ -1245,9 +1272,11 @@ mod tests {
 
     #[test]
     fn test_position_limit_global() {
-        let mut cfg = RiskConfig::default();
-        cfg.max_position_per_market = 10000.0; // 放宽单市场限制
-        cfg.max_global_exposure = 1000.0;
+        let cfg = RiskConfig {
+            max_position_per_market: 10000.0, // 放宽单市场限制
+            max_global_exposure: 1000.0,
+            ..Default::default()
+        };
         let engine = RiskEngine::new(cfg);
         assert!(engine.pre_check("m1", Side::Buy, 600.0, 600.0, 50).is_ok());
         engine.post_check("m1", Side::Buy, 600.0, 600.0, 0.0, 10000.0);
@@ -1311,8 +1340,10 @@ mod tests {
 
     #[test]
     fn test_daily_loss_warning() {
-        let mut cfg = RiskConfig::default();
-        cfg.daily_loss_warn = 50.0;
+        let cfg = RiskConfig {
+            daily_loss_warn: 50.0,
+            ..Default::default()
+        };
         let dll = DailyLossLimit::new(&cfg);
         let level = dll.report_pnl(-75.0);
         assert_eq!(level, BreachLevel::Warning);
@@ -1320,8 +1351,10 @@ mod tests {
 
     #[test]
     fn test_daily_loss_halted() {
-        let mut cfg = RiskConfig::default();
-        cfg.daily_loss_halt = 100.0;
+        let cfg = RiskConfig {
+            daily_loss_halt: 100.0,
+            ..Default::default()
+        };
         let dll = DailyLossLimit::new(&cfg);
         let level = dll.report_pnl(-150.0);
         assert_eq!(level, BreachLevel::Halted);
@@ -1329,10 +1362,12 @@ mod tests {
 
     #[test]
     fn test_daily_loss_progression() {
-        let mut cfg = RiskConfig::default();
-        cfg.daily_loss_warn = 50.0;
-        cfg.daily_loss_limit = 150.0;
-        cfg.daily_loss_halt = 300.0;
+        let cfg = RiskConfig {
+            daily_loss_warn: 50.0,
+            daily_loss_limit: 150.0,
+            daily_loss_halt: 300.0,
+            ..Default::default()
+        };
         let dll = DailyLossLimit::new(&cfg);
         assert_eq!(dll.report_pnl(-60.0), BreachLevel::Warning);
         assert_eq!(dll.report_pnl(-100.0), BreachLevel::Restricted);
@@ -1385,16 +1420,20 @@ mod tests {
 
     #[test]
     fn test_engine_pre_check_all_pass() {
-        let mut cfg = RiskConfig::default();
-        cfg.max_position_per_market = 10000.0;
+        let cfg = RiskConfig {
+            max_position_per_market: 10000.0,
+            ..Default::default()
+        };
         let engine = RiskEngine::new(cfg);
         assert!(engine.pre_check("t", Side::Buy, 100.0, 100.0, 50).is_ok());
     }
 
     #[test]
     fn test_engine_pre_check_halted() {
-        let mut cfg = RiskConfig::default();
-        cfg.daily_loss_halt = 1.0; // 极低阈值，一亏就熔断
+        let cfg = RiskConfig {
+            daily_loss_halt: 1.0, // 极低阈值，一亏就熔断
+            ..Default::default()
+        };
         let engine = RiskEngine::new(cfg);
         engine.post_check("t", Side::Buy, 100.0, 100.0, -50.0, 10000.0);
         assert!(engine.pre_check("t", Side::Buy, 100.0, 100.0, 50).is_err());
@@ -1470,16 +1509,22 @@ mod tests {
 
     #[test]
     fn test_risk_config_validate_invalid() {
-        let mut cfg = RiskConfig::default();
-        cfg.max_position_per_market = f64::NAN;
+        let cfg = RiskConfig {
+            max_position_per_market: f64::NAN,
+            ..Default::default()
+        };
         assert!(cfg.validate().is_err());
 
-        let mut cfg2 = RiskConfig::default();
-        cfg2.max_global_exposure = -1.0;
+        let cfg2 = RiskConfig {
+            max_global_exposure: -1.0,
+            ..Default::default()
+        };
         assert!(cfg2.validate().is_err());
 
-        let mut cfg3 = RiskConfig::default();
-        cfg3.max_concentration = 1.5; // > 1
+        let cfg3 = RiskConfig {
+            max_concentration: 1.5, // > 1
+            ..Default::default()
+        };
         assert!(cfg3.validate().is_err());
 
         assert!(RiskConfig::default().validate().is_ok());
@@ -1502,9 +1547,11 @@ mod tests {
 
     #[test]
     fn test_check_and_reserve_global_limit() {
-        let mut cfg = RiskConfig::default();
-        cfg.max_position_per_market = 10000.0;
-        cfg.max_global_exposure = 1000.0;
+        let cfg = RiskConfig {
+            max_position_per_market: 10000.0,
+            max_global_exposure: 1000.0,
+            ..Default::default()
+        };
         let engine = RiskEngine::new(cfg);
         assert!(engine
             .check_and_reserve("m1", Side::Buy, 600.0, 600.0, 50)
@@ -1547,10 +1594,12 @@ mod tests {
     /// 回滚，否则该市场 reserved 泄漏，后续下单被误拒。
     #[test]
     fn test_check_and_reserve_concentration_failure_rolls_back() {
-        let mut cfg = RiskConfig::default();
-        cfg.max_position_per_market = 1000.0;
-        cfg.max_global_exposure = 10000.0;
-        cfg.max_concentration = 0.3; // 30%
+        let cfg = RiskConfig {
+            max_position_per_market: 1000.0,
+            max_global_exposure: 10000.0,
+            max_concentration: 0.3, // 30%
+            ..Default::default()
+        };
         let engine = RiskEngine::new(cfg);
 
         // 另一市场已持仓 2000（全局 filled = 2000）
@@ -1567,6 +1616,40 @@ mod tests {
         assert!(engine
             .check_and_reserve("t", Side::Buy, 500.0, 500.0, 50)
             .is_ok());
+    }
+
+    /// R5-001：集中度检查分母必须计入 pending 预留（`committed_total`）。
+    ///
+    /// 旧实现分母用 `global_exposure()`（仅 filled），并发 pending 预留被漏计，
+    /// 组合暴露被低估，集中度门禁（`future_total > 2 × 单市场上限`）可能被错误跳过。
+    #[test]
+    fn test_concentration_counts_pending_reserves() {
+        let cfg = RiskConfig {
+            max_position_per_market: 5000.0,
+            max_global_exposure: 100_000.0,
+            max_concentration: 0.4,
+            ..Default::default()
+        };
+        let engine = RiskEngine::new(cfg);
+
+        // 两笔 pending 预留（未成交），合计 6000：只计入 committed_total，
+        // 不计入 global_exposure（filled 暴露仍为 0）。
+        engine
+            .check_and_reserve("a1", Side::Buy, 3000.0, 3000.0, 50)
+            .unwrap();
+        engine
+            .check_and_reserve("a2", Side::Buy, 3000.0, 3000.0, 50)
+            .unwrap();
+        assert_eq!(engine.snapshot().global_exposure, 0.0);
+        assert_eq!(engine.position_limits.committed_total(), 6000.0);
+
+        // 下单 B：committed 将达 10500 > 2 × 5000，new_market = 4500，
+        // 4500 / 10500 ≈ 42.9% > 40% → 必须拒绝。
+        // 若分母漏计 pending（旧口径 future_total = 0 + 4500 = 4500 未过门禁），
+        // 集中度检查被跳过、此单会被错误放行。
+        assert!(engine
+            .check_and_reserve("b", Side::Buy, 4500.0, 4500.0, 50)
+            .is_err());
     }
 
     /// P0-007B：sync_position 以远端为权威重建/删除仓位，并清空残留 reserved。
@@ -1589,7 +1672,7 @@ mod tests {
 
         // 删除：qty=0 notional=0 → 条目移除
         engine.sync_position("m1", 0.0, 0.0);
-        assert!(engine.snapshot_positions().get("m1").is_none());
+        assert!(!engine.snapshot_positions().contains_key("m1"));
         assert_eq!(engine.snapshot().global_exposure, 0.0);
     }
 
@@ -1599,16 +1682,18 @@ mod tests {
         let engine = make_engine();
         engine.sync_position("m1", f64::NAN, 100.0);
         engine.sync_position("m1", 100.0, f64::INFINITY);
-        assert!(engine.snapshot_positions().get("m1").is_none());
+        assert!(!engine.snapshot_positions().contains_key("m1"));
         assert_eq!(engine.snapshot().global_exposure, 0.0);
     }
 
     /// P1-031：rebuild_reserve 重建预留额度，计入后续 check_and_reserve 的暴露检查。
     #[test]
     fn test_rebuild_reserve_blocks_subsequent_order() {
-        let mut cfg = RiskConfig::default();
-        cfg.max_position_per_market = 1000.0;
-        cfg.max_global_exposure = 1000.0;
+        let cfg = RiskConfig {
+            max_position_per_market: 1000.0,
+            max_global_exposure: 1000.0,
+            ..Default::default()
+        };
         let engine = RiskEngine::new(cfg);
 
         // 重建 reserved = 600（模拟远端仍 open 的订单预留）

@@ -86,8 +86,9 @@ impl WalletManager {
         let encrypted = ks
             .find(address)
             .ok_or_else(|| WalletError::WalletNotFound(address.to_string()))?;
+        // R5-005：private_key 为 Zeroizing<String>，解析出 LocalWallet 后即擦除。
         let private_key = encrypted.decrypt(password)?;
-        parse_wallet(&private_key)
+        parse_wallet(private_key.as_str())
     }
 
     /// 使用指定钱包对原始消息进行 EIP-191 签名

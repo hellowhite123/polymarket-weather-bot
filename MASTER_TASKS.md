@@ -122,6 +122,105 @@
 
 ---
 
+### 阶段四（09-23 伯森先生授权开工）：Round 05 代码整改（9 项）
+
+> 授权来源：伯森先生 09-23 逐条整改指令（P0×1 + P1×4 + P2×4）。
+> 红线不变：**不得改交易语义 / 改 RiskConfig 阈值含义 / 改聚合器或 gRPC 契约 / 大规模重构 / 触碰 cold_wallet 与签名算法标准实现**。
+> 通用 Allowed：仅改下列各条指定文件 + 对应测试。通用 Forbidden：上述红线全部适用。
+> 通用验收锚点：`cargo clippy --all-targets` 0 error；`cargo test` 全绿；`python -m pytest -q` 全绿。
+
+#### R5-001（P0）集中度检查 TOCTOU — 分母漏计 pending 预留
+
+- **Status**: 🔧 FIXED（09-23：`PositionLimits::committed_total()` + `check_concentration(..., already_reserved)` 统一分母；新增 `test_concentration_counts_pending_reserves`；risk_engine 35 测试全绿）
+- **Owner**: OpenCode
+- **Allowed Files**: `polymarket-rust/polymarket-rust/src/fast/risk_engine.rs`
+- **Forbidden**: `strategy_engine/`、`RiskConfig` 阈值含义、`ConcentrationChecker` 判定语义
+- **改法**: `PositionLimits` 新增 `committed_total()`（`notional + reserved` 全市场求和）；`check_concentration` 分母改用 committed 口径，统一「要么全含 reserved、要么都事后加」，禁止混用（`check_and_reserve` 已预留 → 不重复加 notional；`pre_check` 未预留 → 补本单 notional）。
+- **Required Tests**: 新增「预留下单 A 后下单 B，集中度校验必须计入 A 的 pending 额度」回归测试；既有 `test_check_and_reserve_concentration_failure_rolls_back` 保持全绿。
+- **Acceptance**: clippy 无新增告警；新增测试通过；cargo test 全绿。
+
+#### R5-002（P1）建议仓位与资本脱节 — MultiSource `_calculate_quantity`
+
+- **Status**: ⬜ TODO（09-23 伯森先生指示**先跳过**：目标公式「价差优势 = |market_dev| 对标 dev_mu 的偏离度」及 quantity/USDC 单位口径待确认后实施）
+- **Owner**: OpenCode
+- **Allowed Files**: `strategy_engine/strategies/multi_source.py`、`strategy_engine/config.py`（仅新增 MultiSource 参数字段）、`test_multi_source.py`
+- **Forbidden**: 改 `max_position_per_market` 硬顶语义；改其他策略；改聚合器 Kelly 实现
+- **改法**: `MultiSourceStrategyParams` 增加 `kelly_fraction`（默认 0.25）、`base_capital`（默认 1000.0，与 `.env` AGG_* 对齐）；`_calculate_quantity` 改为 `kelly_fraction × base_capital × 价差优势系数`，`cap = min(结果, max_position_per_market)`。
+- **Required Tests**: `test_multi_source.py` 断言金额受资本约束、同 dev_sigma 下不随 market_dev 线性飙升。
+- **Acceptance**: pytest 全绿。
+
+#### R5-003（P1）clean_forecast 原地修改输入
+
+- **Status**: 🔧 FIXED（09-23：方案 A `copy.deepcopy` 兑现不可变契约；新增 `test_cleaning.py` 2 用例）
+- **Owner**: OpenCode
+- **Allowed Files**: `weather_data_ingestion/cleaning.py`、`test_cleaning.py`（或新增用例）
+- **Forbidden**: 改清洗数值语义
+- **改法**: 方案 A（推荐）——`clean_forecast` 先 `copy.deepcopy(forecast)` 再清洗并返回新对象，兑现「不修改原始对象」契约；核对 `pipeline.py`/回测/`strategy_engine` 调用点语义一致。
+- **Required Tests**: 断言 `clean_forecast(f) is not f` 且原对象字段不变。
+- **Acceptance**: pytest 全绿。
+
+#### R5-004（P1）AdaptiveWeighter 最小权重语义
+
+- **Status**: 🔧 FIXED（09-23：归一化后再抬升 + 超量按比例扣回；+2 测试含不可行退化）
+- **Owner**: OpenCode
+- **Allowed Files**: `strategy_engine/ensemble_fusion.py`、`test_ensemble_fusion.py`
+- **Forbidden**: 改 Brier/衰减公式
+- **改法**: 先常规归一化得 `w_i`，再 `max(w_i, min_weight)`，二次归一化到 1；若多下限互斥致总和 > 1，按比例缩减超下限源的超量保证和 = 1。
+- **Required Tests**: 3 源、`min_weight=0.1`，断言任一源权重 ≥ 0.1 且总和 = 1；覆盖边界。
+- **Acceptance**: pytest 全绿。
+
+#### R5-005（P1）私钥/密码未零化
+
+- **Status**: 🔧 FIXED（09-23：`zeroize = "1"`；`decrypt` 返回 `Zeroizing<String>`，`encrypt`/`decrypt` 的 pk_bytes/derived_key/plaintext 均 `Zeroizing`；wallet 13 测试全绿）
+- **Owner**: OpenCode
+- **Allowed Files**: `polymarket-rust/polymarket-rust/Cargo.toml`（加 `zeroize = "1"`）、`src/wallet/keystore.rs`、`src/wallet/manager.rs`、`src/fast/hot_wallet.rs`（仅零化缓冲，不改签名算法）
+- **Forbidden**: 改 PBKDF2 迭代/AES-256-GCM 算法、改 cold_wallet、改签名标准实现
+- **改法**: `decrypt` 返回 `Zeroizing<Vec<u8>>`（或签名路径内以 `Zeroizing<Vec<u8>>` 承载私钥字节）；`encrypt` 的 `pk_bytes`/`derived_key` 用 `Zeroizing`；密码参数可保持 `&str`。
+- **Required Tests**: cargo test 全绿；代码审查确认签名流程私钥不在非 Zeroizing 缓冲长期存活。
+- **Acceptance**: cargo test 全绿。
+
+#### R5-006（P2）clippy 门禁修复
+
+- **Status**: 🔧 FIXED（09-23：`cargo clippy --all-targets` **0 error**；警告 82→23。`approx_constant` 用 PI 断言消除；`field_reassign_with_default` 全改结构体初始化；2 处 `await_holding_lock`（uma_monitor/daemon）改为 await 前释放锁；清理 unused/needless_borrow/casts 等。**残留 23 警告**：8 处 serde API 字段名 `non_snake_case`（JSON 契约，不可改名）、never-read/dead-code、complex type、too many args、is_empty 建议——均非资金类，记录在案）
+- **Owner**: OpenCode
+- **Allowed Files**: `polymarket-rust/polymarket-rust/src/**`（仅 clippy 整改）
+- **Forbidden**: 借 clippy 之机改业务语义/阈值
+- **改法**: `client.rs` 测试字面量改用 `std::f64::consts::PI` 消除 2 个 `approx_constant` error；`field_reassign_with_default` 改 `Struct { field, ..Default::default() }`；`uma_monitor.rs` 2 处 `await_holding_lock` 在 await 前 drop guard；清理 unused。
+- **Required Tests**: `cargo clippy --all-targets` 0 error；`cargo test` 全绿。
+- **Acceptance**: clippy 0 error；残留警告记录。
+
+#### R5-007（P2）权益曲线年化因子硬编码
+
+- **Status**: 🔧 FIXED（09-23：`_resolve_periods_per_year` 由 `total_hours / len(equity_curve)` 反推；+1 测试验证 Sharpe 按采样粒度 √缩放）
+- **Owner**: OpenCode
+- **Allowed Files**: `strategy_engine/backtest/metrics.py`、`test_backtest.py`
+- **Forbidden**: 改收益率序列定义
+- **改法**: `calculate()` 依据 `total_hours / len(equity_curve)` 反推实际采样间隔换算 `periods_per_year`，或加参数由调用方传入。
+- **Required Tests**: 若断言 Sharpe 需随新口径核对期望值。
+- **Acceptance**: pytest 全绿。
+
+#### R5-008（P2）持仓时间/分组统计用 token_id 表匹配
+
+- **Status**: 🔧 FIXED（09-23：改为按 token 维护 OPEN 队列 FIFO 配对，一一对应；+1 测试同 token 两次开平）
+- **Owner**: OpenCode
+- **Allowed Files**: `strategy_engine/backtest/metrics.py`、`strategy_engine/backtest/models.py`（如需加批次字段）、`test_backtest.py`
+- **Forbidden**: 改交易记录语义
+- **改法**: 为 `TradeRecord` 增加唯一 `batch_id`/`order_id`（OPEN 与对应 SETTLE 共享）按批次配对；或按时间序 FIFO 匹配同 token 的 OPEN↔CLOSE 保证一一对应。
+- **Required Tests**: 同 token 多次开平场景下持仓时间/胜率统计正确。
+- **Acceptance**: pytest 全绿。
+
+#### R5-009（P2）假健康检查
+
+- **Status**: 🔧 FIXED（09-23：改为扫描 `/proc/*/cmdline` 精确匹配 `-m market_discovery` 的存活探测，不误匹配自身；YAML 校验通过、探针本地返回 1（无守护进程）。⚠️ 本机无 Docker，`docker compose config` 未能实机执行）
+- **Owner**: OpenCode
+- **Allowed Files**: `docker-compose.yml`（app 段 healthcheck）
+- **Forbidden**: 改服务依赖/网络语义
+- **改法**: 改为真实探测（HTTP/gRPC 就绪端点，或进程存活 + 心跳输出），参照 polymorph 段 `nc -z localhost 50051`。
+- **Required Tests**: `docker compose config` 合法；app 失活时 healthcheck 转 unhealthy。
+- **Acceptance**: compose 配置合法。
+
+---
+
 ## 已闭环任务（历史）
 
 ### P0-02 Docker Secret 与环境变量一致性

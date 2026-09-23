@@ -102,7 +102,7 @@ fn main() {
 
     // ---------- 初始化：临时 keystore + 钱包 ----------
     let tmp = std::env::temp_dir().join(format!("latency_bench_{}.json", std::process::id()));
-    let mut mgr = WalletManager::new(&tmp);
+    let mgr = WalletManager::new(&tmp);
     let address = mgr
         .import_private_key(TEST_PK, TEST_PW)
         .expect("导入私钥失败");

@@ -66,7 +66,7 @@ pub fn build_l1_signature(wallet: &LocalWallet, timestamp: u64, nonce: u64) -> C
 
     let chain_id = U256::from(137u64);
 
-    let verifying_contract = [0u8; 32]; // 官方 verifying_contract 为 None → 编码为 32 字节 0
+    let _verifying_contract = [0u8; 32]; // 官方 verifying_contract 为 None → 编码为 32 字节 0
 
     let mut domain_input = Vec::with_capacity(32 * 5);
 

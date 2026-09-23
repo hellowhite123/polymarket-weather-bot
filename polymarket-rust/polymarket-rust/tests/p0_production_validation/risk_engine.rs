@@ -7,9 +7,11 @@ use polymarket_rust::types::enums::Side;
 
 #[test]
 fn p0_003_position_limit_per_market_rejected() {
-    let mut cfg = RiskConfig::default();
-    cfg.max_position_per_market = 500.0;
-    cfg.max_global_exposure = 100_000.0; // 放宽全局，聚焦单市场
+    let cfg = RiskConfig {
+        max_position_per_market: 500.0,
+        max_global_exposure: 100_000.0, // 放宽全局，聚焦单市场
+        ..Default::default()
+    };
     let engine = RiskEngine::new(cfg);
 
     // 开仓 400（< 500，通过）
@@ -25,9 +27,11 @@ fn p0_003_position_limit_per_market_rejected() {
 
 #[test]
 fn p0_003_global_exposure_rejected() {
-    let mut cfg = RiskConfig::default();
-    cfg.max_position_per_market = 10_000.0; // 放宽单市场
-    cfg.max_global_exposure = 1_000.0;
+    let cfg = RiskConfig {
+        max_position_per_market: 10_000.0, // 放宽单市场
+        max_global_exposure: 1_000.0,
+        ..Default::default()
+    };
     let engine = RiskEngine::new(cfg);
 
     assert!(engine.pre_check("m1", Side::Buy, 600.0, 600.0, 50).is_ok());
@@ -55,9 +59,11 @@ fn p0_003_sell_always_allowed_to_reduce_exposure() {
 /// 留在风控里，后续合法订单会被误拒。
 #[test]
 fn p0_003_check_and_reserve_over_limit_no_reserve_leak() {
-    let mut cfg = RiskConfig::default();
-    cfg.max_position_per_market = 500.0;
-    cfg.max_global_exposure = 100_000.0; // 放宽全局，聚焦单市场
+    let cfg = RiskConfig {
+        max_position_per_market: 500.0,
+        max_global_exposure: 100_000.0, // 放宽全局，聚焦单市场
+        ..Default::default()
+    };
     let engine = RiskEngine::new(cfg);
 
     // 预留 400（成功，reserved = 400）
@@ -84,9 +90,11 @@ fn p0_003_check_and_reserve_over_limit_no_reserve_leak() {
 /// P0-003（原子预留版·全局维度）：全局暴露超限拒单时 reserve 不泄漏。
 #[test]
 fn p0_003_check_and_reserve_global_over_limit_no_reserve_leak() {
-    let mut cfg = RiskConfig::default();
-    cfg.max_position_per_market = 10_000.0; // 放宽单市场
-    cfg.max_global_exposure = 1_000.0;
+    let cfg = RiskConfig {
+        max_position_per_market: 10_000.0, // 放宽单市场
+        max_global_exposure: 1_000.0,
+        ..Default::default()
+    };
     let engine = RiskEngine::new(cfg);
 
     // 市场 m1 预留 600（成功，全局 reserved = 600）

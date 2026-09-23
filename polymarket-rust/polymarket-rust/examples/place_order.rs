@@ -24,7 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("KEYSTORE_PATH").unwrap_or_else(|_| "keystore.json".to_string());
 
     // ===== 1. 初始化钱包管理器 =====
-    let mut wallet_mgr = WalletManager::load(&keystore_path)?;
+    let wallet_mgr = WalletManager::load(&keystore_path)?;
 
     // 如果钱包不存在则导入
     let address = if wallet_mgr.list_addresses().is_empty() {

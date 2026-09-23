@@ -126,7 +126,7 @@ fn get_order_raw_amounts(side: Side, size: f64, price: f64, config: RoundConfig)
 /// 将浮点数转为指定 decimals 的 uint256 字符串
 fn to_wei_string(value: f64, decimals: u32) -> String {
     let formatted = format!("{:.10}", value);
-    match parse_units(&formatted, decimals as u32) {
+    match parse_units(&formatted, decimals) {
         Ok(u) => u.to_string(),
         Err(_) => {
             let multiplier = 10f64.powi(decimals as i32);

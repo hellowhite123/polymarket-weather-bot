@@ -562,7 +562,7 @@ impl MarketEventPoller {
                 for (tid, orders) in &current {
                     let prev_orders = prev.get(tid);
                     for o in orders {
-                        let changed = prev_orders.map_or(true, |po| {
+                        let changed = prev_orders.is_none_or(|po| {
                             !po.iter().any(|p| {
                                 p.id == o.id
                                     && p.status == o.status
@@ -859,7 +859,7 @@ mod tests {
     fn test_poller_creation() {
         let poller = MarketEventPoller::new("https://clob.polymarket.com");
         let rx = poller.subscribe();
-        assert!(!rx.is_empty() == false); // Initially empty
+        assert!(rx.is_empty()); // Initially empty
     }
 
     /// P1-035：poll_trades 必须丢弃空/空白 trade_id，只放行合法成交。

@@ -398,7 +398,7 @@ impl NonceManager {
             // 先检查是否已耗尽（用不可变借用）
             let is_exhausted = stuck
                 .get(&nonce)
-                .map_or(true, |e| e.exhausted(self.max_retries));
+                .is_none_or(|e| e.exhausted(self.max_retries));
             if is_exhausted {
                 stuck.remove(&nonce);
                 tracing::warn!("nonce_manager: 放弃 nonce={} (已重试达上限)", nonce,);
@@ -622,7 +622,7 @@ mod tests {
     fn test_manager_pending_nonces() {
         let mgr = NonceManager::new(200);
         let n1 = mgr.next_nonce();
-        let n2 = mgr.next_nonce();
+        let _n2 = mgr.next_nonce();
         assert_eq!(mgr.pending_nonces(), vec![200, 201]);
         mgr.confirm(n1);
         assert_eq!(mgr.pending_nonces(), vec![201]);
