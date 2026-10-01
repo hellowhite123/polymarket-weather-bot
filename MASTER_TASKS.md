@@ -199,6 +199,7 @@
 - **Forbidden**: 改收益率序列定义
 - **改法**: `calculate()` 依据 `total_hours / len(equity_curve)` 反推实际采样间隔换算 `periods_per_year`，或加参数由调用方传入。
 - **Required Tests**: 若断言 Sharpe 需随新口径核对期望值。
+- **复审纠正（09-18，伯森先生）**: 确认 `total_hours` 生产定义 = **回测窗口首尾跨度**（`engine.py`：`events[0].deadline-48h → events[-1].deadline+1h`），**非** equity 曲线首尾；且 n 个点只有 **n-1** 个间隔。旧口径 `total_hours / len(equity_curve)` 分母错误（混用窗口/曲线 + 把 n 当间隔数），会低估间隔、放大年化。**纠正**：`_resolve_periods_per_year` 改为**优先由真实 `EquityPoint.timestamp` 反推** `interval=(last-first)/(n-1)`，时间戳不可用时回退 `total_hours/(n-1)`。测试改为 timestamp-based：`test_sharpe_annualization_follows_sampling`（1h vs 6h → √6）、`test_periods_per_year_uses_real_timestamps_not_total_hours`、`test_periods_per_year_fallback_uses_n_minus_1`；鉴别力验证：改回旧口径 3 测试必 FAILED。全量 pytest `111 passed`。
 - **Acceptance**: pytest 全绿。
 
 #### R5-008（P2）持仓时间/分组统计用 token_id 表匹配

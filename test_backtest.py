@@ -326,13 +326,12 @@ class TestMetricsCalculator(unittest.TestCase):
         self.assertGreater(metrics["sharpe_ratio"], 0)
         self.assertGreaterEqual(metrics["max_drawdown"], 0)
 
-    def test_sharpe_annualization_follows_sampling(self):
-        """R5-007：Sharpe 年化因子应按真实采样间隔缩放，而非硬编码 365×4。"""
-        now = datetime.now(timezone.utc)
-        values = [10000, 10100, 10050, 10200, 10150, 10300]
-        curve = [
+    @staticmethod
+    def _make_curve(now, step_hours, n=6):
+        values = [10000, 10100, 10050, 10200, 10150, 10300][:n]
+        return [
             EquityPoint(
-                timestamp=now + timedelta(hours=i),
+                timestamp=now + timedelta(hours=step_hours * i),
                 cash=v,
                 positions_value=0,
                 equity=v,
@@ -342,17 +341,67 @@ class TestMetricsCalculator(unittest.TestCase):
             )
             for i, v in enumerate(values)
         ]
+
+    def test_sharpe_annualization_follows_sampling(self):
+        """R5-007：Sharpe 年化因子应按**真实时间戳**采样间隔缩放，而非硬编码 365×4。"""
+        now = datetime.now(timezone.utc)
         calc = MetricsCalculator()
 
-        # 采样间隔 6h vs 1h → periods_per_year 之比 = 6 → Sharpe 之比 = sqrt(6)
-        m6 = calc.calculate(curve, [], 10000, total_hours=6 * len(curve))
-        m1 = calc.calculate(curve, [], 10000, total_hours=1 * len(curve))
+        # 同一权益序列，时间戳分别按 1h / 6h 采样：
+        # periods_per_year 之比 = 6 → Sharpe 之比 = sqrt(6)
+        c1 = self._make_curve(now, 1)
+        c6 = self._make_curve(now, 6)
+        m1 = calc.calculate(c1, [], 10000, total_hours=0)
+        m6 = calc.calculate(c6, [], 10000, total_hours=0)
 
         self.assertGreater(m1["sharpe_ratio"], 0)
         self.assertAlmostEqual(
             m1["sharpe_ratio"] / m6["sharpe_ratio"],
             6 ** 0.5,
             places=3,
+        )
+
+    def test_periods_per_year_uses_real_timestamps_not_total_hours(self):
+        """年化因子必须由真实 timestamp 反推；`total_hours`（窗口跨度）不得污染。
+
+        `total_hours` 生产定义 = 回测窗口首尾跨度（engine.py），与 equity 曲线首尾不同，
+        且 n 个点只有 n-1 个间隔。此处验证：无论 total_hours 传何值，结果一致。
+        """
+        now = datetime.now(timezone.utc)
+        calc = MetricsCalculator()
+        curve = self._make_curve(now, step_hours=6)  # 6 点、间隔 6h、跨度 30h
+        expected = (365.25 * 24) / 6
+
+        self.assertAlmostEqual(
+            calc._resolve_periods_per_year(curve, total_hours=0), expected, places=6
+        )
+        # 误导性 total_hours 也不应改变结果（证明以时间戳为准，而非 total_hours/n）
+        self.assertAlmostEqual(
+            calc._resolve_periods_per_year(curve, total_hours=999), expected, places=6
+        )
+
+    def test_periods_per_year_fallback_uses_n_minus_1(self):
+        """时间戳不可用时回退 `total_hours/(n-1)`（旧实现误用 /n，低估间隔、放大年化）。"""
+        now = datetime.now(timezone.utc)
+        calc = MetricsCalculator()
+        n = 6
+        curve = [
+            EquityPoint(
+                timestamp=now,  # 全部相同 → 跨度 0 → 触发回退
+                cash=10000 + i,
+                positions_value=0,
+                equity=10000 + i,
+                open_positions=0,
+                realized_pnl=0,
+                unrealized_pnl=0,
+            )
+            for i in range(n)
+        ]
+        total_hours = 30.0
+        ppy = calc._resolve_periods_per_year(curve, total_hours=total_hours)
+        # 间隔 = 30/(6-1) = 6h（旧实现为 30/6 = 5h）
+        self.assertAlmostEqual(
+            ppy, (365.25 * 24) / (total_hours / (n - 1)), places=6
         )
 
     def test_avg_hold_time_same_token_multiple_rounds(self):

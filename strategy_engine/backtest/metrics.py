@@ -120,18 +120,31 @@ class MetricsCalculator:
         equity_curve: List[EquityPoint],
         total_hours: float,
     ) -> float:
-        """R5-007：由实际采样间隔反推年化因子，替代硬编码 `365 × 4`。
+        """由**真实采样间隔**反推年化因子，替代硬编码 `365 × 4`。
 
-        采样间隔 = `total_hours / len(equity_curve)`（小时）；
-        `periods_per_year = 365.25 × 24 / 采样间隔`。
+        注意：`total_hours` 的生产定义（`engine.py`）是**回测窗口首尾跨度**
+        （`events[0].deadline - 48h` → `events[-1].deadline + 1h`），并非
+        equity_curve 的首尾跨度；因此**不能**用 `total_hours / len(curve)` 作为
+        采样间隔（既混用了窗口与曲线，又把 n 个点当成 n 个间隔——实际只有 n-1 个）。
 
-        信息不足（`total_hours ≤ 0` 或点数 < 2）时回退旧默认（每 6h 一个采样点）。
+        取值优先级：
+        1. **真实时间戳**：`interval = (last_ts - first_ts) / (n - 1)`（推荐）；
+        2. 回退：`interval = total_hours / (n - 1)`（时间戳不可用时，仍按 n-1 个间隔）；
+        3. 信息不足（点数 < 2 / 跨度 ≤ 0）时回退旧默认（每 6h 一个采样点）。
         """
         n = len(equity_curve)
-        if total_hours > 0 and n >= 2:
-            interval_hours = total_hours / n
-            if interval_hours > 0:
-                return (365.25 * 24) / interval_hours
+        if n >= 2:
+            span_hours = (
+                equity_curve[-1].timestamp - equity_curve[0].timestamp
+            ).total_seconds() / 3600.0
+            if span_hours > 0:
+                interval_hours = span_hours / (n - 1)
+                if interval_hours > 0:
+                    return (365.25 * 24) / interval_hours
+            if total_hours > 0:
+                interval_hours = total_hours / (n - 1)
+                if interval_hours > 0:
+                    return (365.25 * 24) / interval_hours
         return 365 * 4
 
     def _calc_sharpe_sortino(
