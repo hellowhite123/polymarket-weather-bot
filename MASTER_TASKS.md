@@ -138,6 +138,7 @@
 - **改法**: `PositionLimits` 新增 `committed_total()`（`notional + reserved` 全市场求和）；`check_concentration` 分母改用 committed 口径，统一「要么全含 reserved、要么都事后加」，禁止混用（`check_and_reserve` 已预留 → 不重复加 notional；`pre_check` 未预留 → 补本单 notional）。
 - **Required Tests**: 新增「预留下单 A 后下单 B，集中度校验必须计入 A 的 pending 额度」回归测试；既有 `test_check_and_reserve_concentration_failure_rolls_back` 保持全绿。
 - **Acceptance**: clippy 无新增告警；新增测试通过；cargo test 全绿。
+- **Sell 分支修正（09-18，伯森先生指令「P0 必须先修」）**: 上项引入 `check_concentration(..., already_reserved)` 后，`check_and_reserve` 对 **Sell 也硬编码 `true`**（Buy 才预留）→ `future_total` 漏算 Sell 本单 notional，与 `pre_check(.., false)` 口径不一致，集中度门禁/比率被低估。改法：`already_reserved = matches!(side, Side::Buy)`；新增 `test_sell_concentration_includes_notional_in_future_total`（鉴别力：改回 `true` 必 FAILED）；Sell 不留预留。全量 Rust `337 + 4 + 18 + 1` 全绿。🔧 FIXED（待独立判 VERIFIED）。
 
 #### R5-002（P1）建议仓位与资本脱节 — MultiSource `_calculate_quantity`
 

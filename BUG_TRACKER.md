@@ -128,6 +128,14 @@
 
 ---
 
+## 二-D、Round 05 P0 — R5-001 Sell 分支修正（09-18）
+
+| 编号 | 问题 | 状态 | 关键点 |
+|------|------|------|--------|
+| R5-001（Sell 分支） | `check_and_reserve` 在引入 `already_reserved` 后对 **Sell 也传 `true`**（Buy 才预留）→ `future_total` 漏算 Sell 本单 notional，集中度门禁/比率被低估，与 `pre_check` 口径不一致 | 🔧 FIXED（09-18；待独立判 VERIFIED） | `risk_engine.rs`：`already_reserved = matches!(side, Side::Buy)`；新增 `test_sell_concentration_includes_notional_in_future_total`（鉴别力：改回 `true` 必 FAILED）；Sell 不留预留。全量 Rust `337 + 4 + 18 + 1` 全绿 |
+
+---
+
 ## 三、P1 清单（10 项，全部完成 09-10）
 
 | 新编号 | 问题 | 处置 | 落地 |

@@ -964,7 +964,15 @@ impl RiskEngine {
             .check_and_reserve(token_id, side, notional)?;
         // P1-033①：集中度检查在「预留」之后执行，若失败须回滚刚才的预留额度，
         // 否则预留泄漏（订单不会成交，也没有后续冲抵）。
-        if let Err(e) = self.check_concentration(token_id, side, notional, true) {
+        //
+        // R5-001：`already_reserved` 仅对 **Buy** 成立——Buy 在上一步已把 notional 计入
+        // `reserved`（`committed_total` 已含本单）；而 **Sell 不预留**，若同样传 `true`
+        // 会漏算本单 notional，使 `future_total` 偏小，集中度门禁（`> 2 × 单市场上限`）
+        // 与比率检查被低估，与 `pre_check(.., false)` 口径不一致。
+        let already_reserved = matches!(side, crate::types::enums::Side::Buy);
+        if let Err(e) =
+            self.check_concentration(token_id, side, notional, already_reserved)
+        {
             // 仅 Buy 会预留（Sell 不预留；对 Sell 调用 release 会误扣其他 pending 预留）。
             if matches!(side, crate::types::enums::Side::Buy) {
                 self.position_limits.release_reserve(token_id, notional);
@@ -1650,6 +1658,41 @@ mod tests {
         assert!(engine
             .check_and_reserve("b", Side::Buy, 4500.0, 4500.0, 50)
             .is_err());
+    }
+
+    /// R5-001：Sell 不预留，但集中度 `future_total` 仍必须包含本单 notional，
+    /// 与 `pre_check`（already_reserved=false）口径一致。
+    ///
+    /// 旧实现 `check_and_reserve` 对 Sell 硬编码 `already_reserved=true`，漏算本单
+    /// notional → `future_total` 偏小 → 集中度门禁被错误跳过，原子路径放行了预检会拒的 Sell。
+    #[test]
+    fn test_sell_concentration_includes_notional_in_future_total() {
+        let cfg = RiskConfig {
+            max_position_per_market: 1000.0,
+            max_global_exposure: 100_000.0,
+            max_concentration: 0.4,
+            ..Default::default()
+        };
+        let engine = RiskEngine::new(cfg);
+
+        // 市场 "t" 已成交 1900（committed = 1900 ≤ 2×1000；旧 bug 会跳过集中度门禁）
+        engine.on_fill("t", Side::Buy, 1900.0, 1900.0);
+
+        // Sell 200：future_total 必须 = 1900 + 200 = 2100 > 2×1000 → 进入检查；
+        // new_market = 1900 - 200 = 1700 → 1700/2100 ≈ 81% > 40% → 拒绝。
+        assert!(
+            engine.pre_check("t", Side::Sell, 200.0, 200.0, 50).is_err(),
+            "pre_check 应按含本单 notional 的 future_total 拒绝"
+        );
+        assert!(
+            engine
+                .check_and_reserve("t", Side::Sell, 200.0, 200.0, 50)
+                .is_err(),
+            "check_and_reserve 对 Sell 必须与 pre_check 一致（future_total 含本单 notional）"
+        );
+
+        // Sell 不产生预留：committed 仍为 1900
+        assert_eq!(engine.position_limits.committed_total(), 1900.0);
     }
 
     /// P0-007B：sync_position 以远端为权威重建/删除仓位，并清空残留 reserved。
