@@ -189,6 +189,7 @@
 - **改法**: `client.rs` 测试字面量改用 `std::f64::consts::PI` 消除 2 个 `approx_constant` error；`field_reassign_with_default` 改 `Struct { field, ..Default::default() }`；`uma_monitor.rs` 2 处 `await_holding_lock` 在 await 前 drop guard；清理 unused。
 - **Required Tests**: `cargo clippy --all-targets` 0 error；`cargo test` 全绿。
 - **Acceptance**: clippy 0 error；残留警告记录。
+- **撤回（09-18，伯森先生指令）**: `daemon.rs` 启动预检 `rpc.check_health_all().await;` **撤回到 `let _ = rpc.check_health_all();`**（不 await），除非另行明确授权。该处不属 clippy 必修项；撤回后 `cargo test` 仍 `337+4+18+1` 全绿。若后续 clippy 因 `let_underscore_future` 报错，须先取得授权再处理。
 
 #### R5-007（P2）权益曲线年化因子硬编码
 

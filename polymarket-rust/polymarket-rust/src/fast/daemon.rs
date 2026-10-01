@@ -85,7 +85,8 @@ impl BackgroundDaemon {
             let mut sweep_tick = interval(Duration::from_secs(60));
 
             // 启动时先跑一轮全部
-            rpc.check_health_all().await;
+            // R5-006 撤回（09-18，伯森先生指令）：此处恢复为不 await，除非重新获得明确授权。
+            let _ = rpc.check_health_all();
 
             loop {
                 tokio::select! {
