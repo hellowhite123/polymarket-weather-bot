@@ -131,7 +131,7 @@
 
 #### R5-001（P0）集中度检查 TOCTOU — 分母漏计 pending 预留
 
-- **Status**: 🔧 FIXED（09-23：`PositionLimits::committed_total()` + `check_concentration(..., already_reserved)` 统一分母；新增 `test_concentration_counts_pending_reserves`；risk_engine 35 测试全绿）
+- **Status**: ✅ **CONFIRMED**（09-18 独立审查，见 `docs/CONSENSUS_ROUND05_R5-001_R5-009.md`）；实现（09-23 分母统一）+ Sell 分支修正与测试重做（09-18）均通过独立审查
 - **Owner**: OpenCode
 - **Allowed Files**: `polymarket-rust/polymarket-rust/src/fast/risk_engine.rs`
 - **Forbidden**: `strategy_engine/`、`RiskConfig` 阈值含义、`ConcentrationChecker` 判定语义
@@ -223,7 +223,7 @@
 
 #### R5-009（P2）假健康检查
 
-- **Status**: 🔧 FIXED（09-23：改为扫描 `/proc/*/cmdline` 精确匹配 `-m market_discovery` 的存活探测，不误匹配自身；YAML 校验通过、探针本地返回 1（无守护进程）。⚠️ 本机无 Docker，`docker compose config` 未能实机执行）
+- **Status**: ⛔ **BLOCKED — ENVIRONMENT**（09-18 独立审查：设计通过，等待真实 Docker Runtime Evidence；本环境无 Docker）。代码侧已 FIXED（09-23 探测 + 09-18 方案1 entrypoint 保持 Up）；**不得再改代码**（除非新 Finding）
 - **Owner**: OpenCode
 - **Allowed Files**: `docker-compose.yml`（app 段 healthcheck）
 - **Forbidden**: 改服务依赖/网络语义
