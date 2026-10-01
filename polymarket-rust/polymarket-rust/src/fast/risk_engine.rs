@@ -148,19 +148,25 @@ impl RiskConfig {
     pub fn validate(&self) -> ClobResult<()> {
         fn pos(name: &str, v: f64) -> ClobResult<()> {
             if !v.is_finite() || v <= 0.0 {
-                return Err(ClobError::OrderFailed(format!("RiskConfig.{name} 非法: {v}")));
+                return Err(ClobError::OrderFailed(format!(
+                    "RiskConfig.{name} 非法: {v}"
+                )));
             }
             Ok(())
         }
         fn nonneg(name: &str, v: f64) -> ClobResult<()> {
             if !v.is_finite() || v < 0.0 {
-                return Err(ClobError::OrderFailed(format!("RiskConfig.{name} 非法: {v}")));
+                return Err(ClobError::OrderFailed(format!(
+                    "RiskConfig.{name} 非法: {v}"
+                )));
             }
             Ok(())
         }
         fn ratio(name: &str, v: f64) -> ClobResult<()> {
             if !v.is_finite() || v <= 0.0 || v > 1.0 {
-                return Err(ClobError::OrderFailed(format!("RiskConfig.{name} 非法: {v}")));
+                return Err(ClobError::OrderFailed(format!(
+                    "RiskConfig.{name} 非法: {v}"
+                )));
             }
             Ok(())
         }
@@ -172,9 +178,14 @@ impl RiskConfig {
         nonneg("daily_loss_limit", self.daily_loss_limit)?;
         nonneg("daily_loss_halt", self.daily_loss_halt)?;
         ratio("max_drawdown_warn", self.max_drawdown_warn)?;
-        ratio("oracle_deviation_threshold", self.oracle_deviation_threshold)?;
+        ratio(
+            "oracle_deviation_threshold",
+            self.oracle_deviation_threshold,
+        )?;
         if self.max_gas_gwei == 0 {
-            return Err(ClobError::OrderFailed("RiskConfig.max_gas_gwei 必须 > 0".into()));
+            return Err(ClobError::OrderFailed(
+                "RiskConfig.max_gas_gwei 必须 > 0".into(),
+            ));
         }
         Ok(())
     }
@@ -184,10 +195,14 @@ impl RiskConfig {
 fn validate_order_inputs(notional: f64, qty: f64) -> ClobResult<()> {
     for (name, v) in [("notional", notional), ("qty", qty)] {
         if !v.is_finite() {
-            return Err(ClobError::OrderFailed(format!("风控输入校验: {name} 含 NaN/Inf")));
+            return Err(ClobError::OrderFailed(format!(
+                "风控输入校验: {name} 含 NaN/Inf"
+            )));
         }
         if v <= 0.0 {
-            return Err(ClobError::OrderFailed(format!("风控输入校验: {name} 必须 > 0")));
+            return Err(ClobError::OrderFailed(format!(
+                "风控输入校验: {name} 必须 > 0"
+            )));
         }
     }
     Ok(())
@@ -280,10 +295,7 @@ impl PositionLimits {
         let mut positions = self.positions.write().unwrap();
         if matches!(side, crate::types::enums::Side::Buy) {
             // 先算全局 committed（含各市场 filled+reserved），再取当前市场 entry，避免借用冲突
-            let committed_global: f64 = positions
-                .values()
-                .map(|e| e.notional + e.reserved)
-                .sum();
+            let committed_global: f64 = positions.values().map(|e| e.notional + e.reserved).sum();
             let new_global = committed_global + notional;
             if new_global > self.config.max_global_exposure {
                 return Err(ClobError::OrderFailed(format!(
@@ -970,9 +982,7 @@ impl RiskEngine {
         // 会漏算本单 notional，使 `future_total` 偏小，集中度门禁（`> 2 × 单市场上限`）
         // 与比率检查被低估，与 `pre_check(.., false)` 口径不一致。
         let already_reserved = matches!(side, crate::types::enums::Side::Buy);
-        if let Err(e) =
-            self.check_concentration(token_id, side, notional, already_reserved)
-        {
+        if let Err(e) = self.check_concentration(token_id, side, notional, already_reserved) {
             // 仅 Buy 会预留（Sell 不预留；对 Sell 调用 release 会误扣其他 pending 预留）。
             if matches!(side, crate::types::enums::Side::Buy) {
                 self.position_limits.release_reserve(token_id, notional);
@@ -1660,39 +1670,77 @@ mod tests {
             .is_err());
     }
 
-    /// R5-001：Sell 不预留，但集中度 `future_total` 仍必须包含本单 notional，
-    /// 与 `pre_check`（already_reserved=false）口径一致。
+    /// R5-001（Test A）：Sell 只因**集中度**被拒——Position Limit / Global Exposure 均 PASS。
     ///
-    /// 旧实现 `check_and_reserve` 对 Sell 硬编码 `already_reserved=true`，漏算本单
-    /// notional → `future_total` 偏小 → 集中度门禁被错误跳过，原子路径放行了预检会拒的 Sell。
+    /// 构造：committed = 9900 ≤ 2×5000，加入本单 Sell 200 → future_total = 10100 > 10000
+    /// 才触发集中度门禁；new_market = 4000 - 200 = 3800 → 3800/10100 ≈ 37.6% > 30% → 拒。
+    /// 旧实现（对 Sell 传 `already_reserved=true`）→ future_total = 9900 ≤ 10000 → 门禁被跳过 → 错误放行。
     #[test]
-    fn test_sell_concentration_includes_notional_in_future_total() {
+    fn test_sell_concentration_rejected_without_position_limit_breach() {
         let cfg = RiskConfig {
-            max_position_per_market: 1000.0,
+            max_position_per_market: 5000.0,
             max_global_exposure: 100_000.0,
-            max_concentration: 0.4,
+            max_concentration: 0.3,
             ..Default::default()
         };
         let engine = RiskEngine::new(cfg);
 
-        // 市场 "t" 已成交 1900（committed = 1900 ≤ 2×1000；旧 bug 会跳过集中度门禁）
-        engine.on_fill("t", Side::Buy, 1900.0, 1900.0);
+        // "t" 持仓 4000（< 5000 → Position Limit PASS）；另一市场 5900（Global Exposure PASS）
+        engine.on_fill("t", Side::Buy, 4000.0, 4000.0);
+        engine.on_fill("other", Side::Buy, 5900.0, 5900.0);
+        assert_eq!(engine.position_limits.committed_total(), 9900.0);
 
-        // Sell 200：future_total 必须 = 1900 + 200 = 2100 > 2×1000 → 进入检查；
-        // new_market = 1900 - 200 = 1700 → 1700/2100 ≈ 81% > 40% → 拒绝。
+        // 唯一拒绝原因必须是「集中度」
+        let pre = engine
+            .pre_check("t", Side::Sell, 200.0, 200.0, 50)
+            .unwrap_err();
         assert!(
-            engine.pre_check("t", Side::Sell, 200.0, 200.0, 50).is_err(),
-            "pre_check 应按含本单 notional 的 future_total 拒绝"
+            pre.to_string().contains("集中度限制"),
+            "pre_check 应因集中度拒绝，实际: {pre}"
         );
+        assert!(!pre.to_string().contains("仓位硬限制"));
+        assert!(!pre.to_string().contains("全局暴露限制"));
+
+        let res = engine
+            .check_and_reserve("t", Side::Sell, 200.0, 200.0, 50)
+            .unwrap_err();
         assert!(
-            engine
-                .check_and_reserve("t", Side::Sell, 200.0, 200.0, 50)
-                .is_err(),
-            "check_and_reserve 对 Sell 必须与 pre_check 一致（future_total 含本单 notional）"
+            res.to_string().contains("集中度限制"),
+            "check_and_reserve 应因集中度拒绝，实际: {res}"
         );
 
-        // Sell 不产生预留：committed 仍为 1900
-        assert_eq!(engine.position_limits.committed_total(), 1900.0);
+        // Sell 不产生预留
+        assert_eq!(engine.position_limits.committed_total(), 9900.0);
+    }
+
+    /// R5-001（Test B）：Sell 集中度失败**不得释放**已存在的 Buy 预留。
+    #[test]
+    fn test_sell_concentration_failure_does_not_release_existing_reserve() {
+        let cfg = RiskConfig {
+            max_position_per_market: 5000.0,
+            max_global_exposure: 100_000.0,
+            max_concentration: 0.3,
+            ..Default::default()
+        };
+        let engine = RiskEngine::new(cfg);
+
+        // 已存在的 Buy 预留（另一 token）：reserved = 500
+        engine
+            .check_and_reserve("r", Side::Buy, 500.0, 500.0, 50)
+            .unwrap();
+        // 持仓：t=4000、other=5400 → committed = 4000 + 5400 + 500 = 9900
+        engine.on_fill("t", Side::Buy, 4000.0, 4000.0);
+        engine.on_fill("other", Side::Buy, 5400.0, 5400.0);
+        let before = engine.position_limits.committed_total();
+        assert_eq!(before, 9900.0);
+
+        // Sell 因集中度失败
+        assert!(engine
+            .check_and_reserve("t", Side::Sell, 200.0, 200.0, 50)
+            .is_err());
+
+        // 既有 Buy 预留未被释放（回滚仅作用于 Buy 分支）
+        assert_eq!(engine.position_limits.committed_total(), before);
     }
 
     /// P0-007B：sync_position 以远端为权威重建/删除仓位，并清空残留 reserved。

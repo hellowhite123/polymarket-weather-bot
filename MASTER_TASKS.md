@@ -138,7 +138,16 @@
 - **改法**: `PositionLimits` 新增 `committed_total()`（`notional + reserved` 全市场求和）；`check_concentration` 分母改用 committed 口径，统一「要么全含 reserved、要么都事后加」，禁止混用（`check_and_reserve` 已预留 → 不重复加 notional；`pre_check` 未预留 → 补本单 notional）。
 - **Required Tests**: 新增「预留下单 A 后下单 B，集中度校验必须计入 A 的 pending 额度」回归测试；既有 `test_check_and_reserve_concentration_failure_rolls_back` 保持全绿。
 - **Acceptance**: clippy 无新增告警；新增测试通过；cargo test 全绿。
-- **Sell 分支修正（09-18，伯森先生指令「P0 必须先修」）**: 上项引入 `check_concentration(..., already_reserved)` 后，`check_and_reserve` 对 **Sell 也硬编码 `true`**（Buy 才预留）→ `future_total` 漏算 Sell 本单 notional，与 `pre_check(.., false)` 口径不一致，集中度门禁/比率被低估。改法：`already_reserved = matches!(side, Side::Buy)`；新增 `test_sell_concentration_includes_notional_in_future_total`（鉴别力：改回 `true` 必 FAILED）；Sell 不留预留。全量 Rust `337 + 4 + 18 + 1` 全绿。🔧 FIXED（待独立判 VERIFIED）。
+- **Sell 分支修正（09-18，伯森先生指令「P0 必须先修」）**: 上项引入 `check_concentration(..., already_reserved)` 后，`check_and_reserve` 对 **Sell 也硬编码 `true`**（Buy 才预留）→ `future_total` 漏算 Sell 本单 notional，与 `pre_check(.., false)` 口径不一致，集中度门禁/比率被低估。改法：`already_reserved = matches!(side, Side::Buy)`。🔧 FIXED（待独立判 VERIFIED）。
+- **测试重做（09-18，独立审查要求「测试必须只因 concentration 失败」）**:
+  - `test_sell_concentration_rejected_without_position_limit_breach`（Test A）：构造 `max_position=5000 / committed=9900 / Sell 200` → **Position Limit PASS + Global PASS**，仅 |committed| 加本单跨过 `2×max` 门禁后 `new_market/future_total = 3800/10100 ≈ 37.6% > 30%` → 拒；并断言错误信息含 `集中度限制`、**不含** `仓位硬限制`/`全局暴露限制`（旧测试因 over-limit 构造无法证明失败原因）。
+  - `test_sell_concentration_failure_does_not_release_existing_reserve`（Test B）：已有 Buy 预留 500，Sell 集中度失败后 `committed_total` **不变**（回滚仅 Buy 分支，不误释放）。
+  - Buy rollback 保持（Test C：`test_check_and_reserve_concentration_failure_rolls_back`）。
+  - **Test D（mutation）**：`already_reserved = matches!(side, Buy)` → Test A/B PASS；临时改 `true` → **A/B 均 FAILED**（已验证）；恢复后全绿。
+- **完成标准核对**：[1]逻辑正确 ✅ [2]Sell 仅因 concentration 失败 ✅ [3]mutation 捕获旧 Bug ✅ [4]Buy rollback ✅ [5]Sell 不误释放 ✅ [6]Rust 全量 `338 + 4 + 18 + 1` 全绿 ✅。
+  - [7] `cargo fmt --check`：**R5-001 授权文件 `risk_engine.rs` rustfmt 干净**；但**全库** `cargo fmt --check` 失败于**预存**文件（`server.rs`/`fill_records.rs`/`market_events.rs`/`mempool.rs`/`nonce_manager.rs`/`order_state.rs`/`state_sync.rs`/`service.rs`/`tests/*`）——非 R5-001 引入，按「仅改授权范围」**不擅自全库 rustfmt**。
+  - [8] `cargo clippy -D warnings`：失败于 **20 个预存残留**（8× `non_snake_case` serde JSON 字段名 `apiKeys`/`orderType`/`orderID`/`errorMsg`/`makingAmount`/`takingAmount` 等、`very complex type`、`Err`-variant 过大）——**R5-006 已记录为 JSON 契约不可改名**；修它属越权/破坏契约。
+  - → [7]/[8] **受预存基线阻断**，需单独授权（全库 fmt 或显式 `#[allow]` 白名单）方能满足；**本任务不擅自处理**。
 
 #### R5-002（P1）建议仓位与资本脱节 — MultiSource `_calculate_quantity`
 

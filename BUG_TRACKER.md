@@ -132,7 +132,7 @@
 
 | 编号 | 问题 | 状态 | 关键点 |
 |------|------|------|--------|
-| R5-001（Sell 分支） | `check_and_reserve` 在引入 `already_reserved` 后对 **Sell 也传 `true`**（Buy 才预留）→ `future_total` 漏算 Sell 本单 notional，集中度门禁/比率被低估，与 `pre_check` 口径不一致 | 🔧 FIXED（09-18；待独立判 VERIFIED） | `risk_engine.rs`：`already_reserved = matches!(side, Side::Buy)`；新增 `test_sell_concentration_includes_notional_in_future_total`（鉴别力：改回 `true` 必 FAILED）；Sell 不留预留。全量 Rust `337 + 4 + 18 + 1` 全绿 |
+| R5-001（Sell 分支） | `check_and_reserve` 在引入 `already_reserved` 后对 **Sell 也传 `true`**（Buy 才预留）→ `future_total` 漏算 Sell 本单 notional，集中度门禁/比率被低估，与 `pre_check` 口径不一致 | 🔧 FIXED（09-18；待独立判 VERIFIED） | `risk_engine.rs`：`already_reserved = matches!(side, Side::Buy)`。测试重做（只因 concentration 失败）：`test_sell_concentration_rejected_without_position_limit_breach`（Position/Global PASS + 集中度 FAIL，断言错误含「集中度限制」）、`test_sell_concentration_failure_does_not_release_existing_reserve`；mutation（改回 `true`）两测试必 FAILED。Rust `338 + 4 + 18 + 1` 全绿。⚠️ 全库 `fmt --check`/`clippy -D warnings` 受**预存**基线阻断（R5-006 已记录），R5-001 授权文件本身 fmt 干净 |
 
 ---
 
