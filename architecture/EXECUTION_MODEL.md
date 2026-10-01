@@ -78,3 +78,24 @@ Trading Gate
 - [ ] 私有 mempool / RPC 部署拓扑（网络层优化方向）
 - [ ] 批量预签的吞吐上限
 - [ ] 断线恢复的具体状态回放策略
+
+## 7. 执行架构确认：CLOB-only + 链上读写边界（2026-09-18）
+
+**结论：订单执行层为 CLOB-only（链下订单簿）**；链上交互仅**只读监控**，**不存在链上交易发送或合约写入**。
+
+### 7.1 订单执行 = 纯 CLOB
+- 唯一提交入口：`clob/client.rs::send_order` → `POST /order`（`clob/endpoints.rs`）；`fast/executor.rs::execute_fast` 经 `send_order` 提交。
+- 订单为 **EIP-712 签名后 HTTP 提交**；`CTF Exchange` / `negRiskAdapter` 地址（`clob/constants.rs`）**仅用于 EIP-712 domain**，非链上调用。
+- 撤单/查单：CLOB `DELETE /order`、`GET /data/orders`。
+
+### 7.2 链上 = 只读 + 休眠脚手架
+- 无 `eth_sendRawTransaction` / `send_transaction` / RLP 签名 / `abigen` / `Contract::new`（全仓为零）。
+- `rpc_pool` 仅只读：`eth_blockNumber` / `eth_getTransactionCount` / `eth_getTransactionReceipt` / `eth_gasPrice` / `eth_getLogs`（`uma_monitor`）。
+- `nonce_manager` / `tx_lifecycle` / Gas 保护虽可被 `executor` 可选挂载，但**不驱动链上交易发送**（监控/脚手架）；余额与授权读取走 CLOB `GET /balance-allowance`（只读）。
+
+### 7.3 边界与缺口（非 CLOB 路径**尚未实现**）
+- **链上结算/赎回（CTF redeem）未实现**：`FillLedger.settle` 仅为本地记账；无 on-chain `redeem`/`claim`。
+- **无链上授权路径**（`approve` / `setApprovalForAll`）。
+- `uma_monitor` 仅监听 UMA OO 事件（只读）。
+
+> 若将「结算/赎回」纳入架构范围，应视为**待实现的缺口**，而非已存在的非 CLOB 交易路径。
