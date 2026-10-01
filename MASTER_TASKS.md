@@ -221,6 +221,8 @@
 - **改法**: 改为真实探测（HTTP/gRPC 就绪端点，或进程存活 + 心跳输出），参照 polymorph 段 `nc -z localhost 50051`。
 - **Required Tests**: `docker compose config` 合法；app 失活时 healthcheck 转 unhealthy。
 - **Acceptance**: compose 配置合法。
+- **补充复审（09-18，伯森先生）**: 实机验收要求 `docker compose config/up` + 停 `market_discovery` 后 3 次 healthcheck 转 `unhealthy`。**本环境无 Docker**（无 `docker.exe` / Docker Desktop / WSL 发行版）→ **真实 Docker 验收 BLOCKED**。静态复核：healthcheck 谓词**正确**（`p` 为每个进程的 argv 列表，`b'-m' in p and b'market_discovery' in p` 成立；不误匹配自身）；`polymarket-rust/Dockerfile` 已装 `netcat-openbsd`。
+- **行为修正（方案 1）**: 原 daemon 监督在子进程退出时 `exit 1` + `restart: unless-stopped` → 容器直接重启，healthcheck 来不及转 `unhealthy`。`docker-entrypoint.sh` daemon 分支改为**子进程退出后保持容器 Up**（仅记录一次告警），使 healthcheck 能累积 3 次转 `unhealthy`。`bash -n` 语法通过。**真实 Docker 验收仍需在有 Docker 的主机执行**（runbook 见对话/交付说明）。
 
 ---
 
