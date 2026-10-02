@@ -151,7 +151,7 @@
 
 #### R5-002（P1）建议仓位与资本脱节 — MultiSource `_calculate_quantity`
 
-- **Status**: ⬜ TODO（09-23 伯森先生指示**先跳过**：目标公式「价差优势 = |market_dev| 对标 dev_mu 的偏离度」及 quantity/USDC 单位口径待确认后实施）
+- **Status**: ⬜ TODO（09-23 伯森先生指示**先跳过**）→ **09-18：已出设计方案待审** `docs/design/R5-002_multi_source_position_sizing.md`（D1 单位口径 / D2 edge 公式 / D3 cap 语义 / D4 参数来源 / D5 与聚合器关系，供独立审查冻结）
 - **Owner**: OpenCode
 - **Allowed Files**: `strategy_engine/strategies/multi_source.py`、`strategy_engine/config.py`（仅新增 MultiSource 参数字段）、`test_multi_source.py`
 - **Forbidden**: 改 `max_position_per_market` 硬顶语义；改其他策略；改聚合器 Kelly 实现
