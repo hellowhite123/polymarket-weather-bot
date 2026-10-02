@@ -270,7 +270,17 @@ class MultiSourceStrategy(BaseStrategy):
         confidence = self._calculate_confidence(
             dev_sigma, div_sigma, div_is_extreme
         )
-        quantity = self._calculate_quantity(market_dev, dev_sigma, divergence)
+        # R5-002：advisory sizing 使用**滚动残差 σ（概率量纲）**做无量纲化，
+        # 以及该方向的 execution cost（YES→price, NO→1-price）。
+        # 注意：上方 `dev_sigma` 是 `is_extreme` 返回的 sigma_level（z 值），
+        # 不是残差 σ；残差 σ 需从 `DeviationTracker.stats()` 取。
+        _, dev_scale_sigma, _ = self.dev_tracker.stats(
+            event_type, location, market.token_id
+        )
+        cost = market.price_for(direction)
+        quantity = self._calculate_quantity(
+            market_dev, dev_scale_sigma, cost
+        )
 
         if confidence < self.params.min_confidence:
             logger.debug(
@@ -414,19 +424,55 @@ class MultiSourceStrategy(BaseStrategy):
     def _calculate_quantity(
         self,
         market_dev: float,
-        dev_sigma: float,
-        divergence: float,
+        dev_scale_sigma: float,
+        cost: float,
     ) -> float:
-        """计算建议交易数量。
+        """R5-002：**bounded advisory sizing**（USDC notional → shares）。
 
-        基于偏差幅度、置信度和分歧度。
-        分歧越大, 说明信息不对称越严重, 可以适当加仓。
+        公式（V3）：
+            edge = 1 - exp(-|market_dev| / σ)          # σ = 滚动残差标准差（概率量纲）
+            advisory_notional = base_capital × kelly_fraction × edge      # USDC
+            capped_notional   = min(advisory_notional, max_position_per_market)  # USDC cap
+            quantity          = capped_notional / cost                    # shares
+
+        特性：market_dev=0 → edge=0 → quantity=0；随 |market_dev| 单调且**饱和**（不线性飙升）。
+        语义：本返回值是 **advisory quantity**，最终下单数量仍由 Aggregator/PositionSizer 决定。
+
+        fail-closed：σ / cost / base_capital / kelly_fraction / cap 无效（≤0 或非有限）→ 0。
         """
-        base = abs(market_dev) * 100.0 * min(dev_sigma / 2.0, 2.0)
-        # 分歧加成: 分歧度 0~0.5 映射到 1.0~1.5 倍
-        div_multiplier = 1.0 + min(divergence, 0.5)
-        base *= div_multiplier
-        return round(min(base, self.params.max_position_per_market), 2)
+        # 参数校验（fail-closed；与项目既有 invalid-price 处理一致，不另造错误框架）
+        if not math.isfinite(market_dev):
+            return 0.0
+        if not (math.isfinite(dev_scale_sigma) and dev_scale_sigma > 0.0):
+            return 0.0
+        if not (math.isfinite(cost) and cost > 0.0):
+            return 0.0
+        if not (
+            math.isfinite(self.params.base_capital)
+            and self.params.base_capital > 0.0
+        ):
+            return 0.0
+        if not (
+            math.isfinite(self.params.kelly_fraction)
+            and self.params.kelly_fraction > 0.0
+        ):
+            return 0.0
+        if not (
+            math.isfinite(self.params.max_position_per_market)
+            and self.params.max_position_per_market > 0.0
+        ):
+            return 0.0
+
+        edge = 1.0 - math.exp(-abs(market_dev) / dev_scale_sigma)
+        advisory_notional = (
+            self.params.base_capital * self.params.kelly_fraction * edge
+        )
+        # USDC notional cap（不是 shares cap）
+        capped_notional = min(
+            advisory_notional, self.params.max_position_per_market
+        )
+        quantity = capped_notional / cost
+        return round(quantity, 2)
 
     def _record_data(
         self,

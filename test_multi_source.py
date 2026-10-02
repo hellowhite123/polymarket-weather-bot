@@ -398,3 +398,168 @@ if __name__ == "__main__":
     print_header("全部测试完成")
     print(f"  信号总数: {sum(1 for s in [sig_a, sig_b] if s)}/2")
     print("  多源验证策略逻辑验证通过")
+
+
+# ================================================================
+# R5-002：MultiSource advisory sizing 测试
+# ================================================================
+
+import math  # noqa: E402
+
+
+def _r5_002_params(**overrides) -> MultiSourceStrategyParams:
+    base = dict(
+        base_capital=1000.0,
+        kelly_fraction=0.25,
+        max_position_per_market=1000.0,
+    )
+    base.update(overrides)
+    return MultiSourceStrategyParams(**base)
+
+
+def _r5_002_quantity(market_dev, sigma, cost, **overrides) -> float:
+    div_tracker = DivergenceTracker(window_size=100)
+    dev_tracker = DeviationTracker(window_size=100)
+    strategy = MultiSourceStrategy(
+        div_tracker, dev_tracker, _r5_002_params(**overrides)
+    )
+    return strategy._calculate_quantity(market_dev, sigma, cost)
+
+
+def test_r5_002_t1_zero_deviation():
+    """T1：market_dev=0 → edge=0 → advisory quantity=0。"""
+    assert _r5_002_quantity(0.0, 0.1, 0.5) == 0.0
+
+
+def test_r5_002_t2_one_sigma():
+    """T2：|dev|=1σ → edge≈0.6321。"""
+    q = _r5_002_quantity(0.1, 0.1, 0.5)
+    expected = (1000.0 * 0.25 * (1.0 - math.exp(-1.0))) / 0.5
+    assert abs(q - round(expected, 2)) < 1e-6
+
+
+def test_r5_002_t3_two_sigma():
+    """T3：|dev|=2σ → edge≈0.8647。"""
+    q = _r5_002_quantity(0.2, 0.1, 0.5)
+    expected = (1000.0 * 0.25 * (1.0 - math.exp(-2.0))) / 0.5
+    assert abs(q - round(expected, 2)) < 1e-6
+
+
+def test_r5_002_t4_saturation():
+    """T4：随 |dev| 单调增但饱和，不线性飙升，且最终 < 资本上限对应值。"""
+    q1 = _r5_002_quantity(0.1, 0.1, 0.5)
+    q2 = _r5_002_quantity(0.2, 0.1, 0.5)
+    q3 = _r5_002_quantity(0.3, 0.1, 0.5)
+    assert q1 < q2 < q3
+    # 上界：edge<1 → notional < base*kelly → shares < base*kelly/cost
+    assert q3 < (1000.0 * 0.25) / 0.5
+    # 非线性：2 倍 dev 不等于 2 倍 quantity
+    assert abs(q2 - 2 * q1) > 1e-6
+
+
+def test_r5_002_t5_negative_deviation():
+    """T5：±market_dev 的 magnitude 一致。"""
+    assert _r5_002_quantity(0.12, 0.1, 0.5) == _r5_002_quantity(-0.12, 0.1, 0.5)
+
+
+def test_r5_002_t6_usdc_cap_applied_at_notional_layer():
+    """T6：cap 发生在 USDC notional 层（非 shares）。"""
+    # base 1000×kelly 0.25 = 250 USDC；cap=100 USDC；edge→1 → shares=100/0.5=200
+    q = _r5_002_quantity(10.0, 1.0, 0.5, max_position_per_market=100.0)
+    assert q == 200.0
+    # 若误把 cap 作用在 shares 上，则会是 100；这里断言不是
+    assert q != 100.0
+
+
+def test_r5_002_t7_yes_cost():
+    """T7：BUY_YES cost=price。"""
+    q = _r5_002_quantity(0.1, 0.1, 0.25)  # edge=1σ
+    expected = (1000.0 * 0.25 * (1.0 - math.exp(-1.0))) / 0.25
+    assert abs(q - round(expected, 2)) < 1e-6
+
+
+def test_r5_002_t8_no_cost():
+    """T8：BUY_NO cost=1-price。"""
+    q = _r5_002_quantity(0.1, 0.1, 0.75)
+    expected = (1000.0 * 0.25 * (1.0 - math.exp(-1.0))) / 0.75
+    assert abs(q - round(expected, 2)) < 1e-6
+
+
+def test_r5_002_t9_invalid_sigma_is_zero():
+    """T9：σ 无效（0/负/NaN/Inf）→ advisory quantity=0。"""
+    for bad in (0.0, -0.1, float("nan"), float("inf")):
+        assert _r5_002_quantity(0.1, bad, 0.5) == 0.0
+
+
+def test_r5_002_t10_invalid_cost_is_zero():
+    """T10：cost 无效（0/负/NaN/Inf）→ advisory quantity=0。"""
+    for bad in (0.0, -0.25, float("nan"), float("inf")):
+        assert _r5_002_quantity(0.1, 0.1, bad) == 0.0
+
+
+def test_r5_002_t11_capital_injection_single_source():
+    """T11：AGG_BASE_CAPITAL / AGG_KELLY_FRACTION 经装配层注入 MultiSource 参数。"""
+    from strategy_engine.config import StrategyConfig
+
+    saved = {
+        k: os.environ.get(k)
+        for k in ("AGG_BASE_CAPITAL", "AGG_KELLY_FRACTION")
+    }
+    try:
+        os.environ["AGG_BASE_CAPITAL"] = "4321"
+        os.environ["AGG_KELLY_FRACTION"] = "0.37"
+        cfg = StrategyConfig.from_env()
+        assert cfg.multi_source.base_capital == cfg.aggregator.base_capital == 4321.0
+        assert cfg.multi_source.kelly_fraction == cfg.aggregator.kelly_fraction == 0.37
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def test_r5_002_t12_aggregator_final_authority_not_overridden():
+    """T12：聚合器 final quantity 不受 MultiSource advisory quantity 影响（不修改 Aggregator）。"""
+    from strategy_engine.aggregator.aggregator import (
+        SignalAggregator,
+        AggregatorParams,
+    )
+    from strategy_engine.aggregator.models import RiskState
+    from strategy_engine.models import TradingSignal, EventType, SignalDirection
+
+    def sig(q):
+        return TradingSignal(
+            strategy="multi_source",
+            direction=SignalDirection.BUY_YES,
+            token_id="tok",
+            event_type=EventType.RAIN,
+            location="NY",
+            condition_id="cond",
+            yes_token_id="tok",
+            no_token_id="notok",
+            target_price=0.6,
+            market_price=0.5,
+            quantity=q,
+            confidence=0.9,
+            deviation=0.1,
+            sigma_level=2.0,
+        )
+
+    params = AggregatorParams(
+        base_capital=1000.0,
+        kelly_fraction=0.25,
+        min_aggregated_confidence=0.0,
+        max_position_per_market=1_000_000.0,
+        max_global_exposure=1_000_000.0,
+        total_portfolio_value=None,
+    )
+    agg = SignalAggregator(params)
+
+    o_small = agg.aggregate([sig(1.0)], RiskState())
+    o_large = agg.aggregate([sig(999.0)], RiskState())
+
+    assert len(o_small) == 1 and len(o_large) == 1
+    # advisory quantity 不同，但最终 quantity 相同（由 PositionSizer 决定）
+    assert o_small[0].quantity == o_large[0].quantity
+    assert o_small[0].quantity != 999.0
