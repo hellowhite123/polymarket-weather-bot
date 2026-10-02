@@ -151,7 +151,12 @@
 
 #### R5-002（P1）建议仓位与资本脱节 — MultiSource `_calculate_quantity`
 
-- **Status**: ⛔ **DEFERRED / DESIGN REQUIRED**（R5-002 Draft v2）→ **09-18：已提交实施前证据包** `docs/design/R5-002_draft_v2_evidence.md`（E1 quantity=shares；E2 AGG_* 来源；E3 聚合器重算、MultiSource.quantity 未被消费；**E4 发现 Python/Rust `max_position_per_market` 双权威不一致 1000 vs 500 + Python risk_gate 单位非 USDC**）。待独立审查裁决 D1–D5 与 E4 范围后方可实施
+- **Status**: 🔧 **FIXED（09-18，待独立审查）** — V3 授权实施完成，commit `a2dde81`；报告 `docs/R5-002_IMPLEMENTATION_REPORT.md`
+  - 公式：`edge=1−exp(−|market_dev|/σ)`（σ=`DeviationTracker.stats()` **残差σ**，非 z）；`advisory_notional=base_capital×kelly_fraction×edge`；**USDC cap** 后 `/cost` 得 shares；无效 σ/cost/参数→0
+  - 资本：`AggregatorParams.from_env()`（`AGG_*` 唯一读取点）→ 装配注入 `MultiSourceStrategyParams`（策略内无 `os.getenv`）
+  - 测试：T1–T12；`pytest` **123 passed**；mutation 捕获（线性 edge → 5 测试 FAILED）
+  - **未修改** `risk_gate.py`/`risk_engine.rs`/`PositionSizer`/`Aggregator` final sizing/proto/Rust
+  - **E4**（Python/Rust `max_position_per_market` 双权威 + Python risk_gate 单位非 USDC）按 V3 §1 **剥离**，建议另立 P1 Finding
 - **Owner**: OpenCode
 - **Allowed Files**: `strategy_engine/strategies/multi_source.py`、`strategy_engine/config.py`（仅新增 MultiSource 参数字段）、`test_multi_source.py`
 - **Forbidden**: 改 `max_position_per_market` 硬顶语义；改其他策略；改聚合器 Kelly 实现
