@@ -9,6 +9,7 @@
 | [`reserve_release_accounting.md`](./reserve_release_accounting.md) | G4 / P1-RISK-008 | **Draft v1，待审** | 预留释放额改按「成交增量 × 订单限价」；是否授权改 `on_fill`/`post_check` 记账接口；过期路径释放 |
 | [`indoubt_order_reconciliation.md`](./indoubt_order_reconciliation.md) | G4 / P1-EXEC-009 | **Draft v1，待审** | in-doubt（Received）订单可见性 + fail-closed；远端匹配收敛；是否用 client order id；TTL/停新单范围 |
 | [`R5-002_multi_source_position_sizing.md`](./R5-002_multi_source_position_sizing.md) | R5-002 / P1 | **Draft v1，待审** | 问题 + D1 单位口径 / D2 edge 公式 / D3 cap 语义 / D4 参数来源 / D5 与聚合器关系 |
+| [`R5-002_draft_v2_evidence.md`](./R5-002_draft_v2_evidence.md) | R5-002 / P1 | **证据包，待审** | E1 quantity=shares / E2 AGG_* 来源 / E3 聚合器重算 / E4 双权威+单位不一致发现 |
 | [`REVIEW_CHECKLIST_DESIGN.md`](./REVIEW_CHECKLIST_DESIGN.md) | 通用 | 有效 | 独立审查核对项 |
 | [`REVIEW_CHECKLIST_DESIGN_V2.md`](./REVIEW_CHECKLIST_DESIGN_V2.md) | G1-001/G1-002 v2 | 已被 V3 清单取代 | 首轮 9+15 项逐条对照 + 需核验证据清单 + 待 Human 拍板项 |
 | [`REVIEW_CHECKLIST_DESIGN_V3.md`](./REVIEW_CHECKLIST_DESIGN_V3.md) | **全部 4 份提案（当前版本）** | **待第三轮复审** | G1-002 v3 / G1-001 v3 / P1-RISK-008 v1 / P1-EXEC-009 v1 的统一复审 + 证据核验 + Human Acceptance 汇总 |

@@ -151,7 +151,7 @@
 
 #### R5-002（P1）建议仓位与资本脱节 — MultiSource `_calculate_quantity`
 
-- **Status**: ⬜ TODO（09-23 伯森先生指示**先跳过**）→ **09-18：已出设计方案待审** `docs/design/R5-002_multi_source_position_sizing.md`（D1 单位口径 / D2 edge 公式 / D3 cap 语义 / D4 参数来源 / D5 与聚合器关系，供独立审查冻结）
+- **Status**: ⛔ **DEFERRED / DESIGN REQUIRED**（R5-002 Draft v2）→ **09-18：已提交实施前证据包** `docs/design/R5-002_draft_v2_evidence.md`（E1 quantity=shares；E2 AGG_* 来源；E3 聚合器重算、MultiSource.quantity 未被消费；**E4 发现 Python/Rust `max_position_per_market` 双权威不一致 1000 vs 500 + Python risk_gate 单位非 USDC**）。待独立审查裁决 D1–D5 与 E4 范围后方可实施
 - **Owner**: OpenCode
 - **Allowed Files**: `strategy_engine/strategies/multi_source.py`、`strategy_engine/config.py`（仅新增 MultiSource 参数字段）、`test_multi_source.py`
 - **Forbidden**: 改 `max_position_per_market` 硬顶语义；改其他策略；改聚合器 Kelly 实现
