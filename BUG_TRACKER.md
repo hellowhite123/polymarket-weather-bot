@@ -145,7 +145,7 @@
 |---|---|---|---|
 | P1-006 | Cancel 未释放 reserve / OrderStore 未同步 | 🔧 FIXED | `settle_cancel` 先活动态→Cancelled 成功再释放；client/exchange 两路径；`limit_price≤0` fail-closed；5 测试+mutation |
 | P1-007 | Reconcile 未重建 open-order reserve | 🔧 FIXED（集成测试待 Docker） | 启动+后台重建失败**强制 fail-closed 不进入 READY**；`bin/server.rs` |
-| P1-008 | on_fill 用 filled notional 抵扣 limit×qty reserve | ⛔ WAITING_AUTHORIZATION | 设计 `docs/design/ROUND05_B_DESIGN_DRAFTS.md` B1 |
+| P1-008 | on_fill 用 filled notional 抵扣 limit×qty reserve | 🔧 FIXED | 订单级释放按 `limit_price×增量`；成交暴露按执行价；身份/限价未知**保守持有**待对账；8 测试+mutation 7 FAILED（`fast/risk_engine.rs`、`grpc/service.rs`） |
 | P1-009 | Unknown Result=Received 被 reconcile 排除 | ⛔ WAITING_AUTHORIZATION | 设计 B2 |
 | P1-010 | Snapshot absolute overwrite + event dual-write | ⛔ WAITING_AUTHORIZATION | 设计 B4 |
 | P1-011 | Pagination 未处理 next_cursor | 🔧 FIXED | 三路径游标循环（推进/去重/页数上限/中间页错误）；5 测试 |

@@ -471,7 +471,7 @@
 
 ---
 
-### 阶段五（Round 05 P1 整改，commit `7c75285`）：A1–A8 已实施 / B1–B5 待授权 / C1 BLOCKED
+### 阶段五（Round 05 P1 整改，commit `7c75285`）：A1–A8 + B1 已实施 / B2–B5 待授权 / C1 BLOCKED
 
 > 来源：`round 5.md`（Round 05 P1 独立二审）+ `docs/INSTRUCTION_TO_OPENCODE_ROUND05_P1_REMEDIATION.md`。
 > 红线：不得改交易语义 / RiskConfig 阈值 / proto / cold wallet；**不得由实施者写 VERIFIED/CLOSED**。
@@ -487,8 +487,9 @@
 | A6 / P1-014 | 全局容量只计 active；terminal 释放容量 | `fast/mempool.rs` | 🔧 FIXED（3 测试 + mutation 3 FAILED） |
 | A7 / R5-001 分子 | 集中度**分子**改用 `committed(filled+reserved)` | `fast/risk_engine.rs` | 🔧 FIXED（1 测试 + mutation FAILED） |
 | A8 / R5-002 | cap 在 **USDC notional** 层（补测试，不改公式） | `test_multi_source.py` | 🔧 FIXED（3 测试） |
-| B1–B5 | P1-008 / P1-009 / P1-RISK-UNIT-001 / P1-010 / R5-005 设计 | `docs/design/ROUND05_B_DESIGN_DRAFTS.md` | ⛔ WAITING_AUTHORIZATION |
+| B1 / P1-008 | on_fill 预留释放改按**订单限价**（成交暴露按执行价；身份/限价未知**保守持有**待对账） | `fast/risk_engine.rs`、`grpc/service.rs` | 🔧 FIXED（8 测试 + mutation 7 FAILED） |
+| B2–B5 | P1-009 / P1-RISK-UNIT-001 / P1-010 / R5-005 | `docs/design/ROUND05_B_DESIGN_DRAFTS.md`；B2 另见 `docs/design/DCR-001-B2-durable-persistence.md` | ⛔ WAITING_AUTHORIZATION（B2 另有 OPEN DCR-001） |
 | C1 / R5-009 | Docker runtime 验收 | — | ⛔ BLOCKED（环境无 Docker） |
 
-- 验证：`cargo test` **355 + 4 + 18 + 1 = 378 passed**；`pytest` **126 passed**；`cargo clippy --all-targets` **0 error**。
+- 验证：`cargo test` **363 + 4 + 18 + 1 = 386 passed**；`pytest` **126 passed**；`cargo clippy --all-targets` **0 error**。
 - **未自证 VERIFIED/CLOSED**；状态由独立审查者更新。

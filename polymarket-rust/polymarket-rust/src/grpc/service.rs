@@ -362,9 +362,40 @@ impl ExecutionServiceImpl {
 
         let notional = trade.price * trade.size;
 
+        // B1 / P1-008：在适配层解析订单身份与限价，算出**订单级**预留释放额。
+        // 预留入池 = limit_price × quantity，故按 limit_price × 本笔增量释放；
+        // 成交暴露仍按实际执行价（notional）。身份/限价未知 → None（保守持有预留，
+        // 交对账/reconciliation 处理），绝不静默按执行名义释放。
+        let reserve_release = match self.order_store.get_by_exchange_order_id(&trade.order_id) {
+            Some(st) if st.side == "BUY" => {
+                if st.limit_price > 0.0 {
+                    Some(trade.size * st.limit_price)
+                } else {
+                    tracing::warn!(
+                        "on_market_trade: BUY 订单 limit_price 非正，保守持有预留待对账 order_id={} trade_id={}",
+                        trade.order_id,
+                        trade.trade_id
+                    );
+                    None
+                }
+            }
+            // SELL：无开仓预留，无需释放。
+            Some(_) => None,
+            None => {
+                if matches!(side, Side::Buy) {
+                    tracing::warn!(
+                        "on_market_trade: 未找到订单身份，BUY 保守持有预留待对账 order_id={} trade_id={}",
+                        trade.order_id,
+                        trade.trade_id
+                    );
+                }
+                None
+            }
+        };
+
         // 1. RiskEngine 权威仓位
         if let Some(re) = self.risk_engine.as_ref() {
-            re.on_fill(&trade.token_id, side, trade.size, notional);
+            re.on_fill(&trade.token_id, side, trade.size, notional, reserve_release);
         }
 
         // 2. 内部 risk_state 快照
@@ -1488,6 +1519,117 @@ mod tests {
         assert_eq!(st.filled_size, 100.0, "多笔 partial fill 应累加到满额");
         assert_eq!(st.remaining_size, 0.0);
         assert_eq!(st.status, OrderStateStatus::Filled);
+    }
+
+    /// 测试辅助：构造一条带指定 order_id 的 BUY 成交事件。
+    fn mk_b1_trade(trade_id: &str, token_id: &str, exchange_order_id: &str, price: f64, size: f64) -> TradeEvent {
+        TradeEvent {
+            token_id: token_id.to_string(),
+            trade_id: trade_id.to_string(),
+            order_id: exchange_order_id.to_string(),
+            side: "BUY".to_string(),
+            price,
+            size,
+            timestamp: 0,
+            taker_order_id: exchange_order_id.to_string(),
+            maker_order_id: String::new(),
+            trader_side: "TAKER".to_string(),
+            owner: String::new(),
+            status: "MATCHED".to_string(),
+        }
+    }
+
+    /// B1 / P1-008：适配层按订单**限价**释放预留，成交暴露按**执行价**。
+    /// 预算改善（exec 0.50 < limit 0.60）下预留必须完整释放。
+    #[tokio::test]
+    async fn test_b1_on_market_trade_releases_reserve_at_limit_price() {
+        let mut service = ExecutionServiceImpl::new_mock();
+        let re = Arc::new(RiskEngine::new(RiskConfig::default()));
+        service.set_risk_engine(re.clone());
+
+        // 订单：BUY 100 @ limit 0.60 → 预留 60
+        service.order_store.create(
+            "client-b1".to_string(),
+            "tok-b1".to_string(),
+            "BUY".to_string(),
+            100.0,
+        );
+        if let Some(mut st) = service.order_store.get("client-b1") {
+            st.mark_submitted("ex-b1".to_string());
+            service.order_store.upsert(st);
+        }
+        service.order_store.set_limit_price("client-b1", 0.60);
+        re.check_and_reserve("tok-b1", Side::Buy, 60.0, 100.0, 50)
+            .unwrap();
+        assert_eq!(re.committed_total(), 60.0);
+
+        // 成交事件：执行价 0.50，全成交
+        let trade = mk_b1_trade("tr-b1", "tok-b1", "ex-b1", 0.50, 100.0);
+        service.on_market_trade(&trade).await;
+
+        // 预留按限价 0.60×100=60 释放 → reserved 0；filled 按执行价 0.50×100=50
+        assert_eq!(re.snapshot().global_exposure, 50.0, "filled 按执行价");
+        assert_eq!(re.committed_total(), 50.0, "预留按限价完整释放");
+
+        // 重复投递同一 trade_id：幂等，不重复释放/记账
+        service.on_market_trade(&trade).await;
+        assert_eq!(service.fill_ledger().list().len(), 1);
+        assert_eq!(re.committed_total(), 50.0, "重复 trade 不二次释放");
+    }
+
+    /// B1：订单限价未知（limit_price=0）→ 保守持有预留，不按执行名义释放。
+    #[tokio::test]
+    async fn test_b1_on_market_trade_holds_reserve_when_limit_unknown() {
+        let mut service = ExecutionServiceImpl::new_mock();
+        let re = Arc::new(RiskEngine::new(RiskConfig::default()));
+        service.set_risk_engine(re.clone());
+
+        service.order_store.create(
+            "client-u".to_string(),
+            "tok-u".to_string(),
+            "BUY".to_string(),
+            100.0,
+        );
+        if let Some(mut st) = service.order_store.get("client-u") {
+            st.mark_submitted("ex-u".to_string());
+            service.order_store.upsert(st);
+        }
+        // 未 set_limit_price → limit_price 仍为 0.0（未知）
+        re.check_and_reserve("tok-u", Side::Buy, 60.0, 100.0, 50)
+            .unwrap();
+
+        service
+            .on_market_trade(&mk_b1_trade("tr-u", "tok-u", "ex-u", 0.50, 100.0))
+            .await;
+
+        assert_eq!(re.snapshot().global_exposure, 50.0);
+        assert_eq!(
+            re.committed_total(),
+            110.0,
+            "限价未知 → 预留保守持有（60 reserved + 50 filled）"
+        );
+    }
+
+    /// B1：完全找不到订单身份 → BUY 保守持有预留。
+    #[tokio::test]
+    async fn test_b1_on_market_trade_unknown_identity_holds_reserve() {
+        let mut service = ExecutionServiceImpl::new_mock();
+        let re = Arc::new(RiskEngine::new(RiskConfig::default()));
+        service.set_risk_engine(re.clone());
+
+        re.check_and_reserve("tok-g", Side::Buy, 60.0, 100.0, 50)
+            .unwrap();
+        // 事件引用的 exchange order id 与本地 OrderStore 无匹配
+        service
+            .on_market_trade(&mk_b1_trade("tr-g", "tok-g", "ex-ghost", 0.50, 100.0))
+            .await;
+
+        assert_eq!(re.snapshot().global_exposure, 50.0);
+        assert_eq!(
+            re.committed_total(),
+            110.0,
+            "身份未知 → 预留保守持有，待对账"
+        );
     }
 
     /// P0-014：事件消费链 poller → MarketEvent::Trade → on_market_trade 接通。

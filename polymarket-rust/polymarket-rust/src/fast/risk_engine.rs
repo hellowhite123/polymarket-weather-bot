@@ -355,6 +355,54 @@ impl PositionLimits {
         }
     }
 
+    /// B1 / P1-008：**订单级**成交记账。
+    ///
+    /// 与 [`PositionLimits::post_check`] 的关键区别：预留释放按**订单 limit price**
+    /// 计算（`reserve_release = limit_price × 本笔增量`），而成交暴露按**实际执行价**
+    /// （`filled_notional = execution_price × 本笔增量`）计入。旧实现用执行名义去冲抵
+    /// limit 预留，在 price improvement（BUY 执行价 < 限价）时留下无法回收的残余预留，
+    /// 并在执行价 > 限价时过度释放。
+    ///
+    /// `reserve_release` 语义（冻结）：
+    /// - `Some(x)`：订单身份/限价已知，从 `reserved` 释放 `x`（仅 Buy）；
+    /// - `None`：订单身份或限价未知 → **保守持有预留**（不精确释放），交由
+    ///   对账/reconciliation（B2）以权威信息修正；**绝不**静默按执行名义释放。
+    ///
+    /// Sell 不产生开仓预留，忽略 `reserve_release`。
+    ///
+    /// 订单归属守恒：per-token 池化 `reserved` 满足
+    /// `Σ_orders release_i = Σ_orders limit_i × filled_qty_i`（每笔挂在各自 order
+    /// 的限价上），因此多订单同 token、不同限价也能正确守恒。
+    pub fn apply_fill_order(
+        &self,
+        token_id: &str,
+        side: crate::types::enums::Side,
+        qty: f64,
+        filled_notional: f64,
+        reserve_release: Option<f64>,
+    ) {
+        if !qty.is_finite() || qty <= 0.0 || !filled_notional.is_finite() || filled_notional < 0.0 {
+            return;
+        }
+        let mut positions = self.positions.write().unwrap();
+        let entry = positions.entry(token_id.to_string()).or_default();
+        match side {
+            crate::types::enums::Side::Buy => {
+                if let Some(release) = reserve_release {
+                    if release.is_finite() && release > 0.0 {
+                        entry.reserved = (entry.reserved - release).max(0.0);
+                    }
+                }
+                entry.qty += qty;
+                entry.notional += filled_notional;
+            }
+            crate::types::enums::Side::Sell => {
+                entry.qty = (entry.qty - qty).max(0.0);
+                entry.notional = (entry.notional - filled_notional).max(0.0);
+            }
+        }
+    }
+
     /// 当前全局暴露（已成交的 filled notional）
     pub fn global_exposure(&self) -> f64 {
         self.positions
@@ -1147,15 +1195,26 @@ impl RiskEngine {
     ///
     /// 用于实时成交路径，避免在缺少可靠 PnL / Equity 数据时
     /// 错误污染风控状态。
+    ///
+    /// B1 / P1-008：`filled_notional` 为**实际执行价**计入的成交暴露；
+    /// `reserve_release` 为**订单限价**计算的预留释放额（`None` = 身份/限价未知，
+    /// 保守持有预留）。调用方（service 适配层）负责解析订单身份与限价。
     pub fn on_fill(
         &self,
         token_id: &str,
         side: crate::types::enums::Side,
         qty: f64,
-        notional: f64,
+        filled_notional: f64,
+        reserve_release: Option<f64>,
     ) {
         self.position_limits
-            .post_check(token_id, side, qty, notional);
+            .apply_fill_order(token_id, side, qty, filled_notional, reserve_release);
+    }
+
+    /// B1：暴露当前全市场 committed（filled notional + pending reserved）口径，
+    /// 供成交/对账链路与测试断言预留释放是否精确。
+    pub fn committed_total(&self) -> f64 {
+        self.position_limits.committed_total()
     }
 
     /// P0-007B：对账恢复——以远端为权威重建指定市场仓位。
@@ -1603,8 +1662,8 @@ mod tests {
         engine
             .check_and_reserve("m", Side::Buy, 400.0, 400.0, 50)
             .unwrap();
-        // 成交路径：预留 → 成交
-        engine.on_fill("m", Side::Buy, 400.0, 400.0);
+        // 成交路径：预留 → 成交（限价 1.0 × 400 = 释放 400）
+        engine.on_fill("m", Side::Buy, 400.0, 400.0, Some(400.0));
         // 成交后 global_exposure = 400（预留已冲抵）
         assert_eq!(engine.snapshot().global_exposure, 400.0);
     }
@@ -1638,7 +1697,7 @@ mod tests {
         let engine = RiskEngine::new(cfg);
 
         // 另一市场已持仓 2000（全局 filled = 2000）
-        engine.on_fill("other", Side::Buy, 2000.0, 2000.0);
+        engine.on_fill("other", Side::Buy, 2000.0, 2000.0, None);
 
         // 集中度失败：new_market=900, future_total=2900 → 900/2900 ≈ 31% > 30%
         assert!(engine
@@ -1702,7 +1761,7 @@ mod tests {
         let engine = RiskEngine::new(cfg);
 
         // 另一市场 X 已成交 21000（> 2×max 以触发集中度门禁）
-        engine.on_fill("X", Side::Buy, 21000.0, 21000.0);
+        engine.on_fill("X", Side::Buy, 21000.0, 21000.0, None);
         // 同 token "t" 已有 pending 预留 7500（filled=0）
         engine
             .check_and_reserve("t", Side::Buy, 7500.0, 7500.0, 0)
@@ -1735,8 +1794,8 @@ mod tests {
         let engine = RiskEngine::new(cfg);
 
         // "t" 持仓 4000（< 5000 → Position Limit PASS）；另一市场 5900（Global Exposure PASS）
-        engine.on_fill("t", Side::Buy, 4000.0, 4000.0);
-        engine.on_fill("other", Side::Buy, 5900.0, 5900.0);
+        engine.on_fill("t", Side::Buy, 4000.0, 4000.0, None);
+        engine.on_fill("other", Side::Buy, 5900.0, 5900.0, None);
         assert_eq!(engine.position_limits.committed_total(), 9900.0);
 
         // 唯一拒绝原因必须是「集中度」
@@ -1778,8 +1837,8 @@ mod tests {
             .check_and_reserve("r", Side::Buy, 500.0, 500.0, 50)
             .unwrap();
         // 持仓：t=4000、other=5400 → committed = 4000 + 5400 + 500 = 9900
-        engine.on_fill("t", Side::Buy, 4000.0, 4000.0);
-        engine.on_fill("other", Side::Buy, 5400.0, 5400.0);
+        engine.on_fill("t", Side::Buy, 4000.0, 4000.0, None);
+        engine.on_fill("other", Side::Buy, 5400.0, 5400.0, None);
         let before = engine.position_limits.committed_total();
         assert_eq!(before, 9900.0);
 
@@ -1800,7 +1859,7 @@ mod tests {
         engine
             .check_and_reserve("m1", Side::Buy, 400.0, 400.0, 50)
             .unwrap();
-        engine.on_fill("m1", Side::Buy, 400.0, 400.0);
+        engine.on_fill("m1", Side::Buy, 400.0, 400.0, Some(400.0));
         engine
             .check_and_reserve("m1", Side::Buy, 50.0, 50.0, 50)
             .unwrap(); // 残留 reserved=50
@@ -1861,5 +1920,117 @@ mod tests {
         assert!(engine
             .check_and_reserve("t1", Side::Buy, 100.0, 100.0, 50)
             .is_ok());
+    }
+
+    // ========== B1 / P1-008：订单级预留释放（按 limit price） ==========
+
+    /// B1 核心：price improvement 下预留按**限价**完整释放，不留残余。
+    ///
+    /// 预留 = limit(0.60) × 100 = 60；执行价 0.50 全额成交 → filled notional = 50。
+    /// 释放必须按限价 0.60 × 100 = 60（而非执行 50），否则残留 reserved=10。
+    ///
+    /// **Mutation guard**：若把 `on_fill` 的释放回退为「执行名义抵扣预留」，
+    /// `committed_total()` 会变成 60（reserved 10 + filled 50），本断言即失败。
+    #[test]
+    fn test_b1_price_improvement_releases_limit_reserve() {
+        let engine = make_engine();
+        engine
+            .check_and_reserve("m", Side::Buy, 60.0, 100.0, 50)
+            .unwrap();
+        // 执行价 0.50，全成交，释放 60（=0.60×100）
+        engine.on_fill("m", Side::Buy, 100.0, 50.0, Some(60.0));
+
+        assert_eq!(engine.snapshot().global_exposure, 50.0, "filled 暴露按执行价");
+        assert_eq!(
+            engine.committed_total(),
+            50.0,
+            "预留必须按限价完整释放（无残余）"
+        );
+    }
+
+    /// B1：多笔 partial fill 按各自增量的限价释放，累计恰好冲抵整单预留。
+    #[test]
+    fn test_b1_partial_fills_then_full_releases_limit_reserve() {
+        let engine = make_engine();
+        // limit 0.60, qty 100 → reserve 60
+        engine
+            .check_and_reserve("m", Side::Buy, 60.0, 100.0, 50)
+            .unwrap();
+
+        // 第一笔 30 @0.50：释放 0.60×30=18，filled += 15
+        engine.on_fill("m", Side::Buy, 30.0, 15.0, Some(18.0));
+        // reserved=42, filled=15 → committed=57
+        assert_eq!(engine.committed_total(), 57.0);
+
+        // 第二笔 70 @0.50：释放 0.60×70=42，filled += 35
+        engine.on_fill("m", Side::Buy, 70.0, 35.0, Some(42.0));
+        assert_eq!(engine.committed_total(), 50.0, "整单预留精确冲抵");
+        assert_eq!(engine.snapshot().global_exposure, 50.0);
+    }
+
+    /// B1：同 token 两笔不同限价的订单，各自按自身限价释放，归属守恒。
+    #[test]
+    fn test_b1_two_orders_different_limits_same_token() {
+        let engine = make_engine();
+        // order A: limit 0.4, qty 100 → reserve 40
+        engine
+            .check_and_reserve("m", Side::Buy, 40.0, 100.0, 50)
+            .unwrap();
+        // order B: limit 0.6, qty 100 → reserve 60
+        engine
+            .check_and_reserve("m", Side::Buy, 60.0, 100.0, 50)
+            .unwrap();
+        assert_eq!(engine.committed_total(), 100.0);
+
+        // A 全额成交 @0.4 → 释放 40
+        engine.on_fill("m", Side::Buy, 100.0, 40.0, Some(40.0));
+        // B 全额成交 @0.6 → 释放 60
+        engine.on_fill("m", Side::Buy, 100.0, 60.0, Some(60.0));
+
+        assert_eq!(engine.committed_total(), 100.0);
+        assert_eq!(engine.snapshot().global_exposure, 100.0, "两单 filled 累加");
+    }
+
+    /// B1：身份/限价未知时**保守持有**预留，不按执行名义释放。
+    #[test]
+    fn test_b1_unknown_limit_holds_reserve_conservatively() {
+        let engine = make_engine();
+        engine
+            .check_and_reserve("m", Side::Buy, 60.0, 100.0, 50)
+            .unwrap();
+        // reserve_release = None（限价未知）→ 不释放预留
+        engine.on_fill("m", Side::Buy, 100.0, 50.0, None);
+
+        assert_eq!(engine.snapshot().global_exposure, 50.0);
+        assert_eq!(
+            engine.committed_total(),
+            110.0,
+            "限价未知时预留保守持有（60 reserved + 50 filled）"
+        );
+    }
+
+    /// B1：Sell 不释放同 token 的 Buy 开仓预留。
+    #[test]
+    fn test_b1_sell_does_not_release_buy_reserve() {
+        let engine = make_engine();
+        // Buy 全额成交，预留清零：filled=50
+        engine
+            .check_and_reserve("m", Side::Buy, 60.0, 100.0, 50)
+            .unwrap();
+        engine.on_fill("m", Side::Buy, 100.0, 50.0, Some(60.0));
+        // 新的 Buy 挂单预留 40
+        engine
+            .check_and_reserve("m", Side::Buy, 40.0, 100.0, 50)
+            .unwrap();
+
+        // Sell 30 @0.5：不得触碰 reserved
+        engine.on_fill("m", Side::Sell, 30.0, 15.0, None);
+
+        assert_eq!(engine.snapshot().global_exposure, 35.0, "filled 50-15");
+        assert_eq!(
+            engine.committed_total(),
+            75.0,
+            "reserved 40 保持不变 + filled 35"
+        );
     }
 }
