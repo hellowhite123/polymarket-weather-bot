@@ -468,3 +468,27 @@
 > G6 认证防御（P1-SEC-013）；G7 OrderStore 记账一致性（P1-CONSIST-010）；
 > G8 Mempool/Nonce 潜伏缺陷（P1-EXEC-014 及 P2 潜伏项，**接入生产前必须修**）。
 > 另有流程项 **ENV-001**：Python `pytest` 门禁实际不可用，建议补 `pytest.ini`/`conftest.py` 与 dev 依赖清单。
+
+---
+
+### 阶段五（Round 05 P1 整改，commit `7c75285`）：A1–A8 已实施 / B1–B5 待授权 / C1 BLOCKED
+
+> 来源：`round 5.md`（Round 05 P1 独立二审）+ `docs/INSTRUCTION_TO_OPENCODE_ROUND05_P1_REMEDIATION.md`。
+> 红线：不得改交易语义 / RiskConfig 阈值 / proto / cold wallet；**不得由实施者写 VERIFIED/CLOSED**。
+> 基线→新：本轮改动未单独记录基线 commit（见 `git show 7c75285`）。
+
+| 项 | 内容 | Allowed | 状态 |
+|----|------|---------|------|
+| A1 / P1-006 | 取消订单：**先转换成功再释放** reserve（client+exchange；`limit_price≤0` fail-closed） | `grpc/service.rs` | 🔧 FIXED（5 测试 + mutation 2 FAILED） |
+| A2 / P1-007 | reconcile 预留重建失败 → **强制不进入 READY**（启动+后台 fail-closed） | `bin/server.rs` | 🔧 FIXED（代码；服务端集成测试待真实运行/Docker） |
+| A3 / P1-011 | positions/orders/trades **游标分页**（推进/去重/页数上限/中间页错误 fail-closed） | `fast/state_sync.rs` | 🔧 FIXED（5 测试） |
+| A4 / P1-012 | `parse_json_f64→Result`；非法恢复成交进 `unresolved` | `fast/state_sync.rs` | 🔧 FIXED（3 测试） |
+| A5 / P1-013 | 删 HMAC raw ASCII fallback；空/非法 secret fail-closed | `clob/signing/hmac_sig.rs`、`clob/auth.rs` | 🔧 FIXED（官方 vector + 2 测试） |
+| A6 / P1-014 | 全局容量只计 active；terminal 释放容量 | `fast/mempool.rs` | 🔧 FIXED（3 测试 + mutation 3 FAILED） |
+| A7 / R5-001 分子 | 集中度**分子**改用 `committed(filled+reserved)` | `fast/risk_engine.rs` | 🔧 FIXED（1 测试 + mutation FAILED） |
+| A8 / R5-002 | cap 在 **USDC notional** 层（补测试，不改公式） | `test_multi_source.py` | 🔧 FIXED（3 测试） |
+| B1–B5 | P1-008 / P1-009 / P1-RISK-UNIT-001 / P1-010 / R5-005 设计 | `docs/design/ROUND05_B_DESIGN_DRAFTS.md` | ⛔ WAITING_AUTHORIZATION |
+| C1 / R5-009 | Docker runtime 验收 | — | ⛔ BLOCKED（环境无 Docker） |
+
+- 验证：`cargo test` **355 + 4 + 18 + 1 = 378 passed**；`pytest` **126 passed**；`cargo clippy --all-targets` **0 error**。
+- **未自证 VERIFIED/CLOSED**；状态由独立审查者更新。

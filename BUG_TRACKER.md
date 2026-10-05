@@ -136,6 +136,28 @@
 
 ---
 
+## 二-E、Round 05 P1 独立二审登记（2026-10-04，commit `7c75285`）
+
+> 编号沿用 `round 5.md`（P1-006~014）；与既有「三、P1 清单」的 P1-006~010（09-10 批次）**同号不同义**，此处按 Round05 文档口径记录。
+> 实施者仅登记 **FIXED / WAITING_AUTHORIZATION / BLOCKED**；**不写 VERIFIED/CLOSED**。
+
+| 编号(round5) | 问题 | 状态 | 关键点 |
+|---|---|---|---|
+| P1-006 | Cancel 未释放 reserve / OrderStore 未同步 | 🔧 FIXED | `settle_cancel` 先活动态→Cancelled 成功再释放；client/exchange 两路径；`limit_price≤0` fail-closed；5 测试+mutation |
+| P1-007 | Reconcile 未重建 open-order reserve | 🔧 FIXED（集成测试待 Docker） | 启动+后台重建失败**强制 fail-closed 不进入 READY**；`bin/server.rs` |
+| P1-008 | on_fill 用 filled notional 抵扣 limit×qty reserve | ⛔ WAITING_AUTHORIZATION | 设计 `docs/design/ROUND05_B_DESIGN_DRAFTS.md` B1 |
+| P1-009 | Unknown Result=Received 被 reconcile 排除 | ⛔ WAITING_AUTHORIZATION | 设计 B2 |
+| P1-010 | Snapshot absolute overwrite + event dual-write | ⛔ WAITING_AUTHORIZATION | 设计 B4 |
+| P1-011 | Pagination 未处理 next_cursor | 🔧 FIXED | 三路径游标循环（推进/去重/页数上限/中间页错误）；5 测试 |
+| P1-012 | parse_json_f64 invalid/missing→0.0 | 🔧 FIXED | 改 `Result`；非法恢复成交→`unresolved`；3 测试 |
+| P1-013 | HMAC decode fallback raw ASCII | 🔧 FIXED | 删 fallback；空/非法 secret fail-closed；2 测试 |
+| P1-014 | Global capacity 用 orders.len() | 🔧 FIXED | active-only 计数；terminal 释放容量；3 测试+mutation |
+| P1-RISK-UNIT-001 | Python RiskGate shares/USDC 混淆 + 双权威 | ⛔ WAITING_AUTHORIZATION | 设计 B3（最高优先）；已从 R5-002 **剥离**（E4） |
+
+> 基线→新：见 commit `7c75285`。
+
+---
+
 ## 三、P1 清单（10 项，全部完成 09-10）
 
 | 新编号 | 问题 | 处置 | 落地 |
