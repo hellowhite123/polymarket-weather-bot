@@ -494,21 +494,46 @@ impl ExecutionServiceImpl {
         parse_gas_price_hex_to_gwei(hex)
     }
 
-    /// G4 / P1-RISK-006：取消成功后释放该单剩余预留并原子标记 `Cancelled`。
+    /// A1 / G4：取消成功后释放该单剩余预留并原子标记 `Cancelled`。
     ///
-    /// 预留额按 `remaining_size × limit_price`（仅 BUY）；`limit_price` 未知（0）时
-    /// 跳过释放（保守：宁可少释放，不平白扣减其它订单的预留）。终态订单不会被覆盖。
+    /// A1 修正：**先原子转换到 `Cancelled`，仅当转换成功（活动态→Cancelled）才释放预留**。
+    /// 旧实现先释放再转换：并发成交已使订单终结时 `mark_cancelled` 被终态保护拒绝，
+    /// 但 reserve 已被释放 → 过度释放（over-release）。改以转换结果为准，天然幂等。
     fn settle_cancel(&self, client_order_id: &str) {
-        let st = match self.order_store.get(client_order_id) {
-            Some(st) => st,
-            None => return,
-        };
-        if st.side == "BUY" && st.limit_price > 0.0 && st.remaining_size > 0.0 {
+        if let Some(st) = self.order_store.mark_cancelled(client_order_id) {
+            self.release_reserve_on_cancel(&st);
+        }
+    }
+
+    /// A1：按交易所订单 ID 取消（先转换成功再释放预留）。
+    fn settle_cancel_by_exchange(&self, exchange_order_id: &str) {
+        if let Some(st) = self
+            .order_store
+            .mark_cancelled_by_exchange_order_id(exchange_order_id)
+        {
+            self.release_reserve_on_cancel(&st);
+        }
+    }
+
+    /// A1：取消成功（活动态→Cancelled）后释放该单剩余预留。
+    ///
+    /// 仅 BUY；`limit_price`/`remaining` 非正时**告警并跳过释放**（保守 fail-closed）。
+    fn release_reserve_on_cancel(&self, st: &crate::fast::order_state::OrderState) {
+        if st.side != "BUY" {
+            return;
+        }
+        if st.limit_price > 0.0 && st.remaining_size > 0.0 {
             if let Some(re) = self.risk_engine.as_ref() {
                 re.release_reserve(&st.token_id, st.remaining_size * st.limit_price);
             }
+        } else {
+            tracing::warn!(
+                "settle_cancel: BUY 订单 limit_price/remaining 非正，跳过预留释放（保守 fail-closed）client_order_id={} limit_price={} remaining={}",
+                st.client_order_id,
+                st.limit_price,
+                st.remaining_size
+            );
         }
-        self.order_store.mark_cancelled(client_order_id);
     }
 
     /// P1-031：重建远端仍 open 的 BUY 订单的预留额度。
@@ -1012,17 +1037,12 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
             .await
         {
             Ok(()) => {
-                // G4 / P1-RISK-006：取消成功后释放预留并标记 OrderStore。
-                // req.order_id 可能是 client_order_id 或 exchange_order_id，两者都尝试。
-                match self.order_store.get(&req.order_id) {
-                    Some(st) => self.settle_cancel(&st.client_order_id),
-                    None => {
-                        if let Some(st) =
-                            self.order_store.get_by_exchange_order_id(&req.order_id)
-                        {
-                            self.settle_cancel(&st.client_order_id);
-                        }
-                    }
+                // A1：req.order_id 可能是 client_order_id 或 exchange_order_id；
+                // 仅当活动态→Cancelled 转换成功时才释放预留（两条路径均覆盖）。
+                if self.order_store.get(&req.order_id).is_some() {
+                    self.settle_cancel(&req.order_id);
+                } else {
+                    self.settle_cancel_by_exchange(&req.order_id);
                 }
                 Ok(Response::new(pb::CancelResult {
                     success: true,
@@ -2188,5 +2208,203 @@ mod tests {
         assert!(engine
             .check_and_reserve("tok-2", Side::Buy, 100.0, 100.0, 0)
             .is_ok());
+    }
+
+    /// A1：终态订单不得被 `settle_cancel` 再次释放预留（先转换成功再释放）。
+    ///
+    /// 旧实现先释放后转换：终态订单仍会释放预留（over-release）。
+    #[tokio::test]
+    async fn test_settle_cancel_terminal_order_not_released() {
+        use crate::fast::order_state::OrderStateStatus;
+
+        let mut service = ExecutionServiceImpl::new_mock();
+        let engine = Arc::new(RiskEngine::new(RiskConfig {
+            max_position_per_market: 100.0,
+            max_global_exposure: 100.0,
+            ..Default::default()
+        }));
+        service.set_risk_engine(engine.clone());
+
+        service.order_store.create(
+            "c1".to_string(), "tok-c".to_string(), "BUY".to_string(), 100.0,
+        );
+        service.order_store.set_limit_price("c1", 0.5);
+        if let Some(mut st) = service.order_store.get("c1") {
+            st.mark_submitted("ex-c".to_string());
+            st.mark_live();
+            service.order_store.upsert(st);
+        }
+        engine
+            .check_and_reserve("tok-c", Side::Buy, 50.0, 100.0, 0)
+            .unwrap();
+        // 预留 50 已占用：再要 60 应被拒（50+60>100）
+        assert!(engine.check_and_reserve("tok-c", Side::Buy, 60.0, 60.0, 0).is_err());
+
+        // 模拟订单已被并发/外部置为终态 Cancelled（预留未释放）
+        service.order_store.mark_cancelled("c1");
+        assert_eq!(
+            service.order_store.get("c1").map(|s| s.status),
+            Some(OrderStateStatus::Cancelled)
+        );
+
+        // 再次 settle_cancel：终态 → 不得释放预留
+        service.settle_cancel("c1");
+        assert!(
+            engine.check_and_reserve("tok-c", Side::Buy, 60.0, 60.0, 0).is_err(),
+            "终态订单不得被 settle_cancel 释放预留（防 over-release）"
+        );
+    }
+
+    /// A1：`settle_cancel` 幂等——首次成功转换并释放，再次调用不再释放。
+    #[tokio::test]
+    async fn test_settle_cancel_idempotent() {
+        use crate::fast::order_state::OrderStateStatus;
+
+        let mut service = ExecutionServiceImpl::new_mock();
+        let engine = Arc::new(RiskEngine::new(RiskConfig {
+            max_position_per_market: 100.0,
+            max_global_exposure: 100.0,
+            ..Default::default()
+        }));
+        service.set_risk_engine(engine.clone());
+
+        service.order_store.create(
+            "c1".to_string(), "tok-c".to_string(), "BUY".to_string(), 100.0,
+        );
+        service.order_store.set_limit_price("c1", 0.5);
+        if let Some(mut st) = service.order_store.get("c1") {
+            st.mark_submitted("ex-c".to_string());
+            st.mark_live();
+            service.order_store.upsert(st);
+        }
+        engine
+            .check_and_reserve("tok-c", Side::Buy, 50.0, 100.0, 0)
+            .unwrap();
+
+        service.settle_cancel("c1");
+        // 已释放：可满额预留 100
+        assert!(engine.check_and_reserve("tok-c", Side::Buy, 100.0, 100.0, 0).is_ok());
+        service.settle_cancel("c1"); // 二次：终态 → no-op（不得再释放/负释放）
+        assert!(engine.check_and_reserve("tok-c", Side::Buy, 1.0, 1.0, 0).is_err());
+        assert_eq!(
+            service.order_store.get("c1").map(|s| s.status),
+            Some(OrderStateStatus::Cancelled)
+        );
+    }
+
+    /// A1：按 exchange_order_id 取消同样先转换成功再释放预留。
+    #[tokio::test]
+    async fn test_settle_cancel_by_exchange_releases_reserve() {
+        use crate::fast::order_state::OrderStateStatus;
+
+        let mut service = ExecutionServiceImpl::new_mock();
+        let engine = Arc::new(RiskEngine::new(RiskConfig {
+            max_position_per_market: 100.0,
+            max_global_exposure: 100.0,
+            ..Default::default()
+        }));
+        service.set_risk_engine(engine.clone());
+
+        service.order_store.create(
+            "c1".to_string(), "tok-c".to_string(), "BUY".to_string(), 100.0,
+        );
+        service.order_store.set_limit_price("c1", 0.5);
+        if let Some(mut st) = service.order_store.get("c1") {
+            st.mark_submitted("ex-c".to_string());
+            st.mark_live();
+            service.order_store.upsert(st);
+        }
+        engine
+            .check_and_reserve("tok-c", Side::Buy, 50.0, 100.0, 0)
+            .unwrap();
+
+        service.settle_cancel_by_exchange("ex-c");
+        assert!(engine.check_and_reserve("tok-c", Side::Buy, 100.0, 100.0, 0).is_ok());
+        assert_eq!(
+            service.order_store.get("c1").map(|s| s.status),
+            Some(OrderStateStatus::Cancelled)
+        );
+        // 不存在的 exchange id → no-op（不 panic、不释放）
+        service.settle_cancel_by_exchange("no-such-id");
+    }
+
+    /// A1：`limit_price<=0` 时明确告警且**不释放**（保守 fail-closed），不影响他人预留。
+    #[tokio::test]
+    async fn test_settle_cancel_missing_limit_price_does_not_release_others() {
+        use crate::fast::order_state::OrderStateStatus;
+
+        let mut service = ExecutionServiceImpl::new_mock();
+        let engine = Arc::new(RiskEngine::new(RiskConfig {
+            max_position_per_market: 1000.0,
+            max_global_exposure: 1000.0,
+            ..Default::default()
+        }));
+        service.set_risk_engine(engine.clone());
+
+        // c2：正常订单，预留 50（同 token）
+        service.order_store.create(
+            "c2".to_string(), "tok-x".to_string(), "BUY".to_string(), 100.0,
+        );
+        service.order_store.set_limit_price("c2", 0.5);
+        if let Some(mut st) = service.order_store.get("c2") {
+            st.mark_submitted("ex-2".to_string());
+            st.mark_live();
+            service.order_store.upsert(st);
+        }
+        engine
+            .check_and_reserve("tok-x", Side::Buy, 50.0, 100.0, 0)
+            .unwrap();
+
+        // c1：缺 limit_price（0），同 token
+        service.order_store.create(
+            "c1".to_string(), "tok-x".to_string(), "BUY".to_string(), 100.0,
+        );
+
+        service.settle_cancel("c1");
+        assert_eq!(
+            service.order_store.get("c1").map(|s| s.status),
+            Some(OrderStateStatus::Cancelled)
+        );
+        // 未释放任何预留（c2 的 50 仍占用）：50+960>1000 → 应被拒
+        assert!(engine.check_and_reserve("tok-x", Side::Buy, 960.0, 960.0, 0).is_err());
+    }
+
+    /// A1：已 Filled 订单不能被 cancel 释放（终态保护）。
+    #[tokio::test]
+    async fn test_settle_cancel_filled_order_not_released() {
+        use crate::fast::order_state::OrderStateStatus;
+
+        let mut service = ExecutionServiceImpl::new_mock();
+        let engine = Arc::new(RiskEngine::new(RiskConfig {
+            max_position_per_market: 100.0,
+            max_global_exposure: 100.0,
+            ..Default::default()
+        }));
+        service.set_risk_engine(engine.clone());
+
+        service.order_store.create(
+            "c1".to_string(), "tok-c".to_string(), "BUY".to_string(), 100.0,
+        );
+        service.order_store.set_limit_price("c1", 0.5);
+        if let Some(mut st) = service.order_store.get("c1") {
+            st.mark_submitted("ex-c".to_string());
+            st.mark_live();
+            service.order_store.upsert(st);
+        }
+        engine
+            .check_and_reserve("tok-c", Side::Buy, 50.0, 100.0, 0)
+            .unwrap();
+        // 全量成交 → Filled
+        service
+            .order_store
+            .apply_fill_by_exchange_order_id("ex-c", 100.0);
+
+        service.settle_cancel("c1");
+        assert_eq!(
+            service.order_store.get("c1").map(|s| s.status),
+            Some(OrderStateStatus::Filled)
+        );
+        // Filled 终态 → 不得释放：预留仍占用，再要 60 被拒
+        assert!(engine.check_and_reserve("tok-c", Side::Buy, 60.0, 60.0, 0).is_err());
     }
 }

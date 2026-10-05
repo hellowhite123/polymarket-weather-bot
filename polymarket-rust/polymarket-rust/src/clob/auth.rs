@@ -65,7 +65,7 @@ pub fn create_l2_headers(
         &args.method,
         &args.request_path,
         args.body.as_deref(),
-    );
+    )?;
     let address = format!("{:?}", wallet.address());
 
     let mut headers = HashMap::new();

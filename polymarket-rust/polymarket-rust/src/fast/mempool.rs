@@ -497,6 +497,19 @@ impl PendingOrderTracker {
         )
     }
 
+    /// A6：全局容量只统计 active（Submitted/Accepted）条目；terminal 不占用容量。
+    fn active_global_count(orders: &std::collections::HashMap<String, PendingEntry>) -> usize {
+        orders
+            .values()
+            .filter(|e| {
+                matches!(
+                    e.status,
+                    PendingStatus::Submitted | PendingStatus::Accepted
+                )
+            })
+            .count()
+    }
+
     /// 检查是否允许新增 pending 订单（不实际添加）
     ///
     /// 锁顺序统一为「先 orders 后 counts」，与写锁路径（`try_submit`）
@@ -515,11 +528,12 @@ impl PendingOrderTracker {
             }
         }
 
-        // 检查全局上限
-        if orders.len() >= self.max_global {
+        // 检查全局上限（A6：只统计 active 条目，terminal 不占用容量）
+        let active = Self::active_global_count(&orders);
+        if active >= self.max_global {
             return Err(ClobError::OrderFailed(format!(
                 "全局 Pending 上限: 已有 {} 笔挂单 (上限 {})",
-                orders.len(),
+                active,
                 self.max_global
             )));
         }
@@ -545,11 +559,12 @@ impl PendingOrderTracker {
             )));
         }
 
-        // 检查全局上限
-        if orders.len() >= self.max_global {
+        // 检查全局上限（A6：只统计 active 条目，terminal 不占用容量）
+        let active = Self::active_global_count(&orders);
+        if active >= self.max_global {
             return Err(ClobError::OrderFailed(format!(
                 "全局 Pending 上限: 已有 {} 笔挂单 (上限 {})",
-                orders.len(),
+                active,
                 self.max_global
             )));
         }
@@ -1204,6 +1219,71 @@ mod tests {
         );
         // confirmed 后不再计入 pending
         assert_eq!(tracker.pending_count_for_token("t"), 0);
+    }
+
+    // ========== A6：terminal 状态释放全局容量 ==========
+
+    fn a6_entry(token: &str) -> PendingEntry {
+        PendingEntry {
+            fingerprint: OrderFingerprint::new(token, Side::Buy, 0.5, 10.0, 0.01),
+            order_id: None,
+            submitted_at: Instant::now(),
+            status: PendingStatus::Submitted,
+            price: 0.5,
+            size: 10.0,
+        }
+    }
+
+    /// A6：Confirmed/Cancelled 后全局容量必须可复用（旧实现用 orders.len() 永久占用）。
+    #[test]
+    fn test_a6_terminal_frees_global_capacity() {
+        let tracker = PendingOrderTracker::new(Duration::from_secs(30), 10, 2);
+        tracker.try_submit("o1".into(), a6_entry("t")).unwrap();
+        tracker.try_submit("o2".into(), a6_entry("t")).unwrap();
+        // 全局满 → 第三个拒绝
+        assert!(tracker.try_submit("o3".into(), a6_entry("t")).is_err());
+
+        tracker.update_status("o1", PendingStatus::Confirmed);
+        assert!(
+            tracker.try_submit("o3".into(), a6_entry("t")).is_ok(),
+            "Confirmed 后应释放全局容量"
+        );
+
+        tracker.update_status("o2", PendingStatus::Cancelled);
+        assert!(
+            tracker.try_submit("o4".into(), a6_entry("t")).is_ok(),
+            "Cancelled 后应释放全局容量"
+        );
+    }
+
+    /// A6：Failed/Stale 也属于可回收终态。
+    #[test]
+    fn test_a6_failed_stale_free_global_capacity() {
+        let tracker = PendingOrderTracker::new(Duration::from_secs(30), 10, 1);
+        tracker.try_submit("o1".into(), a6_entry("t")).unwrap();
+        assert!(tracker.try_submit("o2".into(), a6_entry("t")).is_err());
+
+        tracker.update_status("o1", PendingStatus::Failed);
+        assert!(tracker.try_submit("o2".into(), a6_entry("t")).is_ok());
+
+        tracker.update_status("o2", PendingStatus::Stale);
+        assert!(tracker.try_submit("o3".into(), a6_entry("t")).is_ok());
+    }
+
+    /// A6：重复终态更新不应重复扣减 / 泄漏容量。
+    #[test]
+    fn test_a6_repeated_terminal_update_idempotent() {
+        let tracker = PendingOrderTracker::new(Duration::from_secs(30), 10, 1);
+        tracker.try_submit("o1".into(), a6_entry("t")).unwrap();
+        tracker.update_status("o1", PendingStatus::Confirmed);
+        tracker.update_status("o1", PendingStatus::Confirmed); // 重复
+        assert!(tracker.try_submit("o2".into(), a6_entry("t")).is_ok());
+
+        // temp key → exchange key 迁移不改变 active 计数
+        tracker.update_order_id("o2", "ex-2");
+        assert!(tracker.try_submit("o3".into(), a6_entry("t")).is_err());
+        tracker.update_status("ex-2", PendingStatus::Cancelled);
+        assert!(tracker.try_submit("o3".into(), a6_entry("t")).is_ok());
     }
 
     #[test]

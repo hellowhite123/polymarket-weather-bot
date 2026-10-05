@@ -563,3 +563,37 @@ def test_r5_002_t12_aggregator_final_authority_not_overridden():
     # advisory quantity 不同，但最终 quantity 相同（由 PositionSizer 决定）
     assert o_small[0].quantity == o_large[0].quantity
     assert o_small[0].quantity != 999.0
+
+
+# ================================================================
+# A8：R5-002 cap 在 USDC notional 层生效（补测试，不改公式）
+# ================================================================
+
+
+def test_r5_002_a8_cap_is_usdc_notional_across_costs():
+    """cap 作用于 USDC notional：不同 cost 下 qty×cost == cap。"""
+    # edge→1（market_dev 很大），advisory_notional=250 > cap=100 → capped=100 USDC
+    q_yes = _r5_002_quantity(10.0, 1.0, 0.25, max_position_per_market=100.0)
+    q_no = _r5_002_quantity(10.0, 1.0, 0.75, max_position_per_market=100.0)
+    assert abs(q_yes * 0.25 - 100.0) < 1e-2, "cap 应在 USDC notional 层（YES cost）"
+    assert abs(q_no * 0.75 - 100.0) < 1e-2, "cap 应在 USDC notional 层（NO cost）"
+    # 若误把 cap 当 shares，则 q_yes==q_no==100
+    assert q_yes != q_no
+
+
+def test_r5_002_a8_below_cap_not_capped():
+    """advisory_notional < cap 时不 cap：quantity = advisory_notional / cost。"""
+    edge = 1.0 - math.exp(-0.01 / 1.0)
+    expected = (1000.0 * 0.25 * edge) / 0.5
+    q = _r5_002_quantity(0.01, 1.0, 0.5, max_position_per_market=1000.0)
+    assert abs(q - round(expected, 2)) < 1e-6
+
+
+def test_r5_002_a8_cap_exactly_hit():
+    """advisory_notional 恰好等于 cap 时，结果 == cap / cost。"""
+    # 选 market_dev 使 edge = cap/(base*kelly) = 100/(1000*0.25)=0.4
+    # edge=1-exp(-d/sigma) → d = -sigma*ln(0.6)
+    sigma = 1.0
+    d = -sigma * math.log(0.6)
+    q = _r5_002_quantity(d, sigma, 0.5, max_position_per_market=100.0)
+    assert abs(q - 100.0 / 0.5) < 1e-6

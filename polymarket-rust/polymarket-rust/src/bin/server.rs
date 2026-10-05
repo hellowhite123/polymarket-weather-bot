@@ -172,7 +172,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // P1-031：重建远端仍 open 订单的预留额度（sync_position 清空 reserved 后）
+    // P1-031 / A2：重建远端仍 open 订单的预留额度（sync_position 清空 reserved 后）。
+    // A2：重建失败必须 fail-closed —— 不得在预留不一致时进入 READY。
+    let mut reserve_rebuild_ok = true;
     match state_sync.fetch_open_orders().await {
         Ok(open_orders) => {
             service.rebuild_open_order_reserves(&open_orders);
@@ -182,8 +184,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         Err(e) => {
-            tracing::warn!(
-                "StateSync 重建 open 订单预留失败（不阻断启动，预留可能偏保守）: {e}"
+            reserve_rebuild_ok = false;
+            tracing::error!(
+                "StateSync 重建 open 订单预留失败 —— FAIL-CLOSED，保持 TradingGate=Reconciling: {e}"
             );
         }
     }
@@ -204,7 +207,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     order_report.diffs.len(),
 );
     // ★ 只有持仓和订单都完全同步，才允许进入 READY（决策逻辑见 TradingGate::reconcile_complete，可单测）。
-    trading_gate.reconcile_complete(pos_report.in_sync, order_report.in_sync);
+    // A2：预留重建失败时**强制**不进入 READY（fail-closed）。
+    if !reserve_rebuild_ok {
+        trading_gate.reconcile_complete(false, false);
+        tracing::error!("StateSync 启动预留重建失败，TradingGate 保持 Reconciling（FAIL-CLOSED）");
+    } else {
+        trading_gate.reconcile_complete(pos_report.in_sync, order_report.in_sync);
+    }
     if trading_gate.state() == TradingGateState::Ready {
         tracing::info!("StateSync 启动对账通过，TradingGate -> READY");
     } else {
@@ -246,6 +255,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         // P0-007B：后台对账自动恢复（成交补记 / 订单终态 / 仓位重建）
                         let mut applied = 0usize;
+                        // A2：预留重建失败标记（fail-closed，不进入 READY）
+                        let mut rebuild_failed = false;
                         if recovery.has_actions() {
                             applied = svc.apply_recovery(&recovery).await;
                             tracing::info!("StateSync 后台对账恢复 {} 项动作", applied);
@@ -277,21 +288,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     &open_orders,
                                     Some(&rebuilt_tokens),
                                 ),
-                                Err(e) => tracing::warn!(
-                                    "StateSync 后台重建 open 订单预留失败（预留可能偏保守）: {e}"
-                                ),
+                                Err(e) => {
+                                    rebuild_failed = true;
+                                    tracing::error!(
+                                        "StateSync 后台重建 open 订单预留失败 —— FAIL-CLOSED，保持 TradingGate=Reconciling: {e}"
+                                    );
+                                }
                             }
                         }
 
                         // P1-032：发生过差异或恢复动作后，复核对账确认一致才回 Ready。
                         // apply_recovery 改了本地状态，需重新快照后再对账，否则拿的是旧快照。
-                        if !pos.in_sync || !ord.in_sync || applied > 0 || recovery.has_unresolved()
+                        if !pos.in_sync
+                            || !ord.in_sync
+                            || applied > 0
+                            || recovery.has_unresolved()
+                            || rebuild_failed
                         {
                             let local_positions = svc.snapshot_positions().await;
                             let local_orders = svc.snapshot_pending_exchange_order_ids();
                             match ss.full_reconcile(&local_positions, &local_orders).await {
                                 Ok((pos2, ord2)) => {
-                                    tg.reconcile_complete(pos2.in_sync, ord2.in_sync);
+                                    if rebuild_failed {
+                                        tg.reconcile_complete(false, false);
+                                        tracing::error!(
+                                            "StateSync 后台预留重建失败，TradingGate 保持 Reconciling（FAIL-CLOSED）"
+                                        );
+                                    } else {
+                                        tg.reconcile_complete(pos2.in_sync, ord2.in_sync);
+                                    }
                                     if pos2.in_sync && ord2.in_sync {
                                         tracing::info!(
                                             "StateSync 后台对账复核一致，TradingGate -> Ready"

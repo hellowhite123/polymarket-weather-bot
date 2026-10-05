@@ -81,13 +81,13 @@ pub struct RemoteTrade {
 }
 
 impl RemoteTrade {
-    /// 成交价（字符串或数字 → f64）。
-    pub fn price(&self) -> f64 {
+    /// 成交价（字符串或数字 → f64）。A4：非法/缺失/非有限值返回 `Err`。
+    pub fn price(&self) -> Result<f64, String> {
         parse_json_f64(&self.price)
     }
 
-    /// 成交量（字符串或数字 → f64）。
-    pub fn size(&self) -> f64 {
+    /// 成交量（字符串或数字 → f64）。A4：非法/缺失/非有限值返回 `Err`。
+    pub fn size(&self) -> Result<f64, String> {
         parse_json_f64(&self.size)
     }
 
@@ -120,6 +120,8 @@ pub struct PaginatedResponse<T> {
     #[serde(default)]
     pub count: Option<u32>,
     pub data: Vec<T>,
+    #[serde(default, rename = "next_cursor", alias = "nextCursor")]
+    pub next_cursor: Option<String>,
 }
 
 /// 宽松版分页包装：`data` 字段为任意 JSON，用于「先试包装、失败兜底数组」
@@ -141,6 +143,25 @@ struct PaginatedResponseRaw {
 pub const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_secs(30);
 pub const DEFAULT_RECONNECT_BACKOFF_INITIAL: Duration = Duration::from_secs(1);
 pub const DEFAULT_RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
+
+/// A3：分页最大页数保护（防止 cursor 永不结束导致死循环）。
+pub const MAX_PAGINATION_PAGES: usize = 100;
+
+/// A3：解析分页响应（包装对象优先，兜底顶层数组），返回 `(data, next_cursor)`。
+fn parse_paginated<T>(text: &str) -> Result<(Vec<T>, Option<String>), String>
+where
+    T: serde::de::DeserializeOwned,
+{
+    if let Ok(p) = serde_json::from_str::<PaginatedResponse<T>>(text) {
+        let next = p.next_cursor.filter(|c| !c.trim().is_empty());
+        return Ok((p.data, next));
+    }
+    let arr: Vec<T> = serde_json::from_str(text).map_err(|e| {
+        let preview = &text[..text.len().min(200)];
+        format!("body 既不是分页包装也不是数组: {e} (body前200字符: {preview})")
+    })?;
+    Ok((arr, None))
+}
 
 /// 仓位对账容差（token quantity）。与 `reconcile_positions` 现有容差保持一致。
 pub const DEFAULT_POSITION_TOLERANCE: f64 = 1.0;
@@ -389,41 +410,51 @@ impl StateSync {
     /// Data API 与 CLOB `/data/*` 两种响应形态。错误信息保留原始 body
     /// 前 200 字符，便于诊断。
     pub async fn fetch_positions(&self) -> Result<Vec<RemotePosition>, String> {
-        let url = format!(
-            "{}/positions?user={}",
-            self.data_api_host, self.wallet_address
-        );
+        let mut all: Vec<RemotePosition> = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen = std::collections::HashSet::new();
 
-        let resp = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| e.to_string())?;
+        for _ in 0..MAX_PAGINATION_PAGES {
+            let mut url = format!(
+                "{}/positions?user={}",
+                self.data_api_host, self.wallet_address
+            );
+            if let Some(c) = &cursor {
+                url.push_str(&format!("&next_cursor={}", c));
+            }
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!(
-                "positions API request failed: status={}, body={}",
-                status, body
-            ));
+            let resp = self
+                .client
+                .get(&url)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(format!(
+                    "positions API request failed: status={}, body={}",
+                    status, body
+                ));
+            }
+            let text = resp.text().await.map_err(|e| e.to_string())?;
+            let (data, next) = parse_paginated::<RemotePosition>(&text)?;
+            for d in data {
+                if all.iter().all(|x| x.asset != d.asset) {
+                    all.push(d);
+                }
+            }
+            match next {
+                Some(c) => {
+                    if !seen.insert(c.clone()) {
+                        return Err("positions pagination cursor 未推进（fail-closed）".into());
+                    }
+                    cursor = Some(c);
+                }
+                None => return Ok(all),
+            }
         }
-
-        let text = resp.text().await.map_err(|e| e.to_string())?;
-
-        // 1) 优先：PaginatedResponse 包装对象（真实格式）
-        if let Ok(p) = serde_json::from_str::<PaginatedResponse<RemotePosition>>(&text) {
-            return Ok(p.data);
-        }
-        // 2) 兜底：顶层数组（旧/兼容格式）
-        serde_json::from_str::<Vec<RemotePosition>>(&text).map_err(|e| {
-            let preview = &text[..text.len().min(200)];
-            format!(
-                "positions body 既不是包装对象也不是数组: {} (body前200字符: {})",
-                e, preview
-            )
-        })
+        Err("positions pagination 超出最大页数（fail-closed）".into())
     }
 
     /// 拉取用户当前未结订单。
@@ -435,46 +466,68 @@ impl StateSync {
     /// 旧实现按顶层数组解析导致 `error decoding response body`。这里先按包装
     /// 对象解析，失败兜底顶层数组，并保留 body 前 200 字符便于诊断。
     pub async fn fetch_open_orders(&self) -> Result<Vec<serde_json::Value>, String> {
-        let url = format!("{}/data/orders", self.clob_host);
+        let mut all: Vec<serde_json::Value> = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen = std::collections::HashSet::new();
 
-        let timestamp = now_secs();
-        let l2_args = L2HeaderArgs {
-            method: "GET".to_string(),
-            request_path: "/data/orders".to_string(),
-            body: None,
-        };
-        let headers = create_l2_headers(&self.wallet, &self.api_creds, &l2_args, timestamp)
-            .map_err(|e| e.to_string())?;
+        for _ in 0..MAX_PAGINATION_PAGES {
+            let mut request_path = "/data/orders".to_string();
+            let mut url = format!("{}/data/orders", self.clob_host);
+            if let Some(c) = &cursor {
+                let q = format!("?next_cursor={}", c);
+                request_path.push_str(&q);
+                url.push_str(&q);
+            }
 
-        let mut req = self.client.get(&url);
-        for (k, v) in headers {
-            req = req.header(k, v);
+            let timestamp = now_secs();
+            let l2_args = L2HeaderArgs {
+                method: "GET".to_string(),
+                request_path,
+                body: None,
+            };
+            let headers = create_l2_headers(&self.wallet, &self.api_creds, &l2_args, timestamp)
+                .map_err(|e| e.to_string())?;
+
+            let mut req = self.client.get(&url);
+            for (k, v) in headers {
+                req = req.header(k, v);
+            }
+            let resp = req.send().await.map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(format!(
+                    "open orders API request failed: status={}, body={}",
+                    status, body
+                ));
+            }
+            let text = resp.text().await.map_err(|e| e.to_string())?;
+            let (data, next) = parse_paginated::<serde_json::Value>(&text)?;
+            for d in data {
+                let id = d
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let dup = !id.is_empty()
+                    && all.iter().any(|x| {
+                        x.get("id").and_then(|v| v.as_str()).unwrap_or("") == id
+                    });
+                if !dup {
+                    all.push(d);
+                }
+            }
+            match next {
+                Some(c) => {
+                    if !seen.insert(c.clone()) {
+                        return Err("open orders pagination cursor 未推进（fail-closed）".into());
+                    }
+                    cursor = Some(c);
+                }
+                None => return Ok(all),
+            }
         }
-        let resp = req.send().await.map_err(|e| e.to_string())?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!(
-                "open orders API request failed: status={}, body={}",
-                status, body
-            ));
-        }
-
-        let text = resp.text().await.map_err(|e| e.to_string())?;
-
-        // 1) 优先：PaginatedResponse 包装对象（真实格式）
-        if let Ok(p) = serde_json::from_str::<PaginatedResponseRaw>(&text) {
-            return Ok(p.data);
-        }
-        // 2) 兜底：顶层数组（旧/兼容格式）
-        serde_json::from_str::<Vec<serde_json::Value>>(&text).map_err(|e| {
-            let preview = &text[..text.len().min(200)];
-            format!(
-                "open orders body 既不是包装对象也不是数组: {} (body前200字符: {})",
-                e, preview
-            )
-        })
+        Err("open orders pagination 超出最大页数（fail-closed）".into())
     }
 
     /// 拉取当前用户的成交记录（P0-007B 恢复分类用）。
@@ -482,48 +535,58 @@ impl StateSync {
     /// `/data/trades?user=<address>` 需要 L2 认证，响应为 `PaginatedResponse`
     /// 包装对象或顶层数组，与 `fetch_open_orders` 一致地双格式兜底。
     pub async fn fetch_trades(&self) -> Result<Vec<RemoteTrade>, String> {
-        let query = format!("user={}", self.wallet_address);
-        let url = format!("{}/data/trades?{}", self.clob_host, query);
-        let request_path = format!("/data/trades?{}", query);
+        let mut all: Vec<RemoteTrade> = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen = std::collections::HashSet::new();
 
-        let timestamp = now_secs();
-        let l2_args = L2HeaderArgs {
-            method: "GET".to_string(),
-            request_path,
-            body: None,
-        };
-        let headers = create_l2_headers(&self.wallet, &self.api_creds, &l2_args, timestamp)
-            .map_err(|e| e.to_string())?;
+        for _ in 0..MAX_PAGINATION_PAGES {
+            let mut query = format!("user={}", self.wallet_address);
+            if let Some(c) = &cursor {
+                query.push_str(&format!("&next_cursor={}", c));
+            }
+            let url = format!("{}/data/trades?{}", self.clob_host, query);
+            let request_path = format!("/data/trades?{}", query);
 
-        let mut req = self.client.get(&url);
-        for (k, v) in headers {
-            req = req.header(k, v);
+            let timestamp = now_secs();
+            let l2_args = L2HeaderArgs {
+                method: "GET".to_string(),
+                request_path,
+                body: None,
+            };
+            let headers = create_l2_headers(&self.wallet, &self.api_creds, &l2_args, timestamp)
+                .map_err(|e| e.to_string())?;
+
+            let mut req = self.client.get(&url);
+            for (k, v) in headers {
+                req = req.header(k, v);
+            }
+            let resp = req.send().await.map_err(|e| e.to_string())?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(format!(
+                    "trades API request failed: status={}, body={}",
+                    status, body
+                ));
+            }
+            let text = resp.text().await.map_err(|e| e.to_string())?;
+            let (data, next) = parse_paginated::<RemoteTrade>(&text)?;
+            for d in data {
+                if d.id.trim().is_empty() || all.iter().all(|x| x.id != d.id) {
+                    all.push(d);
+                }
+            }
+            match next {
+                Some(c) => {
+                    if !seen.insert(c.clone()) {
+                        return Err("trades pagination cursor 未推进（fail-closed）".into());
+                    }
+                    cursor = Some(c);
+                }
+                None => return Ok(all),
+            }
         }
-        let resp = req.send().await.map_err(|e| e.to_string())?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(format!(
-                "trades API request failed: status={}, body={}",
-                status, body
-            ));
-        }
-
-        let text = resp.text().await.map_err(|e| e.to_string())?;
-
-        // 1) 优先：PaginatedResponse 包装对象（真实格式）
-        if let Ok(p) = serde_json::from_str::<PaginatedResponse<RemoteTrade>>(&text) {
-            return Ok(p.data);
-        }
-        // 2) 兜底：顶层数组（旧/兼容格式）
-        serde_json::from_str::<Vec<RemoteTrade>>(&text).map_err(|e| {
-            let preview = &text[..text.len().min(200)];
-            format!(
-                "trades body 既不是包装对象也不是数组: {} (body前200字符: {})",
-                e, preview
-            )
-        })
+        Err("trades pagination 超出最大页数（fail-closed）".into())
     }
     // ========================================================================
     // 对账
@@ -844,12 +907,20 @@ fn now_secs() -> u64 {
 }
 
 /// 字符串或数字 JSON 值 → f64（兼容 Polymarket 两种价量编码）。
-fn parse_json_f64(v: &serde_json::Value) -> f64 {
-    match v {
-        serde_json::Value::String(s) => s.parse().unwrap_or(0.0),
-        serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0),
-        _ => 0.0,
+fn parse_json_f64(v: &serde_json::Value) -> Result<f64, String> {
+    let value = match v {
+        serde_json::Value::String(s) => s
+            .parse::<f64>()
+            .map_err(|_| format!("invalid float string: {s}"))?,
+        serde_json::Value::Number(n) => {
+            n.as_f64().ok_or_else(|| "invalid JSON number".to_string())?
+        }
+        _ => return Err("expected string or number".to_string()),
+    };
+    if !value.is_finite() {
+        return Err(format!("non-finite value: {value}"));
     }
+    Ok(value)
 }
 
 // ============================================================================
@@ -937,6 +1008,10 @@ pub fn build_recovery_plan(
                     plan.actions
                         .push(RecoveryAction::MarkOrderNonFilled { order_id: order_id.clone() });
                 } else {
+                    // A4：任一笔匹配 trade 的 price/size 非法（缺失/null/非有限/非法字符串）
+                    // → 该订单**不得生成 MarkOrderFilled**，进入 unresolved（fail-closed）。
+                    let mut order_actions = Vec::new();
+                    let mut invalid = false;
                     for t in matched {
                         if t.id.trim().is_empty() {
                             tracing::warn!(
@@ -945,16 +1020,45 @@ pub fn build_recovery_plan(
                             );
                             continue;
                         }
+                        let price = match t.price() {
+                            Ok(p) => p,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "state_sync: 恢复成交 price 非法 order_id={} err={}",
+                                    order_id,
+                                    e
+                                );
+                                invalid = true;
+                                break;
+                            }
+                        };
+                        let size = match t.size() {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "state_sync: 恢复成交 size 非法 order_id={} err={}",
+                                    order_id,
+                                    e
+                                );
+                                invalid = true;
+                                break;
+                            }
+                        };
 
-                        plan.actions.push(RecoveryAction::MarkOrderFilled {
+                        order_actions.push(RecoveryAction::MarkOrderFilled {
                             order_id: order_id.clone(),
                             token_id: t.asset_id.clone(),
                             // P0-EXEC-005：按本方角色归一化方向（maker 取反）
                             side: own_recovery_side(order_id, t),
-                            price: t.price(),
-                            size: t.size(),
+                            price,
+                            size,
                             trade_id: t.id.clone(),
                         });
+                    }
+                    if invalid {
+                        plan.unresolved_orders.push(order_id.clone());
+                    } else {
+                        plan.actions.extend(order_actions);
                     }
                 }
             }
@@ -1226,8 +1330,8 @@ mod tests {
     #[test]
     fn test_remote_trade_price_size_parse_string() {
         let t = remote_trade("t1", "o1", "", "tok-1", "BUY");
-        assert!((t.price() - 0.5).abs() < 1e-9);
-        assert!((t.size() - 10.0).abs() < 1e-9);
+        assert!((t.price().unwrap() - 0.5).abs() < 1e-9);
+        assert!((t.size().unwrap() - 10.0).abs() < 1e-9);
     }
 
     #[test]
@@ -1235,8 +1339,63 @@ mod tests {
         let mut t = remote_trade("t1", "o1", "", "tok-1", "BUY");
         t.price = serde_json::json!(0.62);
         t.size = serde_json::json!(8);
-        assert!((t.price() - 0.62).abs() < 1e-9);
-        assert!((t.size() - 8.0).abs() < 1e-9);
+        assert!((t.price().unwrap() - 0.62).abs() < 1e-9);
+        assert!((t.size().unwrap() - 8.0).abs() < 1e-9);
+    }
+
+    /// A4：非法/缺失/null/非有限值必须返回 Err，不静默转 0.0。
+    #[test]
+    fn test_remote_trade_invalid_price_size_is_err() {
+        let mut t = remote_trade("t1", "o1", "", "tok-1", "BUY");
+        t.price = serde_json::json!("abc");
+        assert!(t.price().is_err(), "非法字符串价格应 Err");
+        t.price = serde_json::Value::Null;
+        assert!(t.price().is_err(), "null 价格应 Err");
+        t.price = serde_json::json!("NaN");
+        assert!(t.price().is_err(), "NaN 价格应 Err");
+        t.size = serde_json::json!("Infinity");
+        assert!(t.size().is_err(), "Infinity 数量应 Err");
+        let empty = RemoteTrade {
+            id: "t".into(),
+            taker_order_id: "o1".into(),
+            maker_order_id: "".into(),
+            side: "BUY".into(),
+            price: serde_json::Value::Null,
+            size: serde_json::Value::Null,
+            asset_id: "tok-1".into(),
+        };
+        assert!(empty.price().is_err() && empty.size().is_err());
+    }
+
+    /// A4：非法 price/size 的恢复成交不得生成 MarkOrderFilled，应进入 unresolved。
+    #[test]
+    fn test_build_recovery_plan_invalid_trade_goes_unresolved() {
+        let local_pos: HashMap<String, f64> = HashMap::new();
+        let remote_positions: Vec<RemotePosition> = Vec::new();
+        let local_pending: std::collections::HashSet<String> = ["o1".to_string()].into();
+        let remote_open: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut bad = remote_trade("t1", "o1", "", "tok-1", "BUY");
+        bad.price = serde_json::json!("not-a-number");
+
+        let plan = build_recovery_plan(
+            &local_pos,
+            &remote_positions,
+            &local_pending,
+            &remote_open,
+            Some(&[bad]),
+            1.0,
+        );
+
+        assert!(
+            plan.actions
+                .iter()
+                .all(|a| !matches!(a, RecoveryAction::MarkOrderFilled { .. })),
+            "非法 price 不得生成 MarkOrderFilled"
+        );
+        assert!(
+            plan.unresolved_orders.contains(&"o1".to_string()),
+            "非法恢复成交应进入 unresolved（fail-closed）"
+        );
     }
 
     #[test]
@@ -1590,5 +1749,168 @@ mod tests {
         let t: RemoteTrade = serde_json::from_str(snake).unwrap();
         assert_eq!(t.taker_order_id, "o1");
         assert_eq!(t.asset_id, "tok-1");
+    }
+
+    // ── A3：分页 ──
+
+    fn test_sync_host(host: &str) -> StateSync {
+        let wallet: LocalWallet =
+            "bd8024c85d743569c738586185ca743b40af25c0144f8bf1cc7c719bd987a56b"
+                .parse()
+                .unwrap();
+        let creds = ApiKeyCreds {
+            key: "k".into(),
+            secret: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".into(),
+            passphrase: "p".into(),
+        };
+        StateSync::new(host, host, "0xabc", wallet, creds)
+    }
+
+    #[tokio::test]
+    async fn test_a3_fetch_positions_paginates_two_pages() {
+        use wiremock::matchers::{method, path, query_param, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/positions"))
+            .and(query_param("next_cursor", "c2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [
+                    {"asset":"B","conditionId":"c","size":2.0,"avgPrice":0.5,"currentValue":1.0,"cashPnl":0.0}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/positions"))
+            .and(query_param("user", "0xabc"))
+            .and(query_param_is_missing("next_cursor"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "next_cursor": "c2",
+                "data": [
+                    {"asset":"A","conditionId":"c","size":1.0,"avgPrice":0.5,"currentValue":0.5,"cashPnl":0.0}
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let sync = test_sync_host(&server.uri());
+        let pos = sync.fetch_positions().await.unwrap();
+        assert_eq!(pos.len(), 2, "应合并两页（A+B）");
+    }
+
+    #[tokio::test]
+    async fn test_a3_cursor_not_advancing_fails_closed() {
+        use wiremock::matchers::{method, path, query_param, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/positions"))
+            .and(query_param("next_cursor", "c2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "next_cursor": "c2",
+                "data": [{"asset":"B","conditionId":"c","size":2.0,"avgPrice":0.5,"currentValue":1.0,"cashPnl":0.0}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/positions"))
+            .and(query_param_is_missing("next_cursor"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "next_cursor": "c2",
+                "data": [{"asset":"A","conditionId":"c","size":1.0,"avgPrice":0.5,"currentValue":0.5,"cashPnl":0.0}]
+            })))
+            .mount(&server)
+            .await;
+
+        let sync = test_sync_host(&server.uri());
+        let err = sync.fetch_positions().await.unwrap_err();
+        assert!(err.contains("未推进"), "cursor 不推进应 fail-closed: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_a3_mid_page_error_fails_closed() {
+        use wiremock::matchers::{method, path, query_param, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/positions"))
+            .and(query_param("next_cursor", "c2"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/positions"))
+            .and(query_param_is_missing("next_cursor"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "next_cursor": "c2",
+                "data": [{"asset":"A","conditionId":"c","size":1.0,"avgPrice":0.5,"currentValue":0.5,"cashPnl":0.0}]
+            })))
+            .mount(&server)
+            .await;
+
+        let sync = test_sync_host(&server.uri());
+        assert!(sync.fetch_positions().await.is_err(), "中间页 HTTP 错误不得返回不完整结果");
+    }
+
+    #[tokio::test]
+    async fn test_a3_fetch_open_orders_two_pages() {
+        use wiremock::matchers::{method, path, query_param, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/data/orders"))
+            .and(query_param("next_cursor", "c2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id": "o2"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/data/orders"))
+            .and(query_param_is_missing("next_cursor"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "next_cursor": "c2",
+                "data": [{"id": "o1"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let sync = test_sync_host(&server.uri());
+        let orders = sync.fetch_open_orders().await.unwrap();
+        assert_eq!(orders.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_a3_fetch_trades_two_pages() {
+        use wiremock::matchers::{method, path, query_param, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/data/trades"))
+            .and(query_param("next_cursor", "c2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{"id":"t2","takerOrderId":"o2","makerOrderId":"","side":"BUY","price":"0.5","size":"10","assetId":"tok-1"}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/data/trades"))
+            .and(query_param_is_missing("next_cursor"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "next_cursor": "c2",
+                "data": [{"id":"t1","takerOrderId":"o1","makerOrderId":"","side":"BUY","price":"0.5","size":"10","assetId":"tok-1"}]
+            })))
+            .mount(&server)
+            .await;
+
+        let sync = test_sync_host(&server.uri());
+        let trades = sync.fetch_trades().await.unwrap();
+        assert_eq!(trades.len(), 2);
     }
 }

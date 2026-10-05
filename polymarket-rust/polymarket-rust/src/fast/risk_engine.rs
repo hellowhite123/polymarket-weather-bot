@@ -424,6 +424,19 @@ impl PositionLimits {
             .get(token_id)
             .map(|e| (e.qty, e.notional))
     }
+
+    /// A7：单市场 committed 暴露 = filled notional + reserved。
+    ///
+    /// 集中度检查的**分子**必须用此口径（与分母 `committed_total` 统一），
+    /// 否则同市场 pending 预留被漏计入分子，集中度被低估。
+    pub fn market_committed(&self, token_id: &str) -> f64 {
+        self.positions
+            .read()
+            .unwrap()
+            .get(token_id)
+            .map(|e| e.notional + e.reserved)
+            .unwrap_or(0.0)
+    }
     /// 返回当前所有市场的仓位数量快照。
     ///
     /// key: token_id
@@ -1061,15 +1074,19 @@ impl RiskEngine {
         notional: f64,
         already_reserved: bool,
     ) -> ClobResult<()> {
-        let market_pos = self
-            .position_limits
-            .market_position(token_id)
-            .map(|(_, v)| v)
-            .unwrap_or(0.0);
-        let new_market = if matches!(side, crate::types::enums::Side::Buy) {
-            market_pos + notional
-        } else {
-            (market_pos - notional).max(0.0)
+        // A7：分子改用 committed（filled + reserved），与分母 committed_total 统一口径。
+        // `already_reserved=true` 表示本单 notional 已进入 reserved（Buy 预留后调用），
+        // 此时不得再重复加 notional。
+        let market_committed = self.position_limits.market_committed(token_id);
+        let new_market = match side {
+            crate::types::enums::Side::Buy => {
+                if already_reserved {
+                    market_committed
+                } else {
+                    market_committed + notional
+                }
+            }
+            crate::types::enums::Side::Sell => (market_committed - notional).max(0.0),
         };
         let committed = self.position_limits.committed_total();
         let future_total = if already_reserved {
@@ -1668,6 +1685,38 @@ mod tests {
         assert!(engine
             .check_and_reserve("b", Side::Buy, 4500.0, 4500.0, 50)
             .is_err());
+    }
+
+    /// A7：集中度**分子**必须计入同 token 的 pending reserve（committed 口径）。
+    ///
+    /// 旧实现分子用 `market_position()`（仅 filled）→ 同 token pending 预留被漏计，
+    /// 集中度被低估而错误放行。
+    #[test]
+    fn test_a7_concentration_numerator_counts_pending_reserve() {
+        let cfg = RiskConfig {
+            max_position_per_market: 10_000.0,
+            max_global_exposure: 1_000_000.0,
+            max_concentration: 0.3,
+            ..Default::default()
+        };
+        let engine = RiskEngine::new(cfg);
+
+        // 另一市场 X 已成交 21000（> 2×max 以触发集中度门禁）
+        engine.on_fill("X", Side::Buy, 21000.0, 21000.0);
+        // 同 token "t" 已有 pending 预留 7500（filled=0）
+        engine
+            .check_and_reserve("t", Side::Buy, 7500.0, 7500.0, 0)
+            .unwrap();
+
+        // 再下 Buy 2000：position limit PASS（t committed 9500 ≤ 10000）、
+        // global PASS；A7 分子 = market_committed(t) = 9500 → 9500/30500 ≈ 31.2% > 30% → 拒。
+        // 旧（filled-only）分子 = 0 + 2000 = 2000 → 2000/30500 ≈ 6.6% → 错误放行。
+        assert!(
+            engine
+                .check_and_reserve("t", Side::Buy, 2000.0, 2000.0, 0)
+                .is_err(),
+            "同 token pending reserve 必须计入集中度分子"
+        );
     }
 
     /// R5-001（Test A）：Sell 只因**集中度**被拒——Position Limit / Global Exposure 均 PASS。

@@ -8,6 +8,8 @@ use base64::Engine;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
+use crate::clob::error::{ClobError, ClobResult};
+
 type HmacSha256 = Hmac<Sha256>;
 
 /// 构建 Polymarket L2 认证的 HMAC 签名
@@ -24,24 +26,28 @@ pub fn build_poly_hmac_signature(
     method: &str,
     request_path: &str,
     body: Option<&str>,
-) -> String {
+) -> ClobResult<String> {
     // 构建待签名消息：{timestamp}{METHOD}{path}{body}
     let mut message = format!("{timestamp}{method}{request_path}");
     if let Some(b) = body {
         message.push_str(b);
     }
 
-    // secret 为 URL-safe base64（带 padding），与官方 rs-clob-client 一致
+    // A5：secret 必须为 URL-safe base64（带 padding）；空/非法一律 **fail-closed**，
+    // 不再回退为 raw ASCII（旧 fallback 会把配置错误静默当密钥用 → 401 难排查）。
+    if secret.trim().is_empty() {
+        return Err(ClobError::AuthFailed("empty API secret".into()));
+    }
     let secret_bytes = URL_SAFE
         .decode(secret)
-        .unwrap_or_else(|_| secret.as_bytes().to_vec());
+        .map_err(|e| ClobError::AuthFailed(format!("invalid base64 API secret: {e}")))?;
 
     let mut mac = HmacSha256::new_from_slice(&secret_bytes).expect("HMAC 密钥长度错误");
     mac.update(message.as_bytes());
     let result = mac.finalize().into_bytes();
 
     // 输出 URL-safe base64（带 padding），与官方一致
-    URL_SAFE.encode(result)
+    Ok(URL_SAFE.encode(result))
 }
 
 #[cfg(test)]
@@ -52,7 +58,8 @@ mod tests {
     fn test_hmac_signature() {
         // 使用一个固定的 secret 和参数验证签名生成不报错
         let secret = "dGVzdC1zZWNyZXQta2V5LWZvci1wb2x5bWFya2V0"; // "test-secret-key-for-polymarket"
-        let sig = build_poly_hmac_signature(secret, 1234567890, "GET", "/data/orders", None);
+        let sig =
+            build_poly_hmac_signature(secret, 1234567890, "GET", "/data/orders", None).unwrap();
         assert!(!sig.is_empty());
         // 验证 URL-safe：不含 + 或 /
         assert!(!sig.contains('+'));
@@ -69,7 +76,21 @@ mod tests {
             "test-sign",
             "/orders",
             Some(r#"{"hash":"0x123"}"#),
-        );
+        )
+        .unwrap();
         assert_eq!(sig, "4gJVbox-R6XlDK4nlaicig0_ANVL1qdcahiL8CXfXLM=");
+    }
+
+    /// A5：非法 base64 / 空 secret 必须 fail-closed，不再回退 raw ASCII。
+    #[test]
+    fn test_hmac_invalid_secret_fails_closed() {
+        assert!(
+            build_poly_hmac_signature("", 1, "GET", "/x", None).is_err(),
+            "空 secret 应 Err"
+        );
+        assert!(
+            build_poly_hmac_signature("!!!not-base64!!!", 1, "GET", "/x", None).is_err(),
+            "非法 base64 应 Err"
+        );
     }
 }
