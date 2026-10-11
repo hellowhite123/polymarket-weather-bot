@@ -56,8 +56,10 @@ impl OrderType {
 /// 签名类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
+#[derive(Default)]
 pub enum SignatureType {
     /// EOA 钱包签名
+    #[default]
     Eoa = 0,
     /// Polymarket Proxy 钱包签名
     PolyProxy = 1,
@@ -65,11 +67,6 @@ pub enum SignatureType {
     PolyGnosisSafe = 2,
 }
 
-impl Default for SignatureType {
-    fn default() -> Self {
-        SignatureType::Eoa
-    }
-}
 
 /// 链 ID
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

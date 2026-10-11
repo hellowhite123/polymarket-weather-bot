@@ -6,8 +6,8 @@ use crate::wallet::error::{WalletError, WalletResult};
 use crate::wallet::keystore::{EncryptedKey, KeyStore};
 use ethers::signers::{LocalWallet, Signer};
 use ethers::types::Signature;
-use std::str::FromStr;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Mutex;
 
 /// 钱包管理器，负责密钥库的加载、保存和私钥的安全管理
@@ -38,7 +38,10 @@ impl WalletManager {
         } else {
             KeyStore::new()
         };
-        Ok(Self { keystore: Mutex::new(keystore), path })
+        Ok(Self {
+            keystore: Mutex::new(keystore),
+            path,
+        })
     }
 
     /// 将密钥库保存到磁盘
@@ -83,12 +86,18 @@ impl WalletManager {
         let encrypted = ks
             .find(address)
             .ok_or_else(|| WalletError::WalletNotFound(address.to_string()))?;
+        // R5-005：private_key 为 Zeroizing<String>，解析出 LocalWallet 后即擦除。
         let private_key = encrypted.decrypt(password)?;
-        parse_wallet(&private_key)
+        parse_wallet(private_key.as_str())
     }
 
     /// 使用指定钱包对原始消息进行 EIP-191 签名
-    pub async fn sign_message(&self, address: &str, password: &str, message: &[u8]) -> WalletResult<Signature> {
+    pub async fn sign_message(
+        &self,
+        address: &str,
+        password: &str,
+        message: &[u8],
+    ) -> WalletResult<Signature> {
         let wallet = self.unlock(address, password)?;
         let sig = wallet.sign_message(message).await?;
         Ok(sig)
@@ -98,7 +107,12 @@ impl WalletManager {
     ///
     /// 用于 EIP-712 typed data 签名：先计算出 typed data hash，
     /// 再用此方法签名
-    pub async fn sign_hash(&self, address: &str, password: &str, hash: ethers::types::H256) -> WalletResult<Signature> {
+    pub async fn sign_hash(
+        &self,
+        address: &str,
+        password: &str,
+        hash: ethers::types::H256,
+    ) -> WalletResult<Signature> {
         let wallet = self.unlock(address, password)?;
         let sig = wallet.sign_hash(hash)?;
         Ok(sig)

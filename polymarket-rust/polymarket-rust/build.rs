@@ -10,7 +10,7 @@
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tonic_build::configure()
         .build_server(true)
-        .build_client(false)  // Rust 端只做 server
+        .build_client(false) // Rust 端只做 server
         .compile_protos(&["proto/polymarket.proto"], &["proto"])?;
 
     println!("cargo:rerun-if-changed=proto/polymarket.proto");

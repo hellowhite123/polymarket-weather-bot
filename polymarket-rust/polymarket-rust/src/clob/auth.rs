@@ -29,11 +29,24 @@ pub async fn create_l1_headers(
     let sig = build_l1_signature(wallet, timestamp, nonce)?;
     let address = format!("{:?}", wallet.address());
 
+    tracing::info!(
+        "L1 AUTH address={} timestamp={} nonce={} sig={}",
+        address,
+        timestamp,
+        nonce,
+        sig
+    );
+
     let mut headers = HashMap::new();
+
     headers.insert("POLY_ADDRESS".to_string(), address);
+
     headers.insert("POLY_SIGNATURE".to_string(), sig);
+
     headers.insert("POLY_TIMESTAMP".to_string(), timestamp.to_string());
+
     headers.insert("POLY_NONCE".to_string(), nonce.to_string());
+
     Ok(headers)
 }
 
@@ -52,7 +65,7 @@ pub fn create_l2_headers(
         &args.method,
         &args.request_path,
         args.body.as_deref(),
-    );
+    )?;
     let address = format!("{:?}", wallet.address());
 
     let mut headers = HashMap::new();

@@ -10,15 +10,20 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::Utc;
-use tokio::sync::Mutex;
+use tokio::sync::{broadcast, Mutex};
 use tonic::{Request, Response, Status};
 
 use crate::clob::client::ClobConfig;
 use crate::fast::executor::FastExecutor;
 use crate::fast::fill_records::{compute_slippage, FillLedger, FillRecord};
-use crate::fast::order_state::{OrderState, OrderStore};
-use crate::fast::risk_engine::{RiskConfig, RiskEngine};
-use crate::order::{OrderFlow, PlaceOrderParams};
+use crate::fast::market_events::{MarketEvent, TradeEvent};
+use crate::fast::order_state::OrderStore;
+use crate::fast::risk_engine::RiskEngine;
+use crate::fast::state_sync::{
+    InDoubtOrder, InDoubtResolution, RecoveryAction, RecoveryPlan,
+};
+use crate::fast::trading_gate::TradingGate;
+use crate::order::OrderFlow;
 use crate::types::enums::{OrderType, Side};
 use crate::wallet::WalletManager;
 
@@ -37,10 +42,31 @@ fn direction_to_side(direction: i32) -> Result<Side, Status> {
     match direction {
         x if x == pb::Direction::BuyYes as i32 => Ok(Side::Buy),
         x if x == pb::Direction::BuyNo as i32 => Ok(Side::Buy),
-        _ => Err(Status::invalid_argument(format!(
-            "未知方向: {}",
-            direction
-        ))),
+        _ => Err(Status::invalid_argument(format!("未知方向: {}", direction))),
+    }
+}
+
+/// 已有订单状态 → 幂等返回的 OrderResult。
+fn existing_order_result(existing: &crate::fast::order_state::OrderState) -> pb::OrderResult {
+    use crate::fast::order_state::OrderStateStatus;
+    let status = match existing.status {
+        OrderStateStatus::Filled => pb::ExecutionStatus::Filled as i32,
+        OrderStateStatus::PartialFilled => pb::ExecutionStatus::Partial as i32,
+        OrderStateStatus::Live => pb::ExecutionStatus::Live as i32,
+        OrderStateStatus::Rejected => pb::ExecutionStatus::Rejected as i32,
+        OrderStateStatus::Cancelled => pb::ExecutionStatus::Cancelled as i32,
+        _ => pb::ExecutionStatus::Pending as i32,
+    };
+    pb::OrderResult {
+        order_id: existing.client_order_id.clone(),
+        success: true,
+        exchange_order_id: existing.exchange_order_id.clone().unwrap_or_default(),
+        error_message: String::new(),
+        timestamp: Utc::now().to_rfc3339(),
+        filled_price: 0.0,
+        filled_size: existing.filled_size,
+        status,
+        ..Default::default()
     }
 }
 
@@ -49,6 +75,27 @@ fn format_unix(secs: u64) -> String {
     chrono::DateTime::<chrono::Utc>::from_timestamp(secs as i64, 0)
         .map(|dt| dt.to_rfc3339())
         .unwrap_or_default()
+}
+
+/// A2 + B2：对账后的 TradingGate 输入决策（fail-closed，可单测）。
+///
+/// - 预留重建失败 → `(false, false)`（A2 冻结语义：预留不一致不得进入 READY）；
+/// - 存在 unresolved（in-doubt 未唯一命中 / 无法分类的消失订单）→ 订单视为未同步，
+///   闸门不得进入 READY（B2 冻结语义）；
+/// - 否则透传 positions / orders 的同步结论。
+pub fn gate_after_reconcile(
+    pos_in_sync: bool,
+    orders_in_sync: bool,
+    reserve_rebuild_ok: bool,
+    unresolved_count: usize,
+) -> (bool, bool) {
+    if !reserve_rebuild_ok {
+        return (false, false);
+    }
+    if unresolved_count > 0 {
+        return (pos_in_sync, false);
+    }
+    (pos_in_sync, orders_in_sync)
 }
 
 /// 根据 CLOB order status 映射执行状态（P0-03 修复：accepted ≠ filled）。
@@ -74,7 +121,13 @@ fn map_execution_status(status: &str, success: bool) -> pb::ExecutionStatus {
 ///
 /// - matched → 从 making/taking 推导真实成交数量（R2-P0-03：matched ≠ 全额）
 /// - live/pending 等 → 0（未成交）
-fn filled_size_from_status(status: &str, requested: f64, side: Side, making: &str, taking: &str) -> f64 {
+fn filled_size_from_status(
+    status: &str,
+    _requested: f64,
+    side: Side,
+    making: &str,
+    taking: &str,
+) -> f64 {
     match status.to_lowercase().as_str() {
         "matched" => derive_filled_size(side, making, taking).unwrap_or(0.0),
         _ => 0.0,
@@ -116,6 +169,7 @@ fn derive_price(side: Side, making: &str, taking: &str) -> Option<f64> {
 }
 
 /// 执行服务实现。
+#[derive(Clone)]
 pub struct ExecutionServiceImpl {
     /// 下单流程 (内部封装了 ClobClient + WalletManager)
     order_flow: Arc<Mutex<OrderFlow>>,
@@ -150,6 +204,9 @@ pub struct ExecutionServiceImpl {
 
     /// 订单状态存储 —— 状态机 + 幂等去重（R2-P0-05/06）。
     order_store: Arc<OrderStore>,
+
+    /// 交易闸门 —— 未达到 READY 时禁止新订单进入执行路径。
+    trading_gate: Arc<TradingGate>,
 
     /// 风控引擎（可选）—— 挂载后 place_order 强制走 pre_check（R2-P0-08）。
     risk_engine: Option<Arc<RiskEngine>>,
@@ -212,6 +269,7 @@ impl ExecutionServiceImpl {
         wallet_manager: Arc<WalletManager>,
         wallet_address: String,
         password: String,
+        trading_gate: Arc<TradingGate>,
     ) -> Self {
         Self {
             order_flow: Arc::new(Mutex::new(order_flow)),
@@ -228,10 +286,86 @@ impl ExecutionServiceImpl {
             fast_executor: None,
             fill_ledger: Arc::new(FillLedger::new()),
             order_store: Arc::new(OrderStore::new()),
+            trading_gate,
             risk_engine: None,
         }
     }
+    /// 获取当前本地仍处于活动状态的远端订单 ID。
+    ///
+    /// 用于 StateSync 启动对账。
+    pub fn snapshot_pending_exchange_order_ids(&self) -> std::collections::HashSet<String> {
+        self.order_store.pending_exchange_order_ids()
+    }
 
+    /// B2 / P1-009：in-doubt（下单结果未知）订单快照，供 StateSync 匹配远端 open order。
+    ///
+    /// in-doubt = Received 且无 exchange_order_id（submit 超时 / 5xx，结果未知）；
+    /// 这类订单无法参与按 exchange id 的对账（P1-009 根因），必须单独解析。
+    pub fn snapshot_in_doubt_orders(&self) -> Vec<InDoubtOrder> {
+        self.order_store
+            .in_doubt_orders()
+            .iter()
+            .map(|st| InDoubtOrder {
+                client_order_id: st.client_order_id.clone(),
+                token_id: st.token_id.clone(),
+                side: st.side.clone(),
+                price: st.limit_price,
+                size: st.requested_size,
+                created_at: st.created_at,
+            })
+            .collect()
+    }
+
+    /// B2：应用 in-doubt 解析结果（唯一命中 → Received→Submitted 绑定）。
+    ///
+    /// 幂等：重复应用为 no-op（`bind_remote_order` 对已绑定 / 一对一冲突返回 None），
+    /// 重放对账不产生状态翻转、不改变预留。返回成功绑定数量。
+    pub fn apply_in_doubt_resolution(&self, resolution: &InDoubtResolution) -> usize {
+        let mut bound = 0usize;
+        for b in &resolution.bindings {
+            match self
+                .order_store
+                .bind_remote_order(&b.client_order_id, &b.exchange_order_id)
+            {
+                Some(_) => {
+                    bound += 1;
+                    tracing::info!(
+                        client_order_id = %b.client_order_id,
+                        exchange_order_id = %b.exchange_order_id,
+                        via = ?b.via,
+                        "B2: in-doubt 订单绑定远端 open order（Received → Submitted）"
+                    );
+                }
+                None => tracing::warn!(
+                    client_order_id = %b.client_order_id,
+                    exchange_order_id = %b.exchange_order_id,
+                    "B2: in-doubt 绑定跳过（幂等重放 / 一对一冲突），保持原状态"
+                ),
+            }
+        }
+        for c in &resolution.ambiguous {
+            tracing::warn!(
+                client_order_id = %c,
+                "B2: in-doubt fingerprint 命中不唯一（ambiguous），保持 unresolved"
+            );
+        }
+        for u in &resolution.unresolved {
+            if !resolution.ambiguous.contains(u) {
+                tracing::warn!(
+                    client_order_id = %u,
+                    "B2: in-doubt 无唯一命中，保持 unresolved（保守持有预留，TTL 到期不释放）"
+                );
+            }
+        }
+        bound
+    }
+
+    /// 获取当前本地风险状态中的仓位快照。
+    ///
+    /// 用于 StateSync 启动对账。
+    pub async fn snapshot_positions(&self) -> std::collections::HashMap<String, f64> {
+        self.risk_state.lock().await.positions.clone()
+    }
     /// 创建用于测试的 Mock 实例 (不连接真实 API)。
     pub fn new_mock() -> Self {
         let wallet_mgr = Arc::new(WalletManager::new("keystore_mock.json"));
@@ -251,6 +385,7 @@ impl ExecutionServiceImpl {
             fast_executor: None,
             fill_ledger: Arc::new(FillLedger::new()),
             order_store: Arc::new(OrderStore::new()),
+            trading_gate: Arc::new(TradingGate::new()),
             risk_engine: None,
         }
     }
@@ -288,6 +423,348 @@ impl ExecutionServiceImpl {
     pub fn settle_token(&self, token_id: &str, outcome: f64) -> usize {
         self.fill_ledger.settle_by_token(token_id, outcome)
     }
+
+    /// P1-006：异步成交同步。
+    ///
+    /// 将 market_events 轮询到的成交事件（TradeEvent）同步到：
+    /// 1. RiskEngine 权威仓位（on_fill）
+    /// 2. 内部 risk_state 快照（保持与 snapshot_positions 一致）
+    /// 3. FillLedger 成交账簿
+    /// 4. OrderStore 订单状态
+    pub async fn on_market_trade(&self, trade: &TradeEvent) {
+        let side = match trade.side.as_str() {
+            "BUY" => Side::Buy,
+            "SELL" => Side::Sell,
+            _ => {
+                tracing::warn!("忽略未知 side 的成交事件: {}", trade.side);
+                return;
+            }
+        };
+
+        // P0-015：fill 幂等——同一 trade_id 只处理一次（防双路/重复轮询重复记账）
+        if !self.fill_ledger.claim_trade(&trade.trade_id) {
+            tracing::debug!("on_market_trade: trade_id={} 已处理，跳过", trade.trade_id);
+            return;
+        }
+
+        let notional = trade.price * trade.size;
+
+        // B1 / P1-008：在适配层解析订单身份与限价，算出**订单级**预留释放额。
+        // 预留入池 = limit_price × quantity，故按 limit_price × 本笔增量释放；
+        // 成交暴露仍按实际执行价（notional）。身份/限价未知 → None（保守持有预留，
+        // 交对账/reconciliation 处理），绝不静默按执行名义释放。
+        let reserve_release = match self.order_store.get_by_exchange_order_id(&trade.order_id) {
+            Some(st) if st.side == "BUY" => {
+                if st.limit_price > 0.0 {
+                    Some(trade.size * st.limit_price)
+                } else {
+                    tracing::warn!(
+                        "on_market_trade: BUY 订单 limit_price 非正，保守持有预留待对账 order_id={} trade_id={}",
+                        trade.order_id,
+                        trade.trade_id
+                    );
+                    None
+                }
+            }
+            // SELL：无开仓预留，无需释放。
+            Some(_) => None,
+            None => {
+                if matches!(side, Side::Buy) {
+                    tracing::warn!(
+                        "on_market_trade: 未找到订单身份，BUY 保守持有预留待对账 order_id={} trade_id={}",
+                        trade.order_id,
+                        trade.trade_id
+                    );
+                }
+                None
+            }
+        };
+
+        // 1. RiskEngine 权威仓位
+        if let Some(re) = self.risk_engine.as_ref() {
+            re.on_fill(&trade.token_id, side, trade.size, notional, reserve_release);
+        }
+
+        // 2. 内部 risk_state 快照
+        {
+            let mut rs = self.risk_state.lock().await;
+            let entry = rs.positions.entry(trade.token_id.clone()).or_insert(0.0);
+            match side {
+                Side::Buy => *entry += trade.size,
+                Side::Sell => *entry -= trade.size,
+            }
+        }
+
+        // 3. FillLedger 成交账簿
+        if !trade.order_id.is_empty() {
+            let mut rec = FillRecord::new(
+                trade.order_id.clone(),
+                trade.token_id.clone(),
+                trade.side.clone(),
+                trade.price,
+                trade.size,
+            );
+            rec.trade_id = trade.trade_id.clone(); // P0-015：fill 级 identity
+            rec.mark_filled(trade.price, 0.0);
+            self.fill_ledger.record(rec);
+        }
+
+        // 4. OrderStore 订单状态（P0-016：trade.order_id 是交易所订单 ID，
+        //    需按 exchange_order_id 反查，而非 client_order_id；
+        //    P1-026：用 apply_fill 增量累加，避免多笔 partial fill 绝对覆盖；
+        //    P1-027：改用 apply_fill_by_exchange_order_id 单写锁内完成，避免并发 fill lost update）
+        self.order_store
+            .apply_fill_by_exchange_order_id(&trade.order_id, trade.size);
+    }
+
+    /// P0-007B：应用 StateSync 生成的恢复计划，修复本地状态。
+    ///
+    /// - `MarkOrderFilled` → 走 `on_market_trade`（补记 FillLedger + RiskEngine + OrderStore，
+    ///   复用 trade_id 幂等去重，防重复记账）
+    /// - `MarkOrderNonFilled` → 标记 cancelled（终态，清除 pending）
+    /// - `RebuildPosition` → 以远端为权威重建 risk_state 与 RiskEngine 仓位
+    ///
+    /// 返回应用的恢复动作数量。
+    pub async fn apply_recovery(&self, plan: &RecoveryPlan) -> usize {
+        for action in &plan.actions {
+            match action {
+                RecoveryAction::MarkOrderFilled {
+                    order_id,
+                    token_id,
+                    side,
+                    price,
+                    size,
+                    trade_id,
+                } => {
+                    if trade_id.trim().is_empty() {
+                        tracing::warn!(
+                            "apply_recovery: 拒绝缺少 trade_id 的成交恢复 order_id={}",
+                            order_id
+                        );
+                        continue;
+                    }
+
+                    let trade = TradeEvent {
+                        token_id: token_id.clone(),
+                        trade_id: trade_id.clone(),
+                        order_id: order_id.clone(),
+                        side: side.clone(),
+                        price: *price,
+                        size: *size,
+                        timestamp: 0,
+                        taker_order_id: order_id.clone(),
+                        maker_order_id: String::new(),
+                        trader_side: "TAKER".to_string(),
+                        owner: String::new(),
+                        status: "MATCHED".to_string(),
+                    };
+                    self.on_market_trade(&trade).await;
+                }
+                RecoveryAction::MarkOrderNonFilled { order_id } => {
+                    // P0-016 / G4：order_id 是交易所订单 ID；单写锁内原子取消
+                    //（终态保护，不覆盖并发成交）。
+                    self.order_store
+                        .mark_cancelled_by_exchange_order_id(order_id);
+                }
+                RecoveryAction::RebuildPosition {
+                    token_id,
+                    qty,
+                    notional,
+                } => {
+                    {
+                        let mut rs = self.risk_state.lock().await;
+                        if qty.abs() < 1e-9 && notional.abs() < 1e-9 {
+                            rs.positions.remove(token_id);
+                        } else {
+                            rs.positions.insert(token_id.clone(), *qty);
+                        }
+                    }
+                    if let Some(re) = self.risk_engine.as_ref() {
+                        re.sync_position(token_id, *qty, *notional);
+                    }
+                }
+            }
+        }
+        plan.actions.len()
+    }
+
+    /// G1-003 / P0-RISK-003：获取当前 gas 价（gwei）供风控预检。
+    ///
+    /// - 未挂载 `FastExecutor` 或未配 `RpcPool`（mock / paper / 未接线）→ `Ok(0)`：不阻塞；
+    ///   此类订单随后会因「FastExecutor 未初始化」被拒，不存在真实链上 Gas 风险。
+    /// - 已挂载但 RPC 调用/解析失败 → `Err`：调用方 FAIL-CLOSED 拒绝下单（不低估 Gas 风险）。
+    async fn gas_gwei_for_risk(&self) -> Result<u64, String> {
+        let fe = match self.fast_executor.as_ref() {
+            Some(fe) => fe,
+            None => return Ok(0),
+        };
+        let pool = match fe.rpc_pool() {
+            Some(p) => p,
+            None => return Ok(0),
+        };
+        let result = pool
+            .rpc_call("eth_gasPrice", serde_json::json!([]))
+            .await
+            .map_err(|e| format!("eth_gasPrice 调用失败: {e}"))?;
+        let hex = result
+            .as_str()
+            .ok_or_else(|| format!("eth_gasPrice 返回非字符串: {result}"))?;
+        parse_gas_price_hex_to_gwei(hex)
+    }
+
+    /// A1 / G4：取消成功后释放该单剩余预留并原子标记 `Cancelled`。
+    ///
+    /// A1 修正：**先原子转换到 `Cancelled`，仅当转换成功（活动态→Cancelled）才释放预留**。
+    /// 旧实现先释放再转换：并发成交已使订单终结时 `mark_cancelled` 被终态保护拒绝，
+    /// 但 reserve 已被释放 → 过度释放（over-release）。改以转换结果为准，天然幂等。
+    fn settle_cancel(&self, client_order_id: &str) {
+        if let Some(st) = self.order_store.mark_cancelled(client_order_id) {
+            self.release_reserve_on_cancel(&st);
+        }
+    }
+
+    /// A1：按交易所订单 ID 取消（先转换成功再释放预留）。
+    fn settle_cancel_by_exchange(&self, exchange_order_id: &str) {
+        if let Some(st) = self
+            .order_store
+            .mark_cancelled_by_exchange_order_id(exchange_order_id)
+        {
+            self.release_reserve_on_cancel(&st);
+        }
+    }
+
+    /// A1：取消成功（活动态→Cancelled）后释放该单剩余预留。
+    ///
+    /// 仅 BUY；`limit_price`/`remaining` 非正时**告警并跳过释放**（保守 fail-closed）。
+    fn release_reserve_on_cancel(&self, st: &crate::fast::order_state::OrderState) {
+        if st.side != "BUY" {
+            return;
+        }
+        if st.limit_price > 0.0 && st.remaining_size > 0.0 {
+            if let Some(re) = self.risk_engine.as_ref() {
+                re.release_reserve(&st.token_id, st.remaining_size * st.limit_price);
+            }
+        } else {
+            tracing::warn!(
+                "settle_cancel: BUY 订单 limit_price/remaining 非正，跳过预留释放（保守 fail-closed）client_order_id={} limit_price={} remaining={}",
+                st.client_order_id,
+                st.limit_price,
+                st.remaining_size
+            );
+        }
+    }
+
+    /// P1-031：重建远端仍 open 的 BUY 订单的预留额度。
+    ///
+    /// 对账恢复时 `sync_position` 会清空各市场的 reserved（幽灵预留），但远端
+    /// 仍 open 的订单（本地下单、未成交、仍在挂单）对应的 pending 预留没有重建。
+    /// 本方法遍历本地 pending 订单（`OrderStore` 持有正确的 token_id，规避
+    /// open order `asset_id` 与 ERC-1155 token_id 的映射问题），按 exchange_order_id
+    /// 匹配远端 open order 的 price，计算剩余 notional = remaining_size × price，
+    /// 按 token 聚合后回填 RiskEngine.reserved。
+    pub fn rebuild_open_order_reserves(&self, remote_open_orders: &[serde_json::Value]) {
+        self.rebuild_open_order_reserves_filtered(remote_open_orders, None);
+    }
+
+    /// G4 / P1-RISK-007：只重建 `token_filter` 内 token 的预留。
+    ///
+    /// 后台对账在 `sync_position` 清空**这些** token 的 `reserved` 后调用本方法，
+    /// 避免对未清空 token 重复累加（`rebuild_reserve` 是累加语义）。
+    /// `token_filter == None` 表示全部 token（启动时 `reserved` 为 0，安全）。
+    pub fn rebuild_open_order_reserves_filtered(
+        &self,
+        remote_open_orders: &[serde_json::Value],
+        token_filter: Option<&std::collections::HashSet<String>>,
+    ) {
+        let re = match self.risk_engine.as_ref() {
+            Some(re) => re,
+            None => return,
+        };
+
+        // 远端 open order 的 price 索引（按 id）
+        let price_by_id: HashMap<String, f64> = remote_open_orders
+            .iter()
+            .filter_map(|o| {
+                let id = o.get("id")?.as_str()?.to_string();
+                let price = match o.get("price") {
+                    Some(serde_json::Value::String(s)) => s.parse::<f64>().ok()?,
+                    Some(serde_json::Value::Number(n)) => n.as_f64()?,
+                    _ => return None,
+                };
+                Some((id, price))
+            })
+            .collect();
+
+        // 按 token 聚合 open BUY 订单的剩余 notional
+        let mut reserve_by_token: HashMap<String, f64> = HashMap::new();
+        for ex_id in self.order_store.pending_exchange_order_ids() {
+            let Some(st) = self.order_store.get_by_exchange_order_id(&ex_id) else {
+                continue;
+            };
+            if st.side != "BUY" || st.remaining_size <= 0.0 {
+                continue;
+            }
+            if let Some(filter) = token_filter {
+                if !filter.contains(&st.token_id) {
+                    continue;
+                }
+            }
+            let Some(price) = price_by_id.get(&ex_id) else {
+                continue;
+            };
+            let notional = st.remaining_size * price;
+            if notional > 0.0 {
+                *reserve_by_token.entry(st.token_id.clone()).or_insert(0.0) += notional;
+            }
+        }
+
+        for (token_id, notional) in reserve_by_token {
+            re.rebuild_reserve(&token_id, notional);
+        }
+    }
+}
+
+/// P0-014：市场事件消费循环。把 poller 广播的 Trade 事件转发到
+/// [`ExecutionServiceImpl::on_market_trade`]（成交 → RiskEngine/FillLedger/OrderStore）。
+///
+/// P1-034：`rx.recv()` 的两种 Err 语义不同，必须分别处理：
+/// - `Lagged(n)`：消费者落后，**跳过了 n 条消息**（可能含成交），但 channel 仍可用 →
+///   告警（成交丢失需 StateSync 对账兜底）后**继续消费**；旧实现用 `while let Ok(...)`
+///   把 Lagged 当致命错误直接退出，导致成交链路静默永久停摆。
+/// - `Closed`：所有 sender 已 drop，真正不可恢复 → 告警后退出。
+///
+/// 只处理 `MarketEvent::Trade`，其余变体（OrderBookUpdate / OrderStateChange /
+/// Settlement）当前阶段静默忽略，不误跑 `on_market_trade`。
+/// trade_id 幂等由下层 `on_market_trade`（`FillLedger::claim_trade`）单点负责，
+/// 本层不重复做。
+pub async fn consume_trade_events(
+    service: Arc<ExecutionServiceImpl>,
+    mut rx: broadcast::Receiver<MarketEvent>,
+) {
+    loop {
+        match rx.recv().await {
+            Ok(MarketEvent::Trade(trade)) => {
+                service.on_market_trade(&trade).await;
+            }
+            // 非 Trade 事件：当前阶段不处理
+            Ok(_other) => {}
+            // Lagged：channel 仍可用，但丢了事件（可能含成交）——告警后继续
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                tracing::error!(
+                    "market events 消费者落后，丢弃 {} 条事件（可能含成交，依赖 StateSync 对账兜底）",
+                    n
+                );
+                continue;
+            }
+            // Closed：sender 全部 drop，真正不可恢复——告警后退出
+            Err(broadcast::error::RecvError::Closed) => {
+                tracing::error!(
+                    "market events 广播通道已关闭，成交消费循环退出（需重启/重订阅）"
+                );
+                return;
+            }
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -298,38 +775,46 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
         request: Request<pb::AggregatedOrder>,
     ) -> Result<Response<pb::OrderResult>, Status> {
         let order = request.into_inner();
+        self.trading_gate
+            .ensure_ready()
+            .map_err(Status::failed_precondition)?;
 
-        // ★ R2-P0-06 幂等：order_id 已存在则返回已有状态，不重复下单
-        if !order.order_id.is_empty() {
-            if let Some(existing) = self.order_store.get(&order.order_id) {
-                tracing::info!(
-                    "order_id={} 已存在（幂等去重），返回已有状态 {}",
-                    order.order_id, existing.status
-                );
-                let status = match existing.status {
-                    crate::fast::order_state::OrderStateStatus::Filled => pb::ExecutionStatus::Filled as i32,
-                    crate::fast::order_state::OrderStateStatus::PartialFilled => pb::ExecutionStatus::Partial as i32,
-                    crate::fast::order_state::OrderStateStatus::Live => pb::ExecutionStatus::Live as i32,
-                    crate::fast::order_state::OrderStateStatus::Rejected => pb::ExecutionStatus::Rejected as i32,
-                    crate::fast::order_state::OrderStateStatus::Cancelled => pb::ExecutionStatus::Cancelled as i32,
-                    _ => pb::ExecutionStatus::Pending as i32,
-                };
-                return Ok(Response::new(pb::OrderResult {
-                    order_id: order.order_id.clone(),
-                    success: true,
-                    exchange_order_id: existing.exchange_order_id.unwrap_or_default(),
-                    error_message: String::new(),
-                    timestamp: Utc::now().to_rfc3339(),
-                    filled_price: 0.0,
-                    filled_size: existing.filled_size,
-                    status,
-                    ..Default::default()
-                }));
+        // 方向转换（提前到幂等检查之前，供原子占位使用）
+        let side = direction_to_side(order.direction)?;
+
+        // ★ P0-004 幂等：原子 claim_or_retry 占位，并发下只允许一个请求下单；
+        // 可重试终态（Rejected/Expired/Cancelled）会被重置并重新下单。
+        if !order.order_id.is_empty()
+            && self
+                .order_store
+                .claim_or_retry(
+                    order.order_id.clone(),
+                    order.token_id.clone(),
+                    side.as_str().to_string(),
+                    order.quantity,
+                )
+                .is_none()
+            {
+                // 进行中或已成交：幂等去重，返回已有状态
+                if let Some(existing) = self.order_store.get(&order.order_id) {
+                    tracing::info!(
+                        "order_id={} 幂等去重（进行中/已成交），返回已有状态 {}",
+                        order.order_id,
+                        existing.status
+                    );
+                    return Ok(Response::new(existing_order_result(&existing)));
+                }
             }
+
+        // G4 / P1-RISK-006：记录下单价，供取消时按 remaining×price 释放预留。
+        if !order.order_id.is_empty() {
+            self.order_store
+                .set_limit_price(&order.order_id, order.target_price);
         }
 
         // 只执行 OPEN 状态的指令
         if order.status != pb::OrderStatus::Open as i32 {
+            self.order_store.mark_rejected(&order.order_id);
             return Ok(Response::new(pb::OrderResult {
                 order_id: order.order_id.clone(),
                 success: false,
@@ -347,8 +832,11 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
         if order.paper_trading {
             tracing::info!(
                 "[PAPER] 纸面下单: order_id={}, token={}, price={}, qty={}, conf={:.2}",
-                order.order_id, order.token_id, order.target_price,
-                order.quantity, order.confidence,
+                order.order_id,
+                order.token_id,
+                order.target_price,
+                order.quantity,
+                order.confidence,
             );
             let ex_id = format!("paper_{}", order.order_id);
             let side_str = match order.direction {
@@ -389,6 +877,7 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
         {
             let rs = self.risk_state.lock().await;
             if rs.daily_circuit_breaker || rs.manual_halt {
+                self.order_store.mark_rejected(&order.order_id);
                 return Ok(Response::new(pb::OrderResult {
                     order_id: order.order_id.clone(),
                     success: false,
@@ -403,19 +892,22 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
             }
         }
 
-        // 方向转换
-        let side = direction_to_side(order.direction)?;
+        // ★ R2-P0-08：RiskEngine 必须存在，缺失时 FAIL-CLOSED
+        let re = match self.risk_engine.as_ref() {
+            Some(re) => re,
+            None => {
+                tracing::error!(
+                    "RiskEngine 未初始化，拒绝实时订单: order_id={}, token={}",
+                    order.order_id,
+                    order.token_id
+                );
 
-        // ★ R2-P0-08 风控：RiskEngine pre_check 强制接入（熔断/仓位硬限制/时间窗口等）
-        if let Some(ref re) = self.risk_engine {
-            let notional = order.quantity * order.target_price;
-            if let Err(e) = re.pre_check(&order.token_id, side, notional, order.quantity, 0) {
-                tracing::warn!("风控预检拦截: token={}, {}", order.token_id, e);
+                self.order_store.mark_rejected(&order.order_id);
                 return Ok(Response::new(pb::OrderResult {
                     order_id: order.order_id.clone(),
                     success: false,
                     exchange_order_id: String::new(),
-                    error_message: format!("风控预检拦截: {}", e),
+                    error_message: "RiskEngine 未初始化，禁止实时交易".to_string(),
                     timestamp: Utc::now().to_rfc3339(),
                     filled_price: 0.0,
                     filled_size: 0.0,
@@ -423,6 +915,52 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
                     ..Default::default()
                 }));
             }
+        };
+
+        let notional = order.quantity * order.target_price;
+
+        // G1-003 / P0-RISK-003：取实时 gas 价供风控预检。有执行器但取价失败 → FAIL-CLOSED。
+        let gas_gwei = match self.gas_gwei_for_risk().await {
+            Ok(g) => g,
+            Err(e) => {
+                tracing::error!(
+                    "Gas 费获取失败，FAIL-CLOSED 拒绝下单: order_id={}, {}",
+                    order.order_id,
+                    e
+                );
+                self.order_store.mark_rejected(&order.order_id);
+                return Ok(Response::new(pb::OrderResult {
+                    order_id: order.order_id.clone(),
+                    success: false,
+                    exchange_order_id: String::new(),
+                    error_message: format!("Gas 费获取失败，禁止下单: {}", e),
+                    timestamp: Utc::now().to_rfc3339(),
+                    filled_price: 0.0,
+                    filled_size: 0.0,
+                    status: pb::ExecutionStatus::Rejected as i32,
+                    ..Default::default()
+                }));
+            }
+        };
+
+        // ★ P0-008：原子「检查 + 预留」——并发下单不会同时通过仓位上限。
+        if let Err(e) =
+            re.check_and_reserve(&order.token_id, side, notional, order.quantity, gas_gwei)
+        {
+            tracing::warn!("风控预检拦截: token={}, {}", order.token_id, e);
+
+            self.order_store.mark_rejected(&order.order_id);
+            return Ok(Response::new(pb::OrderResult {
+                order_id: order.order_id.clone(),
+                success: false,
+                exchange_order_id: String::new(),
+                error_message: format!("风控预检拦截: {}", e),
+                timestamp: Utc::now().to_rfc3339(),
+                filled_price: 0.0,
+                filled_size: 0.0,
+                status: pb::ExecutionStatus::Rejected as i32,
+                ..Default::default()
+            }));
         }
 
         // 亚秒级 fast path：若已挂载 FastExecutor，走热路径（缓存命中时本地 < 1ms）
@@ -446,55 +984,67 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
                     let error_message = result.response.errorMsg.clone();
                     // 状态机：accepted ≠ filled（P0-03）
                     let execution_status = map_execution_status(&result.response.status, success);
+
+                    // P1-033②：HTTP 200 但 success=false（交易所拒单）→ 释放预留 + 标记
+                    // rejected，否则预留泄漏（订单不会被成交，on_market_trade 也不会冲抵）。
+                    if !success {
+                        re.release_reserve(&order.token_id, notional);
+                        self.order_store.mark_rejected(&order.order_id);
+                        return Ok(Response::new(pb::OrderResult {
+                            order_id: order.order_id.clone(),
+                            success: false,
+                            exchange_order_id,
+                            error_message,
+                            timestamp: Utc::now().to_rfc3339(),
+                            filled_price: 0.0,
+                            filled_size: 0.0,
+                            status: pb::ExecutionStatus::Rejected as i32,
+                            ..Default::default()
+                        }));
+                    }
+
                     // R2-P0-03/21：从 making/taking 按 side 推导真实 fill 与成交价
                     let filled_size = filled_size_from_status(
-                        &result.response.status, order.quantity, side,
-                        &result.response.makingAmount, &result.response.takingAmount,
+                        &result.response.status,
+                        order.quantity,
+                        side,
+                        &result.response.makingAmount,
+                        &result.response.takingAmount,
                     );
                     let filled_price = derive_price(
-                        side, &result.response.makingAmount, &result.response.takingAmount,
-                    ).unwrap_or(order.target_price);
-                    let (slippage, slippage_pct) = compute_slippage(order.target_price, filled_price, filled_size);
+                        side,
+                        &result.response.makingAmount,
+                        &result.response.takingAmount,
+                    )
+                    .unwrap_or(order.target_price);
+                    let (slippage, slippage_pct) =
+                        compute_slippage(order.target_price, filled_price, filled_size);
 
                     // 记录订单状态（R2-P0-05 状态机）
                     if !order.order_id.is_empty() {
-                        let mut st = self.order_store
-                            .get(&order.order_id)
-                            .unwrap_or_else(|| self.order_store.create(
+                        let mut st = self.order_store.get(&order.order_id).unwrap_or_else(|| {
+                            self.order_store.create(
                                 order.order_id.clone(),
                                 order.token_id.clone(),
                                 side.as_str().to_string(),
                                 order.quantity,
-                            ));
+                            )
+                        });
                         if !exchange_order_id.is_empty() {
                             st.mark_submitted(exchange_order_id.clone());
                         }
                         if filled_size > 0.0 {
                             st.update_fill(filled_size);
-                        } else if st.status == crate::fast::order_state::OrderStateStatus::Submitted {
+                        } else if st.status == crate::fast::order_state::OrderStateStatus::Submitted
+                        {
                             st.mark_live();
                         }
                         self.order_store.upsert(st);
                     }
 
-                    // 风控：只有真实 fill 才更新持仓（P0-03/04）
-                    if filled_size > 0.0 {
-                        let mut rs = self.risk_state.lock().await;
-                        *rs.positions.entry(order.token_id.clone()).or_insert(0.0) += filled_size;
-                    }
-
-                    // 记录成交：只有真实 fill 才记（P0-04）
-                    if filled_size > 0.0 && !exchange_order_id.is_empty() {
-                        let mut rec = FillRecord::new(
-                            exchange_order_id.clone(),
-                            order.token_id.clone(),
-                            side.as_str().to_string(),
-                            order.target_price,
-                            filled_size,
-                        );
-                        rec.mark_filled(filled_price, 0.0);
-                        self.fill_ledger.record(rec);
-                    }
+                    // 方案 X（P0-015 收尾）：成交记账唯一走 on_market_trade（路径 B）。
+                    // 下单路径只更新 OrderStore 状态，不再 on_fill / 记 FillLedger，
+                    // 避免与轮询成交双路重复记账。仓位预留由 P0-008 check-and-reserve 解决。
 
                     return Ok(Response::new(pb::OrderResult {
                         order_id: order.order_id.clone(),
@@ -515,6 +1065,31 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
                 }
                 Err(e) => {
                     tracing::error!("fast path 下单失败: {}", e);
+
+                    // P1-033③：网络超时/5xx 结果未知（订单可能已上链）——不立即释放预留、
+                    // 不标记终态，保留 pending（Received 态）交由 StateSync 对账确认远端后再决定。
+                    // 预留保持持有 = 保守方向（避免低估暴露）。
+                    if e.is_unknown_outcome() {
+                        tracing::warn!(
+                            "下单结果未知（可能已成交），保留预留额度待 StateSync 确认: {}",
+                            e
+                        );
+                        return Ok(Response::new(pb::OrderResult {
+                            order_id: order.order_id.clone(),
+                            success: false,
+                            exchange_order_id: String::new(),
+                            error_message: format!("下单结果未知，待对账确认: {}", e),
+                            timestamp: Utc::now().to_rfc3339(),
+                            filled_price: 0.0,
+                            filled_size: 0.0,
+                            status: pb::ExecutionStatus::Pending as i32,
+                            ..Default::default()
+                        }));
+                    }
+
+                    // 确定未成交（4xx 明确拒单 / 本地构建签名失败）：释放预留额度
+                    re.release_reserve(&order.token_id, notional);
+                    self.order_store.mark_rejected(&order.order_id);
                     return Ok(Response::new(pb::OrderResult {
                         order_id: order.order_id.clone(),
                         success: false,
@@ -530,118 +1105,25 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
             }
         }
 
-        tracing::info!(
-            "收到下单指令: order_id={}, token={}, direction={:?}, price={}, qty={}",
-            order.order_id,
-            order.token_id,
-            pb::Direction::try_from(order.direction).unwrap_or(pb::Direction::Unspecified),
-            order.target_price,
-            order.quantity,
+        tracing::error!(
+            "FastExecutor 未初始化，拒绝实时订单，禁止降级到普通 OrderFlow: order_id={}",
+            order.order_id
         );
 
-        // 构建 PlaceOrderParams
-        let params = PlaceOrderParams {
-            wallet_address: self.wallet_address.clone(),
-            password: self.password.clone(),
-            token_id: order.token_id.clone(),
-            price: order.target_price,
-            size: order.quantity,
-            side,
-            tick_size: None,     // 从 API 获取
-            neg_risk: None,      // 默认 false
-            order_type: Some(OrderType::GTC),  // 默认 GTC
-        };
-
-        // 执行下单
-        let mut flow = self.order_flow.lock().await;
-        match flow.place_order(params).await {
-            Ok(response) => {
-                // 状态机：accepted ≠ filled（P0-03）
-                let execution_status = map_execution_status(&response.status, response.success);
-                // R2-P0-03/21：从 making/taking 按 side 推导真实 fill 与成交价
-                let filled_size = filled_size_from_status(
-                    &response.status, order.quantity, side,
-                    &response.makingAmount, &response.takingAmount,
-                );
-                let filled_price = derive_price(
-                    side, &response.makingAmount, &response.takingAmount,
-                ).unwrap_or(order.target_price);
-
-                // 滑点计算
-                let (slippage, slippage_pct) = compute_slippage(order.target_price, filled_price, filled_size);
-
-                // 记录订单状态（R2-P0-05 状态机）
-                if !order.order_id.is_empty() {
-                    let mut st = self.order_store
-                        .get(&order.order_id)
-                        .unwrap_or_else(|| self.order_store.create(
-                            order.order_id.clone(),
-                            order.token_id.clone(),
-                            side.as_str().to_string(),
-                            order.quantity,
-                        ));
-                    if !response.orderID.is_empty() {
-                        st.mark_submitted(response.orderID.clone());
-                    }
-                    if filled_size > 0.0 {
-                        st.update_fill(filled_size);
-                    } else if st.status == crate::fast::order_state::OrderStateStatus::Submitted {
-                        st.mark_live();
-                    }
-                    self.order_store.upsert(st);
-                }
-
-                // 风控：只有真实 fill 才更新持仓（P0-03/04）
-                if filled_size > 0.0 {
-                    let mut rs = self.risk_state.lock().await;
-                    *rs.positions.entry(order.token_id.clone()).or_insert(0.0) += filled_size;
-                }
-
-                // 记录成交：只有真实 fill 才记（P0-04）
-                if filled_size > 0.0 && !response.orderID.is_empty() {
-                    let mut rec = FillRecord::new(
-                        response.orderID.clone(),
-                        order.token_id.clone(),
-                        side.as_str().to_string(),
-                        order.target_price,
-                        filled_size,
-                    );
-                    rec.mark_filled(filled_price, 0.0);
-                    self.fill_ledger.record(rec);
-                }
-
-                Ok(Response::new(pb::OrderResult {
-                    order_id: order.order_id.clone(),
-                    success: response.success,
-                    exchange_order_id: response.orderID.clone(),
-                    error_message: response.errorMsg.clone(),
-                    timestamp: Utc::now().to_rfc3339(),
-                    filled_price,
-                    filled_size,
-                    status: execution_status as i32,
-                    filled_at: Utc::now().to_rfc3339(),
-                    settled_at: String::new(),
-                    slippage,
-                    slippage_pct,
-                    fee: 0.0,
-                    pnl: 0.0,
-                }))
-            }
-            Err(e) => {
-                tracing::error!("下单失败: {}", e);
-                Ok(Response::new(pb::OrderResult {
-                    order_id: order.order_id.clone(),
-                    success: false,
-                    exchange_order_id: String::new(),
-                    error_message: format!("下单失败: {}", e),
-                    timestamp: Utc::now().to_rfc3339(),
-                    filled_price: 0.0,
-                    filled_size: 0.0,
-                    status: pb::ExecutionStatus::Rejected as i32,
-                    ..Default::default()
-                }))
-            }
-        }
+        // P0-008：FastExecutor 缺失，释放预留额度
+        re.release_reserve(&order.token_id, notional);
+        self.order_store.mark_rejected(&order.order_id);
+        return Ok(Response::new(pb::OrderResult {
+            order_id: order.order_id.clone(),
+            success: false,
+            exchange_order_id: String::new(),
+            error_message: "FastExecutor 未初始化，禁止进入普通交易路径".to_string(),
+            timestamp: Utc::now().to_rfc3339(),
+            filled_price: 0.0,
+            filled_size: 0.0,
+            status: pb::ExecutionStatus::Rejected as i32,
+            ..Default::default()
+        }));
     }
 
     /// 批量下单。
@@ -653,10 +1135,7 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
         let mut results = Vec::with_capacity(orders.len());
 
         for order in orders {
-            let result = self
-                .place_order(Request::new(order))
-                .await?
-                .into_inner();
+            let result = self.place_order(Request::new(order)).await?.into_inner();
             results.push(result);
         }
 
@@ -675,11 +1154,20 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
             .cancel_order(&self.wallet_address, &self.password, &req.order_id)
             .await
         {
-            Ok(()) => Ok(Response::new(pb::CancelResult {
-                success: true,
-                message: format!("已取消订单 {}", req.order_id),
-                cancelled_count: 1,
-            })),
+            Ok(()) => {
+                // A1：req.order_id 可能是 client_order_id 或 exchange_order_id；
+                // 仅当活动态→Cancelled 转换成功时才释放预留（两条路径均覆盖）。
+                if self.order_store.get(&req.order_id).is_some() {
+                    self.settle_cancel(&req.order_id);
+                } else {
+                    self.settle_cancel_by_exchange(&req.order_id);
+                }
+                Ok(Response::new(pb::CancelResult {
+                    success: true,
+                    message: format!("已取消订单 {}", req.order_id),
+                    cancelled_count: 1,
+                }))
+            }
             Err(e) => Ok(Response::new(pb::CancelResult {
                 success: false,
                 message: format!("取消失败: {}", e),
@@ -697,16 +1185,16 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
 
         match flow.cancel_all(&self.wallet_address, &self.password).await {
             Ok(()) => {
-                let count = {
-                    let mut rs = self.risk_state.lock().await;
-                    let n = rs.positions.len() as i32;
-                    rs.positions.clear();
-                    n
-                };
+                // G4 / P1-RISK-006：释放所有活动订单预留并标记取消。
+                let active = self.order_store.active_orders();
+                let count = active.len();
+                for st in active {
+                    self.settle_cancel(&st.client_order_id);
+                }
                 Ok(Response::new(pb::CancelResult {
                     success: true,
-                    message: format!("已取消 {} 个订单", count),
-                    cancelled_count: count,
+                    message: "已取消全部未成交订单，持仓保持不变".to_string(),
+                    cancelled_count: count as i32,
                 }))
             }
             Err(e) => Ok(Response::new(pb::CancelResult {
@@ -727,8 +1215,9 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
     }
 
     /// 流式推送风控状态更新。
-    type StreamRiskStateUpdatesStream =
-        std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<pb::RiskStateUpdate, Status>> + Send>>;
+    type StreamRiskStateUpdatesStream = std::pin::Pin<
+        Box<dyn tokio_stream::Stream<Item = Result<pb::RiskStateUpdate, Status>> + Send>,
+    >;
 
     async fn stream_risk_state_updates(
         &self,
@@ -826,7 +1315,7 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
         &self,
         request: Request<pb::AddWalletRequest>,
     ) -> Result<Response<pb::WalletResult>, Status> {
-        let req = request.into_inner();
+        let _req = request.into_inner();
         tracing::warn!("AddWallet 通过 gRPC 传输私钥（安全红线），已拒绝");
         // 拒绝通过 RPC 导入私钥，强制使用本地 keystore
         return Ok(Response::new(pb::WalletResult {
@@ -874,9 +1363,26 @@ impl pb::execution_service_server::ExecutionService for ExecutionServiceImpl {
 // 测试
 // ============================================================================
 
+/// G1-003：把 `eth_gasPrice` 的十六进制 Wei 解析为 gwei（向下取整，避免低估）。
+fn parse_gas_price_hex_to_gwei(hex: &str) -> Result<u64, String> {
+    let trimmed = hex.trim();
+    let digits = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    if digits.is_empty() {
+        return Err(format!("gasPrice 空值: {hex}"));
+    }
+    let wei = u128::from_str_radix(digits, 16)
+        .map_err(|e| format!("gasPrice 解析失败 ({hex}): {e}"))?;
+    Ok((wei / 1_000_000_000) as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    // RiskConfig 仅在测试中使用；放在测试模块内可避免 lib 构建下的 unused import 告警。
+    use crate::fast::risk_engine::RiskConfig;
 
     #[test]
     fn test_map_execution_status_matched_is_filled() {
@@ -936,8 +1442,14 @@ mod tests {
     #[test]
     fn test_filled_size_live_zero() {
         // P0-04 核心：live 订单不是 fill，filled_size 必须为 0
-        assert_eq!(filled_size_from_status("live", 10.0, Side::Buy, "", ""), 0.0);
-        assert_eq!(filled_size_from_status("pending", 10.0, Side::Buy, "", ""), 0.0);
+        assert_eq!(
+            filled_size_from_status("live", 10.0, Side::Buy, "", ""),
+            0.0
+        );
+        assert_eq!(
+            filled_size_from_status("pending", 10.0, Side::Buy, "", ""),
+            0.0
+        );
         assert_eq!(filled_size_from_status("", 10.0, Side::Buy, "", ""), 0.0);
     }
 
@@ -958,5 +1470,1429 @@ mod tests {
 
         let side_yes = direction_to_side(pb::Direction::BuyYes as i32).unwrap();
         assert_eq!(side_yes, Side::Buy);
+    }
+
+    #[tokio::test]
+    async fn test_on_market_trade_updates_fill_ledger_and_risk() {
+        let mut service = ExecutionServiceImpl::new_mock();
+        let risk_engine = Arc::new(RiskEngine::new(RiskConfig::default()));
+        service.set_risk_engine(risk_engine);
+
+        let trade = TradeEvent {
+            token_id: "token-1".to_string(),
+            trade_id: "trade-1".to_string(),
+            order_id: "order-1".to_string(),
+            side: "BUY".to_string(),
+            price: 0.5,
+            size: 10.0,
+            timestamp: 0,
+            taker_order_id: "order-1".to_string(),
+            maker_order_id: "maker-1".to_string(),
+            trader_side: "TAKER".to_string(),
+            owner: "0xowner".to_string(),
+            status: "MATCHED".to_string(),
+        };
+
+        service.on_market_trade(&trade).await;
+
+        // FillLedger 记录 1 条
+        assert_eq!(service.fill_ledger().list().len(), 1);
+
+        // risk_state 仓位更新（BUY +10）
+        let rs = service.risk_state.lock().await;
+        assert_eq!(rs.positions.get("token-1").copied().unwrap_or(0.0), 10.0);
+    }
+
+    /// P0-015：同一 trade_id 重复投递只记账一次。
+    #[tokio::test]
+    async fn test_on_market_trade_idempotent_by_trade_id() {
+        let mut service = ExecutionServiceImpl::new_mock();
+        let risk_engine = Arc::new(RiskEngine::new(RiskConfig::default()));
+        service.set_risk_engine(risk_engine);
+
+        let trade = TradeEvent {
+            token_id: "token-1".to_string(),
+            trade_id: "trade-1".to_string(),
+            order_id: "order-1".to_string(),
+            side: "BUY".to_string(),
+            price: 0.5,
+            size: 10.0,
+            timestamp: 0,
+            taker_order_id: "order-1".to_string(),
+            maker_order_id: "maker-1".to_string(),
+            trader_side: "TAKER".to_string(),
+            owner: "0xowner".to_string(),
+            status: "MATCHED".to_string(),
+        };
+
+        service.on_market_trade(&trade).await;
+        service.on_market_trade(&trade).await; // 重复投递
+
+        // FillLedger 只记 1 条
+        assert_eq!(service.fill_ledger().list().len(), 1);
+        // 仓位只 +10 一次（不重复累加）
+        let rs = service.risk_state.lock().await;
+        assert_eq!(rs.positions.get("token-1").copied().unwrap_or(0.0), 10.0);
+    }
+
+    /// P1-026：on_market_trade 多笔 partial fill 累加（apply_fill 增量，非绝对覆盖）。
+    #[tokio::test]
+    async fn test_on_market_trade_accumulates_partial_fills() {
+        use crate::fast::order_state::OrderStateStatus;
+
+        let mut service = ExecutionServiceImpl::new_mock();
+        service.set_risk_engine(Arc::new(RiskEngine::new(RiskConfig::default())));
+
+        // 造一个 100 shares 订单（client 键 + exchange 字段）
+        service
+            .order_store
+            .create("client-pf".to_string(), "tok-pf".to_string(), "BUY".to_string(), 100.0);
+        if let Some(mut st) = service.order_store.get("client-pf") {
+            st.mark_submitted("exchange-pf".to_string());
+            st.mark_live();
+            service.order_store.upsert(st);
+        }
+
+        // 三笔 partial fill（不同 trade_id，同一订单）
+        let t1 = TradeEvent {
+            token_id: "tok-pf".to_string(),
+            trade_id: "trade-pf-1".to_string(),
+            order_id: "exchange-pf".to_string(),
+            side: "BUY".to_string(),
+            price: 0.5,
+            size: 30.0,
+            timestamp: 0,
+            taker_order_id: "exchange-pf".to_string(),
+            maker_order_id: String::new(),
+            trader_side: "TAKER".to_string(),
+            owner: String::new(),
+            status: "MATCHED".to_string(),
+        };
+        let t2 = TradeEvent {
+            token_id: "tok-pf".to_string(),
+            trade_id: "trade-pf-2".to_string(),
+            order_id: "exchange-pf".to_string(),
+            side: "BUY".to_string(),
+            price: 0.5,
+            size: 40.0,
+            timestamp: 0,
+            taker_order_id: "exchange-pf".to_string(),
+            maker_order_id: String::new(),
+            trader_side: "TAKER".to_string(),
+            owner: String::new(),
+            status: "MATCHED".to_string(),
+        };
+        let t3 = TradeEvent {
+            token_id: "tok-pf".to_string(),
+            trade_id: "trade-pf-3".to_string(),
+            order_id: "exchange-pf".to_string(),
+            side: "BUY".to_string(),
+            price: 0.5,
+            size: 30.0,
+            timestamp: 0,
+            taker_order_id: "exchange-pf".to_string(),
+            maker_order_id: String::new(),
+            trader_side: "TAKER".to_string(),
+            owner: String::new(),
+            status: "MATCHED".to_string(),
+        };
+
+        service.on_market_trade(&t1).await;
+        service.on_market_trade(&t2).await;
+        service.on_market_trade(&t3).await;
+
+        // OrderStore filled_size 累加：30 → 70 → 100（三笔不互相覆盖）
+        let st = service.order_store.get("client-pf").unwrap();
+        assert_eq!(st.filled_size, 100.0, "多笔 partial fill 应累加到满额");
+        assert_eq!(st.remaining_size, 0.0);
+        assert_eq!(st.status, OrderStateStatus::Filled);
+    }
+
+    /// 测试辅助：构造一条带指定 order_id 的 BUY 成交事件。
+    fn mk_b1_trade(trade_id: &str, token_id: &str, exchange_order_id: &str, price: f64, size: f64) -> TradeEvent {
+        TradeEvent {
+            token_id: token_id.to_string(),
+            trade_id: trade_id.to_string(),
+            order_id: exchange_order_id.to_string(),
+            side: "BUY".to_string(),
+            price,
+            size,
+            timestamp: 0,
+            taker_order_id: exchange_order_id.to_string(),
+            maker_order_id: String::new(),
+            trader_side: "TAKER".to_string(),
+            owner: String::new(),
+            status: "MATCHED".to_string(),
+        }
+    }
+
+    /// B1 / P1-008：适配层按订单**限价**释放预留，成交暴露按**执行价**。
+    /// 预算改善（exec 0.50 < limit 0.60）下预留必须完整释放。
+    #[tokio::test]
+    async fn test_b1_on_market_trade_releases_reserve_at_limit_price() {
+        let mut service = ExecutionServiceImpl::new_mock();
+        let re = Arc::new(RiskEngine::new(RiskConfig::default()));
+        service.set_risk_engine(re.clone());
+
+        // 订单：BUY 100 @ limit 0.60 → 预留 60
+        service.order_store.create(
+            "client-b1".to_string(),
+            "tok-b1".to_string(),
+            "BUY".to_string(),
+            100.0,
+        );
+        if let Some(mut st) = service.order_store.get("client-b1") {
+            st.mark_submitted("ex-b1".to_string());
+            service.order_store.upsert(st);
+        }
+        service.order_store.set_limit_price("client-b1", 0.60);
+        re.check_and_reserve("tok-b1", Side::Buy, 60.0, 100.0, 50)
+            .unwrap();
+        assert_eq!(re.committed_total(), 60.0);
+
+        // 成交事件：执行价 0.50，全成交
+        let trade = mk_b1_trade("tr-b1", "tok-b1", "ex-b1", 0.50, 100.0);
+        service.on_market_trade(&trade).await;
+
+        // 预留按限价 0.60×100=60 释放 → reserved 0；filled 按执行价 0.50×100=50
+        assert_eq!(re.snapshot().global_exposure, 50.0, "filled 按执行价");
+        assert_eq!(re.committed_total(), 50.0, "预留按限价完整释放");
+
+        // 重复投递同一 trade_id：幂等，不重复释放/记账
+        service.on_market_trade(&trade).await;
+        assert_eq!(service.fill_ledger().list().len(), 1);
+        assert_eq!(re.committed_total(), 50.0, "重复 trade 不二次释放");
+    }
+
+    /// B1：订单限价未知（limit_price=0）→ 保守持有预留，不按执行名义释放。
+    #[tokio::test]
+    async fn test_b1_on_market_trade_holds_reserve_when_limit_unknown() {
+        let mut service = ExecutionServiceImpl::new_mock();
+        let re = Arc::new(RiskEngine::new(RiskConfig::default()));
+        service.set_risk_engine(re.clone());
+
+        service.order_store.create(
+            "client-u".to_string(),
+            "tok-u".to_string(),
+            "BUY".to_string(),
+            100.0,
+        );
+        if let Some(mut st) = service.order_store.get("client-u") {
+            st.mark_submitted("ex-u".to_string());
+            service.order_store.upsert(st);
+        }
+        // 未 set_limit_price → limit_price 仍为 0.0（未知）
+        re.check_and_reserve("tok-u", Side::Buy, 60.0, 100.0, 50)
+            .unwrap();
+
+        service
+            .on_market_trade(&mk_b1_trade("tr-u", "tok-u", "ex-u", 0.50, 100.0))
+            .await;
+
+        assert_eq!(re.snapshot().global_exposure, 50.0);
+        assert_eq!(
+            re.committed_total(),
+            110.0,
+            "限价未知 → 预留保守持有（60 reserved + 50 filled）"
+        );
+    }
+
+    /// B1：完全找不到订单身份 → BUY 保守持有预留。
+    #[tokio::test]
+    async fn test_b1_on_market_trade_unknown_identity_holds_reserve() {
+        let mut service = ExecutionServiceImpl::new_mock();
+        let re = Arc::new(RiskEngine::new(RiskConfig::default()));
+        service.set_risk_engine(re.clone());
+
+        re.check_and_reserve("tok-g", Side::Buy, 60.0, 100.0, 50)
+            .unwrap();
+        // 事件引用的 exchange order id 与本地 OrderStore 无匹配
+        service
+            .on_market_trade(&mk_b1_trade("tr-g", "tok-g", "ex-ghost", 0.50, 100.0))
+            .await;
+
+        assert_eq!(re.snapshot().global_exposure, 50.0);
+        assert_eq!(
+            re.committed_total(),
+            110.0,
+            "身份未知 → 预留保守持有，待对账"
+        );
+    }
+
+    /// P0-014：事件消费链 poller → MarketEvent::Trade → on_market_trade 接通。
+    #[tokio::test]
+    async fn test_consume_trade_events_wires_on_market_trade() {
+        let (tx, _) = broadcast::channel(16);
+        let rx = tx.subscribe();
+
+        let mut service = ExecutionServiceImpl::new_mock();
+        service.set_risk_engine(Arc::new(RiskEngine::new(RiskConfig::default())));
+        let service = Arc::new(service);
+
+        // spawn consumer
+        let svc = service.clone();
+        tokio::spawn(consume_trade_events(svc, rx));
+
+        // 发送一笔成交事件
+        let trade = TradeEvent {
+            token_id: "token-1".to_string(),
+            trade_id: "trade-wire".to_string(),
+            order_id: "order-1".to_string(),
+            side: "BUY".to_string(),
+            price: 0.5,
+            size: 10.0,
+            timestamp: 0,
+            taker_order_id: "order-1".to_string(),
+            maker_order_id: "maker-1".to_string(),
+            trader_side: "TAKER".to_string(),
+            owner: "0xowner".to_string(),
+            status: "MATCHED".to_string(),
+        };
+        let _ = tx.send(MarketEvent::Trade(trade));
+        drop(tx); // 关闭 sender，让消费循环退出
+
+        // 给 consumer 时间处理
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // 成交被记账
+        assert_eq!(service.fill_ledger().list().len(), 1);
+        let rs = service.risk_state.lock().await;
+        assert_eq!(rs.positions.get("token-1").copied().unwrap_or(0.0), 10.0);
+    }
+
+    /// 测试辅助：构造一条 TradeEvent。
+    fn mk_trade(trade_id: &str, token_id: &str, size: f64) -> TradeEvent {
+        TradeEvent {
+            token_id: token_id.to_string(),
+            trade_id: trade_id.to_string(),
+            order_id: "order-x".to_string(),
+            side: "BUY".to_string(),
+            price: 0.5,
+            size,
+            timestamp: 0,
+            taker_order_id: "order-x".to_string(),
+            maker_order_id: String::new(),
+            trader_side: "TAKER".to_string(),
+            owner: String::new(),
+            status: "MATCHED".to_string(),
+        }
+    }
+
+    /// P1-034：`Lagged` 不是致命错误——consumer 必须告警后继续消费。
+    ///
+    /// 旧实现 `while let Ok(...)` 遇到 `Lagged` 直接退出循环，成交链路静默永久停摆。
+    /// 本测试在制造 lag 之后仍投递一笔成交，断言它被正常记账。
+    #[tokio::test]
+    async fn test_consume_trade_events_lagged_not_fatal() {
+        // 容量仅 2，连续发送超出容量 → rx 必然落后，首次 recv 返回 Lagged
+        let (tx, _ka) = broadcast::channel(2);
+        let rx = tx.subscribe();
+
+        let mut service = ExecutionServiceImpl::new_mock();
+        service.set_risk_engine(Arc::new(RiskEngine::new(RiskConfig::default())));
+        let service = Arc::new(service);
+
+        // 制造 lag：rx 尚未开始消费就灌超过容量的事件
+        for i in 0..8 {
+            let _ = tx.send(MarketEvent::Trade(mk_trade(
+                &format!("warmup-{i}"),
+                "tok-lag",
+                1.0,
+            )));
+        }
+        // lag 之后再投递一笔——只有 consumer 没被 Lagged 打死才会被消费
+        let _ = tx.send(MarketEvent::Trade(mk_trade("after-lag", "tok-lag", 7.0)));
+
+        let svc = service.clone();
+        let handle = tokio::spawn(consume_trade_events(svc, rx));
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let fills = service.fill_ledger().list();
+        assert!(
+            fills.iter().any(|f| f.trade_id == "after-lag"),
+            "Lagged 之后仍必须能消费后续成交（旧实现会静默退出，after-lag 丢失）"
+        );
+        // task 仍然存活（未被 Lagged 终止）
+        assert!(
+            !handle.is_finished(),
+            "Lagged 不应终止消费 task（旧实现会退出）"
+        );
+
+        drop(tx);
+        drop(_ka);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+    }
+
+    /// P1-034：`Closed`（所有 sender drop）才真正退出消费循环。
+    #[tokio::test]
+    async fn test_consume_trade_events_closed_exits() {
+        let (tx, _ka) = broadcast::channel(8);
+        let rx = tx.subscribe();
+
+        let mut service = ExecutionServiceImpl::new_mock();
+        service.set_risk_engine(Arc::new(RiskEngine::new(RiskConfig::default())));
+        let service = Arc::new(service);
+
+        let svc = service.clone();
+        let handle = tokio::spawn(consume_trade_events(svc, rx));
+
+        let _ = tx.send(MarketEvent::Trade(mk_trade("before-close", "tok-c", 3.0)));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(service.fill_ledger().list().len(), 1);
+
+        // 所有 sender drop → Closed → 循环退出
+        drop(tx);
+        drop(_ka);
+
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+        assert!(
+            joined.is_ok(),
+            "sender 全部 drop（Closed）后 consumer task 应正常退出"
+        );
+    }
+
+    /// P1-034：非 Trade 事件被静默忽略，不会误跑 on_market_trade（不产生记账）。
+    #[tokio::test]
+    async fn test_consume_trade_events_ignores_non_trade_events() {
+        use crate::fast::market_events::{BookSnapshot, OrderStateEvent, SettlementEvent};
+
+        let (tx, _ka) = broadcast::channel(16);
+        let rx = tx.subscribe();
+
+        let mut service = ExecutionServiceImpl::new_mock();
+        service.set_risk_engine(Arc::new(RiskEngine::new(RiskConfig::default())));
+        let service = Arc::new(service);
+
+        let svc = service.clone();
+        let handle = tokio::spawn(consume_trade_events(svc, rx));
+
+        let _ = tx.send(MarketEvent::OrderBookUpdate(BookSnapshot {
+            token_id: "tok-n".to_string(),
+            bids: Vec::new(),
+            asks: Vec::new(),
+            timestamp: 0,
+        }));
+        let _ = tx.send(MarketEvent::OrderStateChange(OrderStateEvent {
+            order_id: "order-n".to_string(),
+            token_id: "tok-n".to_string(),
+            status: "live".to_string(),
+            filled_size: 5.0,
+            remaining_size: 5.0,
+            avg_price: Some(0.5),
+        }));
+        let _ = tx.send(MarketEvent::Settlement(SettlementEvent {
+            token_id: "tok-n".to_string(),
+            outcome: 1.0,
+            settled_at: 0,
+            uma_proposal: false,
+        }));
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        assert_eq!(
+            service.fill_ledger().list().len(),
+            0,
+            "OrderBookUpdate/OrderStateChange/Settlement 都不应触发成交记账"
+        );
+        let rs = service.risk_state.lock().await;
+        assert!(
+            !rs.positions.contains_key("tok-n"),
+            "非 Trade 事件不应污染 RiskEngine/risk_state 仓位"
+        );
+        // task 仍存活（非 Trade 事件被安全吞掉，未退出）
+        assert!(!handle.is_finished());
+
+        drop(tx);
+        drop(_ka);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
+    }
+
+    /// P1-010：下单失败路径（RiskEngine 未初始化）会把 claim 占位标记为 Rejected，
+    /// 之后同 order_id 可重试且不进入 pending 对账。
+    #[tokio::test]
+    async fn test_failed_place_order_marks_rejected() {
+        use crate::fast::order_state::OrderStateStatus;
+        use crate::fast::trading_gate::TradingGateState;
+        use pb::execution_service_server::ExecutionService;
+
+        let service = ExecutionServiceImpl::new_mock();
+        service.trading_gate.set_state(TradingGateState::Ready);
+        // 不挂载 risk_engine → 走「RiskEngine 未初始化」失败路径
+
+        let req = pb::AggregatedOrder {
+            order_id: "o-fail".to_string(),
+            token_id: "t1".to_string(),
+            direction: pb::Direction::BuyYes as i32,
+            quantity: 10.0,
+            status: pb::OrderStatus::Open as i32,
+            target_price: 0.5,
+            paper_trading: false,
+            ..Default::default()
+        };
+
+        let resp = service.place_order(Request::new(req)).await.unwrap();
+        let result = resp.into_inner();
+
+        assert_eq!(result.status, pb::ExecutionStatus::Rejected as i32);
+        // 占位已被标记 rejected（不再残留 Received）
+        assert_eq!(
+            service.order_store.get("o-fail").map(|s| s.status),
+            Some(OrderStateStatus::Rejected)
+        );
+        // 且不再进入 pending（对账不误报）
+        assert!(!service.order_store.pending_order_ids().contains("o-fail"));
+    }
+
+    /// P0-003：超仓订单在 place_order 中被 `check_and_reserve` 拦截，
+    /// 不会进入 FastExecutor / 普通下单路径，也不会产生有效订单。
+    ///
+    /// 关键判别：`new_mock()` 的 `fast_executor` 为 None，若超仓拒单没有
+    /// 在 FastExecutor 之前拦截，会落到「FastExecutor 未初始化」的拒绝分支。
+    /// 断言 error_message 是「风控预检拦截」而非「FastExecutor 未初始化」，
+    /// 即证明拒单发生在执行路径之前（不调 FastExecutor）。
+    #[tokio::test]
+    async fn test_place_order_over_limit_rejected_before_executor() {
+        use crate::fast::order_state::OrderStateStatus;
+        use crate::fast::trading_gate::TradingGateState;
+        use pb::execution_service_server::ExecutionService;
+
+        let mut service = ExecutionServiceImpl::new_mock();
+        service.trading_gate.set_state(TradingGateState::Ready);
+
+        // 挂载一个「单市场上限极小」的风控引擎，并把仓位占满到上限
+        let cfg = RiskConfig {
+            max_position_per_market: 100.0,
+            max_global_exposure: 100_000.0,
+            ..Default::default()
+        };
+        let engine = RiskEngine::new(cfg);
+        engine.post_check("t1", Side::Buy, 100.0, 100.0, 0.0, 10_000.0);
+        service.set_risk_engine(Arc::new(engine));
+
+        // 下单：qty=50 @ 0.5 → notional=25，100+25=125 > 100 超仓
+        let req = pb::AggregatedOrder {
+            order_id: "o-over".to_string(),
+            token_id: "t1".to_string(),
+            direction: pb::Direction::BuyYes as i32,
+            quantity: 50.0,
+            status: pb::OrderStatus::Open as i32,
+            target_price: 0.5,
+            paper_trading: false,
+            ..Default::default()
+        };
+
+        let resp = service.place_order(Request::new(req)).await.unwrap();
+        let result = resp.into_inner();
+
+        // 拒单
+        assert_eq!(result.status, pb::ExecutionStatus::Rejected as i32);
+        assert!(!result.success);
+        // 是「风控预检拦截」而非「FastExecutor 未初始化」→ 未进入执行路径
+        assert!(
+            result.error_message.contains("风控预检拦截"),
+            "应被风控拦截，实际错误: {}",
+            result.error_message
+        );
+        // 不产生有效订单：占位被标记 rejected，且不在 pending
+        assert_eq!(
+            service.order_store.get("o-over").map(|s| s.status),
+            Some(OrderStateStatus::Rejected)
+        );
+        assert!(!service.order_store.pending_order_ids().contains("o-over"));
+    }
+
+    /// P0-007B：apply_recovery 应用恢复计划（非成交订单标记终态 + 仓位重建 + 成交补记）。
+    #[tokio::test]
+    async fn test_apply_recovery_rebuild_and_nonfilled() {
+        use crate::fast::order_state::OrderStateStatus;
+        use crate::fast::state_sync::RecoveryAction;
+        use crate::fast::state_sync::RecoveryPlan;
+
+        let mut service = ExecutionServiceImpl::new_mock();
+        service.set_risk_engine(Arc::new(RiskEngine::new(RiskConfig::default())));
+
+        // 先制造一个 pending 订单（Live 状态）
+        service
+            .order_store
+            .create("o-vanish".to_string(), "tok-1".to_string(), "BUY".to_string(), 10.0);
+        if let Some(mut st) = service.order_store.get("o-vanish") {
+            st.mark_submitted("ex-vanish".to_string());
+            st.mark_live();
+            service.order_store.upsert(st);
+        }
+        assert!(service
+            .order_store
+            .pending_exchange_order_ids()
+            .contains("ex-vanish"));
+
+        let plan = RecoveryPlan {
+            actions: vec![
+                // P0-016：MarkOrderNonFilled 的 order_id 是交易所订单 ID（ex-vanish），
+                //    非 client_order_id（o-vanish），与 build_recovery_plan 生产路径一致
+                RecoveryAction::MarkOrderNonFilled {
+                    order_id: "ex-vanish".to_string(),
+                },
+                RecoveryAction::RebuildPosition {
+                    token_id: "tok-1".to_string(),
+                    qty: 25.0,
+                    notional: 12.5,
+                },
+            ],
+            unresolved_orders: Vec::new(),
+        };
+
+        let applied = service.apply_recovery(&plan).await;
+        assert_eq!(applied, 2);
+
+        // 非成交订单 → cancelled，退出 pending
+        assert_eq!(
+            service.order_store.get("o-vanish").map(|s| s.status),
+            Some(OrderStateStatus::Cancelled)
+        );
+        assert!(!service
+            .order_store
+            .pending_exchange_order_ids()
+            .contains("ex-vanish"));
+
+        // 仓位重建 → risk_state 与 RiskEngine 都更新
+        let rs = service.risk_state.lock().await;
+        assert_eq!(rs.positions.get("tok-1").copied().unwrap_or(0.0), 25.0);
+        drop(rs);
+        let re = service.risk_engine.as_ref().unwrap();
+        assert_eq!(re.snapshot_positions().get("tok-1"), Some(&25.0));
+        assert_eq!(re.snapshot().global_exposure, 12.5);
+    }
+
+    /// P1-031：rebuild_open_order_reserves 用 OrderStore 的 token_id + open order 的 price
+    /// 重建远端仍 open 的 BUY 订单预留额度。
+    #[tokio::test]
+    async fn test_rebuild_open_order_reserves_rebuilds_reserve() {
+        let mut service = ExecutionServiceImpl::new_mock();
+        let cfg = RiskConfig {
+            max_position_per_market: 100.0,
+            max_global_exposure: 100.0,
+            ..Default::default()
+        };
+        let engine = Arc::new(RiskEngine::new(cfg));
+        service.set_risk_engine(engine.clone());
+
+        // 本地 pending BUY 订单：requested 100，已成交 60，remaining 40
+        let mut st = service
+            .order_store
+            .create("client-r".to_string(), "tok-r".to_string(), "BUY".to_string(), 100.0);
+        st.mark_submitted("exchange-r".to_string());
+        st.update_fill(60.0); // PartialFilled, remaining 40
+        service.order_store.upsert(st);
+
+        // 远端 open order JSON：id 匹配 exchange-r，price = 0.5
+        let open_orders: Vec<serde_json::Value> = serde_json::from_value(serde_json::json!([
+            {"id": "exchange-r", "price": "0.5", "side": "BUY", "original_size": "100", "size_matched": "60"}
+        ]))
+        .unwrap();
+
+        service.rebuild_open_order_reserves(&open_orders);
+
+        // 重建 reserved = remaining 40 × 0.5 = 20。
+        // 再 reserve 85 → 20 + 85 = 105 > 100 → Err（暴露检查计入重建预留）
+        assert!(engine
+            .check_and_reserve("tok-r", Side::Buy, 85.0, 85.0, 50)
+            .is_err());
+        // 再 reserve 80 → 20 + 80 = 100 = 上限 → Ok
+        assert!(engine
+            .check_and_reserve("tok-r", Side::Buy, 80.0, 80.0, 50)
+            .is_ok());
+    }
+
+    /// P1-031：rebuild_open_order_reserves 对 SELL 订单不重建（减少暴露无需预留）。
+    #[tokio::test]
+    async fn test_rebuild_open_order_reserves_skips_sell() {
+        let mut service = ExecutionServiceImpl::new_mock();
+        let cfg = RiskConfig {
+            max_position_per_market: 100.0,
+            max_global_exposure: 100.0,
+            ..Default::default()
+        };
+        let engine = Arc::new(RiskEngine::new(cfg));
+        service.set_risk_engine(engine.clone());
+
+        // 本地 pending SELL 订单
+        let mut st = service
+            .order_store
+            .create("client-s".to_string(), "tok-s".to_string(), "SELL".to_string(), 100.0);
+        st.mark_submitted("exchange-s".to_string());
+        st.mark_live();
+        service.order_store.upsert(st);
+
+        let open_orders: Vec<serde_json::Value> = serde_json::from_value(serde_json::json!([
+            {"id": "exchange-s", "price": "0.5", "side": "SELL", "original_size": "100", "size_matched": "0"}
+        ]))
+        .unwrap();
+
+        service.rebuild_open_order_reserves(&open_orders);
+
+        // SELL 不重建预留 → 仍可满额 reserve 100
+        assert!(engine
+            .check_and_reserve("tok-s", Side::Buy, 100.0, 100.0, 50)
+            .is_ok());
+    }
+
+    /// P0-007B：apply_recovery 对 MarkOrderFilled 走 on_market_trade（成交补记 + 幂等）。
+    #[tokio::test]
+    async fn test_apply_recovery_filled_records_fill() {
+        use crate::fast::order_state::OrderStateStatus;
+        use crate::fast::state_sync::{RecoveryAction, RecoveryPlan};
+
+        let mut service = ExecutionServiceImpl::new_mock();
+        service.set_risk_engine(Arc::new(RiskEngine::new(RiskConfig::default())));
+
+        // 先制造一个已提交的订单（client_order_id 键 + exchange_order_id 字段）
+        service
+            .order_store
+            .create("client-fill".to_string(), "tok-1".to_string(), "BUY".to_string(), 10.0);
+        if let Some(mut st) = service.order_store.get("client-fill") {
+            st.mark_submitted("exchange-fill".to_string());
+            st.mark_live();
+            service.order_store.upsert(st);
+        }
+
+        let plan = RecoveryPlan {
+            actions: vec![RecoveryAction::MarkOrderFilled {
+                // P0-016：order_id 是交易所订单 ID（exchange-fill）
+                order_id: "exchange-fill".to_string(),
+                token_id: "tok-1".to_string(),
+                side: "BUY".to_string(),
+                price: 0.5,
+                size: 10.0,
+                trade_id: "trade-recover-1".to_string(),
+            }],
+            unresolved_orders: Vec::new(),
+        };
+
+        let applied = service.apply_recovery(&plan).await;
+        assert_eq!(applied, 1);
+
+        // FillLedger 记 1 条
+        assert_eq!(service.fill_ledger().list().len(), 1);
+        // risk_state 仓位 +10
+        let rs = service.risk_state.lock().await;
+        assert_eq!(rs.positions.get("tok-1").copied().unwrap_or(0.0), 10.0);
+        drop(rs);
+        // P0-016：OrderStore 通过 exchange_order_id 反查成功，成交后状态 → Filled
+        assert_eq!(
+            service.order_store.get("client-fill").map(|s| s.status),
+            Some(OrderStateStatus::Filled)
+        );
+    }
+
+    /// P1-035：apply_recovery 对空/空白 trade_id 的 MarkOrderFilled 必须 fail-closed，
+    /// 不产生任何记账副作用（FillLedger / RiskEngine 仓位 / OrderStore 均不变）。
+    #[tokio::test]
+    async fn test_apply_recovery_rejects_empty_trade_id() {
+        use crate::fast::order_state::OrderStateStatus;
+        use crate::fast::state_sync::{RecoveryAction, RecoveryPlan};
+
+        for bad_id in ["", "   "] {
+            let mut service = ExecutionServiceImpl::new_mock();
+            service.set_risk_engine(Arc::new(RiskEngine::new(RiskConfig::default())));
+
+            service
+                .order_store
+                .create("client-fill".to_string(), "tok-1".to_string(), "BUY".to_string(), 10.0);
+            if let Some(mut st) = service.order_store.get("client-fill") {
+                st.mark_submitted("exchange-fill".to_string());
+                st.mark_live();
+                service.order_store.upsert(st);
+            }
+
+            let plan = RecoveryPlan {
+                actions: vec![RecoveryAction::MarkOrderFilled {
+                    order_id: "exchange-fill".to_string(),
+                    token_id: "tok-1".to_string(),
+                    side: "BUY".to_string(),
+                    price: 0.5,
+                    size: 10.0,
+                    trade_id: bad_id.to_string(),
+                }],
+                unresolved_orders: Vec::new(),
+            };
+
+            service.apply_recovery(&plan).await;
+
+            assert!(
+                service.fill_ledger().list().is_empty(),
+                "trade_id={:?} 不应写入 FillLedger",
+                bad_id
+            );
+            let rs = service.risk_state.lock().await;
+            assert!(
+                !rs.positions.contains_key("tok-1"),
+                "trade_id={:?} 不应更新仓位",
+                bad_id
+            );
+            drop(rs);
+            assert_ne!(
+                service.order_store.get("client-fill").map(|s| s.status),
+                Some(OrderStateStatus::Filled),
+                "trade_id={:?} 不应把订单标记为 Filled",
+                bad_id
+            );
+        }
+    }
+
+    /// G1-003：eth_gasPrice 十六进制 Wei → gwei 解析（向下取整）。
+    #[test]
+    fn test_parse_gas_price_hex_to_gwei() {
+        assert_eq!(
+            parse_gas_price_hex_to_gwei(&format!("0x{:x}", 1_000_000_000u128)).unwrap(),
+            1
+        );
+        assert_eq!(
+            parse_gas_price_hex_to_gwei(&format!("0x{:x}", 1_000_000_000_000u128)).unwrap(),
+            1000
+        );
+        assert_eq!(
+            parse_gas_price_hex_to_gwei(&format!("0x{:x}", 1_500_000_000u128)).unwrap(),
+            1,
+            "不足 1 gwei 的部分应向下取整"
+        );
+        assert_eq!(parse_gas_price_hex_to_gwei("0x0").unwrap(), 0);
+    }
+
+    /// G1-003：非法 gasPrice 必须报错，不能静默当 0。
+    #[test]
+    fn test_parse_gas_price_invalid_returns_err() {
+        assert!(parse_gas_price_hex_to_gwei("").is_err());
+        assert!(parse_gas_price_hex_to_gwei("0x").is_err());
+        assert!(parse_gas_price_hex_to_gwei("zzz").is_err());
+    }
+
+    /// G1-003 / P0-RISK-003：Gas 超上限必须被风控拒绝（阈值逻辑不变，仅验证接线所依赖的门）。
+    #[test]
+    fn test_gas_protection_rejects_high_gwei() {
+        let cfg = RiskConfig {
+            max_gas_gwei: 500,
+            ..Default::default()
+        };
+        let engine = RiskEngine::new(cfg);
+        assert!(
+            engine
+                .check_and_reserve("t-gas", Side::Buy, 10.0, 10.0, 501)
+                .is_err(),
+            "gas 501 gwei 超上限应拒单"
+        );
+        assert!(
+            engine
+                .check_and_reserve("t-gas", Side::Buy, 10.0, 10.0, 500)
+                .is_ok(),
+            "gas 500 gwei 等于上限应放行"
+        );
+    }
+
+    /// G1-003：已挂载执行器但 gas 取价失败（RPC 不可达）→ FAIL-CLOSED 拒绝下单。
+    #[tokio::test]
+    async fn test_place_order_fails_closed_when_gas_fetch_fails() {
+        use crate::fast::order_state::OrderStateStatus;
+        use crate::fast::rpc_pool::RpcPool;
+        use crate::fast::trading_gate::TradingGateState;
+        use pb::execution_service_server::ExecutionService;
+
+        let mgr = Arc::new(WalletManager::new("gas_test_ks.json"));
+        let fe = FastExecutor::new(mgr, crate::clob::client::ClobConfig::default())
+            .unwrap()
+            .with_rpc_pool(Arc::new(RpcPool::new(&["http://127.0.0.1:1"])));
+
+        let mut service = ExecutionServiceImpl::new_mock();
+        service.trading_gate.set_state(TradingGateState::Ready);
+        service.set_risk_engine(Arc::new(RiskEngine::new(RiskConfig::default())));
+        service.set_fast_executor(Arc::new(fe));
+
+        let req = pb::AggregatedOrder {
+            order_id: "o-gas".to_string(),
+            token_id: "t1".to_string(),
+            direction: pb::Direction::BuyYes as i32,
+            quantity: 10.0,
+            status: pb::OrderStatus::Open as i32,
+            target_price: 0.5,
+            paper_trading: false,
+            ..Default::default()
+        };
+
+        let result = service
+            .place_order(Request::new(req))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(!result.success);
+        assert!(
+            result.error_message.contains("Gas 费获取失败"),
+            "应因 gas 取价失败被拒，实际: {}",
+            result.error_message
+        );
+        assert_eq!(
+            service.order_store.get("o-gas").map(|s| s.status),
+            Some(OrderStateStatus::Rejected)
+        );
+    }
+
+    /// G4 / P1-RISK-006：取消订单释放该单剩余预留并标记 Cancelled。
+    #[tokio::test]
+    async fn test_cancel_order_releases_reserve() {
+        use crate::fast::order_state::OrderStateStatus;
+
+        let mut service = ExecutionServiceImpl::new_mock();
+        let cfg = RiskConfig {
+            max_position_per_market: 100.0,
+            max_global_exposure: 100.0,
+            ..Default::default()
+        };
+        let engine = Arc::new(RiskEngine::new(cfg));
+        service.set_risk_engine(engine.clone());
+
+        // BUY 挂单：requested 100、未成交、限价 0.5 → 预留 50
+        service.order_store.create(
+            "c1".to_string(),
+            "tok-c".to_string(),
+            "BUY".to_string(),
+            100.0,
+        );
+        service.order_store.set_limit_price("c1", 0.5);
+        if let Some(mut st) = service.order_store.get("c1") {
+            st.mark_submitted("ex-c".to_string());
+            st.mark_live();
+            service.order_store.upsert(st);
+        }
+        engine
+            .check_and_reserve("tok-c", Side::Buy, 50.0, 100.0, 0)
+            .unwrap();
+        // 预留占满：再要 60 → 拒
+        assert!(engine
+            .check_and_reserve("tok-c", Side::Buy, 60.0, 60.0, 0)
+            .is_err());
+
+        service.settle_cancel("c1");
+
+        // 预留已释放：发布 100 应可满额通过（未释放则 50+100>100 被拒）
+        assert!(
+            engine
+                .check_and_reserve("tok-c", Side::Buy, 100.0, 100.0, 0)
+                .is_ok(),
+            "取消后预留必须已释放"
+        );
+        assert_eq!(
+            service.order_store.get("c1").map(|s| s.status),
+            Some(OrderStateStatus::Cancelled)
+        );
+    }
+
+    /// G4 / P1-RISK-006：cancel_all 场景对全部活动订单释放预留。
+    #[tokio::test]
+    async fn test_cancel_all_releases_reserves() {
+        use crate::fast::order_state::OrderStateStatus;
+
+        let mut service = ExecutionServiceImpl::new_mock();
+        let cfg = RiskConfig {
+            max_position_per_market: 100.0,
+            max_global_exposure: 1000.0,
+            ..Default::default()
+        };
+        let engine = Arc::new(RiskEngine::new(cfg));
+        service.set_risk_engine(engine.clone());
+
+        service.order_store.create(
+            "c1".to_string(),
+            "tok-1".to_string(),
+            "BUY".to_string(),
+            100.0,
+        );
+        service.order_store.set_limit_price("c1", 0.5);
+        service.order_store.create(
+            "c2".to_string(),
+            "tok-2".to_string(),
+            "BUY".to_string(),
+            100.0,
+        );
+        service.order_store.set_limit_price("c2", 0.5);
+        engine
+            .check_and_reserve("tok-1", Side::Buy, 50.0, 100.0, 0)
+            .unwrap();
+        engine
+            .check_and_reserve("tok-2", Side::Buy, 50.0, 100.0, 0)
+            .unwrap();
+
+        for st in service.order_store.active_orders() {
+            service.settle_cancel(&st.client_order_id);
+        }
+
+        assert!(service.order_store.active_orders().is_empty());
+        assert_eq!(
+            service.order_store.get("c1").map(|s| s.status),
+            Some(OrderStateStatus::Cancelled)
+        );
+        // 预留已全部释放：两 token 均可再满额
+        assert!(engine
+            .check_and_reserve("tok-1", Side::Buy, 100.0, 100.0, 0)
+            .is_ok());
+        assert!(engine
+            .check_and_reserve("tok-2", Side::Buy, 100.0, 100.0, 0)
+            .is_ok());
+    }
+
+    /// A1：终态订单不得被 `settle_cancel` 再次释放预留（先转换成功再释放）。
+    ///
+    /// 旧实现先释放后转换：终态订单仍会释放预留（over-release）。
+    #[tokio::test]
+    async fn test_settle_cancel_terminal_order_not_released() {
+        use crate::fast::order_state::OrderStateStatus;
+
+        let mut service = ExecutionServiceImpl::new_mock();
+        let engine = Arc::new(RiskEngine::new(RiskConfig {
+            max_position_per_market: 100.0,
+            max_global_exposure: 100.0,
+            ..Default::default()
+        }));
+        service.set_risk_engine(engine.clone());
+
+        service.order_store.create(
+            "c1".to_string(), "tok-c".to_string(), "BUY".to_string(), 100.0,
+        );
+        service.order_store.set_limit_price("c1", 0.5);
+        if let Some(mut st) = service.order_store.get("c1") {
+            st.mark_submitted("ex-c".to_string());
+            st.mark_live();
+            service.order_store.upsert(st);
+        }
+        engine
+            .check_and_reserve("tok-c", Side::Buy, 50.0, 100.0, 0)
+            .unwrap();
+        // 预留 50 已占用：再要 60 应被拒（50+60>100）
+        assert!(engine.check_and_reserve("tok-c", Side::Buy, 60.0, 60.0, 0).is_err());
+
+        // 模拟订单已被并发/外部置为终态 Cancelled（预留未释放）
+        service.order_store.mark_cancelled("c1");
+        assert_eq!(
+            service.order_store.get("c1").map(|s| s.status),
+            Some(OrderStateStatus::Cancelled)
+        );
+
+        // 再次 settle_cancel：终态 → 不得释放预留
+        service.settle_cancel("c1");
+        assert!(
+            engine.check_and_reserve("tok-c", Side::Buy, 60.0, 60.0, 0).is_err(),
+            "终态订单不得被 settle_cancel 释放预留（防 over-release）"
+        );
+    }
+
+    /// A1：`settle_cancel` 幂等——首次成功转换并释放，再次调用不再释放。
+    #[tokio::test]
+    async fn test_settle_cancel_idempotent() {
+        use crate::fast::order_state::OrderStateStatus;
+
+        let mut service = ExecutionServiceImpl::new_mock();
+        let engine = Arc::new(RiskEngine::new(RiskConfig {
+            max_position_per_market: 100.0,
+            max_global_exposure: 100.0,
+            ..Default::default()
+        }));
+        service.set_risk_engine(engine.clone());
+
+        service.order_store.create(
+            "c1".to_string(), "tok-c".to_string(), "BUY".to_string(), 100.0,
+        );
+        service.order_store.set_limit_price("c1", 0.5);
+        if let Some(mut st) = service.order_store.get("c1") {
+            st.mark_submitted("ex-c".to_string());
+            st.mark_live();
+            service.order_store.upsert(st);
+        }
+        engine
+            .check_and_reserve("tok-c", Side::Buy, 50.0, 100.0, 0)
+            .unwrap();
+
+        service.settle_cancel("c1");
+        // 已释放：可满额预留 100
+        assert!(engine.check_and_reserve("tok-c", Side::Buy, 100.0, 100.0, 0).is_ok());
+        service.settle_cancel("c1"); // 二次：终态 → no-op（不得再释放/负释放）
+        assert!(engine.check_and_reserve("tok-c", Side::Buy, 1.0, 1.0, 0).is_err());
+        assert_eq!(
+            service.order_store.get("c1").map(|s| s.status),
+            Some(OrderStateStatus::Cancelled)
+        );
+    }
+
+    /// A1：按 exchange_order_id 取消同样先转换成功再释放预留。
+    #[tokio::test]
+    async fn test_settle_cancel_by_exchange_releases_reserve() {
+        use crate::fast::order_state::OrderStateStatus;
+
+        let mut service = ExecutionServiceImpl::new_mock();
+        let engine = Arc::new(RiskEngine::new(RiskConfig {
+            max_position_per_market: 100.0,
+            max_global_exposure: 100.0,
+            ..Default::default()
+        }));
+        service.set_risk_engine(engine.clone());
+
+        service.order_store.create(
+            "c1".to_string(), "tok-c".to_string(), "BUY".to_string(), 100.0,
+        );
+        service.order_store.set_limit_price("c1", 0.5);
+        if let Some(mut st) = service.order_store.get("c1") {
+            st.mark_submitted("ex-c".to_string());
+            st.mark_live();
+            service.order_store.upsert(st);
+        }
+        engine
+            .check_and_reserve("tok-c", Side::Buy, 50.0, 100.0, 0)
+            .unwrap();
+
+        service.settle_cancel_by_exchange("ex-c");
+        assert!(engine.check_and_reserve("tok-c", Side::Buy, 100.0, 100.0, 0).is_ok());
+        assert_eq!(
+            service.order_store.get("c1").map(|s| s.status),
+            Some(OrderStateStatus::Cancelled)
+        );
+        // 不存在的 exchange id → no-op（不 panic、不释放）
+        service.settle_cancel_by_exchange("no-such-id");
+    }
+
+    /// A1：`limit_price<=0` 时明确告警且**不释放**（保守 fail-closed），不影响他人预留。
+    #[tokio::test]
+    async fn test_settle_cancel_missing_limit_price_does_not_release_others() {
+        use crate::fast::order_state::OrderStateStatus;
+
+        let mut service = ExecutionServiceImpl::new_mock();
+        let engine = Arc::new(RiskEngine::new(RiskConfig {
+            max_position_per_market: 1000.0,
+            max_global_exposure: 1000.0,
+            ..Default::default()
+        }));
+        service.set_risk_engine(engine.clone());
+
+        // c2：正常订单，预留 50（同 token）
+        service.order_store.create(
+            "c2".to_string(), "tok-x".to_string(), "BUY".to_string(), 100.0,
+        );
+        service.order_store.set_limit_price("c2", 0.5);
+        if let Some(mut st) = service.order_store.get("c2") {
+            st.mark_submitted("ex-2".to_string());
+            st.mark_live();
+            service.order_store.upsert(st);
+        }
+        engine
+            .check_and_reserve("tok-x", Side::Buy, 50.0, 100.0, 0)
+            .unwrap();
+
+        // c1：缺 limit_price（0），同 token
+        service.order_store.create(
+            "c1".to_string(), "tok-x".to_string(), "BUY".to_string(), 100.0,
+        );
+
+        service.settle_cancel("c1");
+        assert_eq!(
+            service.order_store.get("c1").map(|s| s.status),
+            Some(OrderStateStatus::Cancelled)
+        );
+        // 未释放任何预留（c2 的 50 仍占用）：50+960>1000 → 应被拒
+        assert!(engine.check_and_reserve("tok-x", Side::Buy, 960.0, 960.0, 0).is_err());
+    }
+
+    /// A1：已 Filled 订单不能被 cancel 释放（终态保护）。
+    #[tokio::test]
+    async fn test_settle_cancel_filled_order_not_released() {
+        use crate::fast::order_state::OrderStateStatus;
+
+        let mut service = ExecutionServiceImpl::new_mock();
+        let engine = Arc::new(RiskEngine::new(RiskConfig {
+            max_position_per_market: 100.0,
+            max_global_exposure: 100.0,
+            ..Default::default()
+        }));
+        service.set_risk_engine(engine.clone());
+
+        service.order_store.create(
+            "c1".to_string(), "tok-c".to_string(), "BUY".to_string(), 100.0,
+        );
+        service.order_store.set_limit_price("c1", 0.5);
+        if let Some(mut st) = service.order_store.get("c1") {
+            st.mark_submitted("ex-c".to_string());
+            st.mark_live();
+            service.order_store.upsert(st);
+        }
+        engine
+            .check_and_reserve("tok-c", Side::Buy, 50.0, 100.0, 0)
+            .unwrap();
+        // 全量成交 → Filled
+        service
+            .order_store
+            .apply_fill_by_exchange_order_id("ex-c", 100.0);
+
+        service.settle_cancel("c1");
+        assert_eq!(
+            service.order_store.get("c1").map(|s| s.status),
+            Some(OrderStateStatus::Filled)
+        );
+        // Filled 终态 → 不得释放：预留仍占用，再要 60 被拒
+        assert!(engine.check_and_reserve("tok-c", Side::Buy, 60.0, 60.0, 0).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // B2 / P1-009 — in-doubt 订单解析（冻结设计 Required Tests）
+    // ------------------------------------------------------------------
+
+    /// B2：gate_after_reconcile 决策表（A2 + B2，fail-closed，可单测）。
+    #[test]
+    fn test_b2_gate_after_reconcile_decision_table() {
+        use crate::fast::trading_gate::TradingGateState;
+
+        // 正常：全部同步 + 预留 OK + 无 unresolved → 双 true（允许进入 READY）
+        assert_eq!(gate_after_reconcile(true, true, true, 0), (true, true));
+        // positions 不同步 → 透传
+        assert_eq!(gate_after_reconcile(false, true, true, 0), (false, true));
+        // A2：预留重建失败 → 强制 (false, false)
+        assert_eq!(gate_after_reconcile(true, true, false, 0), (false, false));
+        assert_eq!(gate_after_reconcile(true, true, false, 3), (false, false));
+        // B2：unresolved>0（in-doubt 未唯一命中 / 消失订单无法分类）→ 订单不进同步
+        assert_eq!(gate_after_reconcile(true, true, true, 1), (true, false));
+        assert_eq!(gate_after_reconcile(false, true, true, 1), (false, false));
+        // 闸门层验证：unresolved → 不得 READY（停新单）
+        let gate = TradingGate::new();
+        let (p, o) = gate_after_reconcile(true, true, true, 2);
+        gate.reconcile_complete(p, o);
+        assert_ne!(gate.state(), TradingGateState::Ready);
+        // 干净时才允许 READY
+        let gate2 = TradingGate::new();
+        let (p2, o2) = gate_after_reconcile(true, true, true, 0);
+        gate2.reconcile_complete(p2, o2);
+        assert_eq!(gate2.state(), TradingGateState::Ready);
+    }
+
+    /// B2：唯一 fingerprint 命中 → Received→Submitted 绑定，进入按 ID 对账集合，预留不变。
+    #[tokio::test]
+    async fn test_b2_unique_remote_match_progresses_to_submitted() {
+        use crate::fast::order_state::OrderStateStatus;
+        use crate::fast::state_sync::resolve_in_doubt_orders;
+
+        let mut service = ExecutionServiceImpl::new_mock();
+        let re = Arc::new(RiskEngine::new(RiskConfig::default()));
+        service.set_risk_engine(re.clone());
+
+        // in-doubt 订单：Received、无 exchange_order_id；预留 60（100 × 0.60）已持有
+        service.order_store.create(
+            "c-b2".to_string(),
+            "tok-b2".to_string(),
+            "BUY".to_string(),
+            100.0,
+        );
+        service.order_store.set_limit_price("c-b2", 0.60);
+        if let Some(mut st) = service.order_store.get("c-b2") {
+            st.created_at = 1748779200;
+            service.order_store.upsert(st);
+        }
+        re.check_and_reserve("tok-b2", Side::Buy, 60.0, 100.0, 50)
+            .unwrap();
+        assert_eq!(re.committed_total(), 60.0);
+
+        let in_doubt = service.snapshot_in_doubt_orders();
+        assert_eq!(in_doubt.len(), 1);
+        // P1-009 根因：in-doubt 不在按 exchange id 的对账集合
+        assert!(service.snapshot_pending_exchange_order_ids().is_empty());
+
+        let remote = vec![serde_json::json!({
+            "id": "ex-b2",
+            "asset_id": "tok-b2",
+            "side": "BUY",
+            "price": "0.60000000",
+            "original_size": "100"
+        })];
+        let known = service.snapshot_pending_exchange_order_ids();
+        let resolution = resolve_in_doubt_orders(&in_doubt, &remote, &known);
+        assert_eq!(resolution.bindings.len(), 1);
+        assert_eq!(resolution.bindings[0].exchange_order_id, "ex-b2");
+        assert!(!resolution.has_unresolved());
+        assert_eq!(service.apply_in_doubt_resolution(&resolution), 1);
+
+        // Received → Submitted + exchange id，此后走正常 ID 对账
+        let st = service.order_store.get("c-b2").unwrap();
+        assert_eq!(st.status, OrderStateStatus::Submitted);
+        assert_eq!(st.exchange_order_id.as_deref(), Some("ex-b2"));
+        assert!(service
+            .snapshot_pending_exchange_order_ids()
+            .contains("ex-b2"));
+        assert!(service.snapshot_in_doubt_orders().is_empty());
+        // 绑定不改变预留（无释放、无累加）
+        assert_eq!(re.committed_total(), 60.0);
+    }
+
+    /// B2：fingerprint 命中 ≥2 → ambiguous → unresolved，绝不自动绑定，闸门不 READY。
+    #[tokio::test]
+    async fn test_b2_ambiguous_fingerprint_stays_unresolved() {
+        use crate::fast::order_state::OrderStateStatus;
+        use crate::fast::state_sync::resolve_in_doubt_orders;
+        use crate::fast::trading_gate::TradingGateState;
+
+        let mut service = ExecutionServiceImpl::new_mock();
+        let re = Arc::new(RiskEngine::new(RiskConfig::default()));
+        service.set_risk_engine(re.clone());
+
+        service.order_store.create(
+            "c-amb".to_string(),
+            "tok-amb".to_string(),
+            "BUY".to_string(),
+            100.0,
+        );
+        service.order_store.set_limit_price("c-amb", 0.60);
+        re.check_and_reserve("tok-amb", Side::Buy, 60.0, 100.0, 50)
+            .unwrap();
+
+        let mk = |id: &str| {
+            serde_json::json!({
+                "id": id, "asset_id": "tok-amb", "side": "BUY",
+                "price": "0.6", "original_size": "100"
+            })
+        };
+        let in_doubt = service.snapshot_in_doubt_orders();
+        let remote = vec![mk("ex-a"), mk("ex-b")];
+        let known = service.snapshot_pending_exchange_order_ids();
+        let resolution = resolve_in_doubt_orders(&in_doubt, &remote, &known);
+
+        assert!(resolution.bindings.is_empty());
+        assert_eq!(resolution.ambiguous, vec!["c-amb".to_string()]);
+        assert!(resolution.has_unresolved());
+        assert_eq!(
+            service.apply_in_doubt_resolution(&resolution),
+            0,
+            "ambiguous 不得绑定"
+        );
+
+        // 仍 in-doubt：Received、无 exchange id
+        let st = service.order_store.get("c-amb").unwrap();
+        assert_eq!(st.status, OrderStateStatus::Received);
+        assert!(st.exchange_order_id.is_none());
+        // 预留保守持有
+        assert_eq!(re.committed_total(), 60.0);
+        // 闸门不 READY
+        let (p, o) = gate_after_reconcile(true, true, true, resolution.unresolved.len());
+        let gate = TradingGate::new();
+        gate.reconcile_complete(p, o);
+        assert_ne!(gate.state(), TradingGateState::Ready);
+    }
+
+    /// B2：无唯一命中 → unresolved 保守持有预留；TTL 到期不构成释放授权
+    ///（实现中不存在任何按时间释放预留的路径），闸门保持非 READY。
+    #[tokio::test]
+    async fn test_b2_unmatched_keeps_reserve_no_ttl_release() {
+        use crate::fast::order_state::OrderStateStatus;
+        use crate::fast::state_sync::resolve_in_doubt_orders;
+        use crate::fast::trading_gate::TradingGateState;
+
+        let mut service = ExecutionServiceImpl::new_mock();
+        let re = Arc::new(RiskEngine::new(RiskConfig::default()));
+        service.set_risk_engine(re.clone());
+
+        service.order_store.create(
+            "c-ttl".to_string(),
+            "tok-ttl".to_string(),
+            "BUY".to_string(),
+            100.0,
+        );
+        service.order_store.set_limit_price("c-ttl", 0.60);
+        if let Some(mut st) = service.order_store.get("c-ttl") {
+            // 远古时间：即使 TTL 已远超任何时限也不释放
+            st.created_at = 1748779200;
+            service.order_store.upsert(st);
+        }
+        re.check_and_reserve("tok-ttl", Side::Buy, 60.0, 100.0, 50)
+            .unwrap();
+
+        let in_doubt = service.snapshot_in_doubt_orders();
+        let known = service.snapshot_pending_exchange_order_ids();
+        let resolution = resolve_in_doubt_orders(&in_doubt, &[], &known);
+        assert!(resolution.bindings.is_empty());
+        assert_eq!(resolution.unresolved, vec!["c-ttl".to_string()]);
+        assert_eq!(service.apply_in_doubt_resolution(&resolution), 0);
+
+        // 预留仍持有：无 TTL 释放路径，unresolved 不动预留
+        assert_eq!(re.committed_total(), 60.0);
+        assert_eq!(
+            service.order_store.get("c-ttl").map(|s| s.status),
+            Some(OrderStateStatus::Received)
+        );
+
+        // 闸门：unresolved → 非 READY（停新单，等待人工/后续对账分类）
+        let (p, o) = gate_after_reconcile(true, true, true, resolution.unresolved.len());
+        assert!(p && !o);
+        let gate = TradingGate::new();
+        gate.reconcile_complete(p, o);
+        assert_ne!(gate.state(), TradingGateState::Ready);
+    }
+
+    /// B2：解析结果重放（重连/重复对账后再应用）为 no-op：
+    /// 不翻转状态、不重复绑定、不改变预留。
+    #[tokio::test]
+    async fn test_b2_resolve_replay_is_noop() {
+        use crate::fast::order_state::OrderStateStatus;
+        use crate::fast::state_sync::resolve_in_doubt_orders;
+
+        let mut service = ExecutionServiceImpl::new_mock();
+        let re = Arc::new(RiskEngine::new(RiskConfig::default()));
+        service.set_risk_engine(re.clone());
+
+        service.order_store.create(
+            "c-replay".to_string(),
+            "tok-r".to_string(),
+            "BUY".to_string(),
+            100.0,
+        );
+        service.order_store.set_limit_price("c-replay", 0.60);
+        if let Some(mut st) = service.order_store.get("c-replay") {
+            st.created_at = 1748779200;
+            service.order_store.upsert(st);
+        }
+        re.check_and_reserve("tok-r", Side::Buy, 60.0, 100.0, 50)
+            .unwrap();
+
+        let remote = vec![serde_json::json!({
+            "id": "ex-r",
+            "asset_id": "tok-r",
+            "side": "BUY",
+            "price": "0.6",
+            "original_size": "100",
+            "created_at": 1748779200u64
+        })];
+
+        // 第一次解析：绑定成功
+        let in_doubt = service.snapshot_in_doubt_orders();
+        let known = service.snapshot_pending_exchange_order_ids();
+        let resolution = resolve_in_doubt_orders(&in_doubt, &remote, &known);
+        assert_eq!(service.apply_in_doubt_resolution(&resolution), 1);
+
+        // 重放同一解析结果 → no-op（已绑定，bind 返回 None）
+        assert_eq!(service.apply_in_doubt_resolution(&resolution), 0);
+
+        // 后续快照：已无 in-doubt → 再解析也是 no-op
+        let in_doubt2 = service.snapshot_in_doubt_orders();
+        assert!(in_doubt2.is_empty());
+        let known2 = service.snapshot_pending_exchange_order_ids();
+        let resolution2 = resolve_in_doubt_orders(&in_doubt2, &remote, &known2);
+        assert!(resolution2.bindings.is_empty());
+        assert!(!resolution2.has_unresolved());
+        assert_eq!(service.apply_in_doubt_resolution(&resolution2), 0);
+
+        // 状态 / 预留稳定
+        let st = service.order_store.get("c-replay").unwrap();
+        assert_eq!(st.status, OrderStateStatus::Submitted);
+        assert_eq!(st.exchange_order_id.as_deref(), Some("ex-r"));
+        assert_eq!(re.committed_total(), 60.0);
+    }
+
+    /// B2 Required Test（显式 DEFERRED，DCR-001 方案 A）：
+    /// durable-restart（进程重启后恢复 in-doubt 订单与预留）不可编写——
+    /// OrderStore/RiskEngine 为内存态，durable persistence 明确不实现（需新 DCR + Human 批准）。
+    #[test]
+    #[ignore = "DEFERRED per DCR-001 方案 A（durable persistence 未实现）"]
+    fn test_b2_durable_restart_recovery_deferred() {
+        panic!("DEFERRED: durable persistence 未实现，需新 DCR + Human 批准后补写");
     }
 }

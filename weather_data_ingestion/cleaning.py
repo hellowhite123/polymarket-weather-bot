@@ -12,6 +12,7 @@ cleaning.py - 数据清洗模块
 
 from __future__ import annotations
 
+import copy
 import logging
 import math
 from typing import Optional
@@ -189,6 +190,11 @@ def clean_forecast(forecast: WeatherForecast) -> WeatherForecast:
 
     返回新的 WeatherForecast（不修改原始对象）。
     """
+    # R5-003：兑现不可变契约——先深拷贝再清洗，避免原地修改污染调用方
+    # 持有的原始快照（此前 `_clean_period_fields` 与 `forecast.periods = periods`
+    # 均直接改动传入对象）。
+    forecast = copy.deepcopy(forecast)
+
     if not forecast.periods:
         logger.warning("[%s] %s 无预报周期，跳过清洗", forecast.source.source, forecast.location_name)
         return forecast

@@ -45,10 +45,20 @@ services:
       polymorph:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      # R5-009：真实探测——原 `sys.exit(0)` 恒真。app 无 HTTP/gRPC 就绪端点，
+      # 故探测 `market_discovery` 守护进程是否存活（扫描 /proc 的 argv，
+      # 精确匹配 `-m market_discovery`，不误匹配本 healthcheck 自身）。
+      test:
+        - CMD-SHELL
+        - >-
+          python -c "import glob,os,sys;
+          parts=[open(d+'/cmdline','rb').read().split(b'\x00')
+          for d in glob.glob('/proc/[0-9]*') if os.path.exists(d+'/cmdline')];
+          sys.exit(0 if any(b'-m' in p and b'market_discovery' in p for p in parts) else 1)"
       interval: 30s
       timeout: 5s
       retries: 3
+      start_period: 20s
 
   # ── Rust 执行层 ──
   polymorph:

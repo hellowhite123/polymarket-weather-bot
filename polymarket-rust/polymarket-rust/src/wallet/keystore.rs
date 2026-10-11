@@ -10,6 +10,7 @@ use aes_gcm::{Aes256Gcm, Key, Nonce};
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 /// PBKDF2 迭代次数，兼顾安全与性能
 const PBKDF2_ITERATIONS: u32 = 210_000;
@@ -68,7 +69,8 @@ impl KeyStore {
     /// 删除指定地址的条目
     pub fn remove(&mut self, address: &str) -> WalletResult<()> {
         let before = self.keys.len();
-        self.keys.retain(|k| !k.address.eq_ignore_ascii_case(address));
+        self.keys
+            .retain(|k| !k.address.eq_ignore_ascii_case(address));
         if self.keys.len() == before {
             Err(WalletError::WalletNotFound(address.to_string()))
         } else {
@@ -91,9 +93,12 @@ impl EncryptedKey {
     /// - `password`: 用户提供的加密密码
     pub fn encrypt(private_key: &str, address: &str, password: &str) -> WalletResult<Self> {
         // 标准化私钥：去掉 0x 前缀，转为字节
+        // R5-005：私钥字节以 Zeroizing 承载，离开作用域即擦除。
         let pk_hex = private_key.trim_start_matches("0x");
-        let pk_bytes = hex::decode(pk_hex)
-            .map_err(|e| WalletError::InvalidPrivateKey(format!("hex 解码失败: {e}")))?;
+        let pk_bytes = Zeroizing::new(
+            hex::decode(pk_hex)
+                .map_err(|e| WalletError::InvalidPrivateKey(format!("hex 解码失败: {e}")))?,
+        );
 
         if pk_bytes.len() != 32 {
             return Err(WalletError::InvalidPrivateKey(format!(
@@ -109,14 +114,20 @@ impl EncryptedKey {
         rand::thread_rng().fill_bytes(&mut nonce_bytes);
 
         // 通过 PBKDF2 从密码派生 AES-256 密钥
-        let mut derived_key = [0u8; KEY_LEN];
-        pbkdf2::pbkdf2_hmac::<sha2::Sha256>(password.as_bytes(), &salt, PBKDF2_ITERATIONS, &mut derived_key);
+        // R5-005：派生密钥以 Zeroizing 承载，离开作用域即擦除。
+        let mut derived_key = Zeroizing::new([0u8; KEY_LEN]);
+        pbkdf2::pbkdf2_hmac::<sha2::Sha256>(
+            password.as_bytes(),
+            &salt,
+            PBKDF2_ITERATIONS,
+            &mut derived_key[..],
+        );
 
         // AES-256-GCM 加密
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&derived_key));
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&derived_key[..]));
         let nonce = Nonce::from_slice(&nonce_bytes);
         let ciphertext = cipher
-            .encrypt(nonce, pk_bytes.as_ref())
+            .encrypt(nonce, pk_bytes.as_slice())
             .map_err(|e| WalletError::EncryptionFailed(e.to_string()))?;
 
         Ok(Self {
@@ -128,8 +139,11 @@ impl EncryptedKey {
         })
     }
 
-    /// 使用用户密码解密私钥，返回原始十六进制私钥（0x 开头）
-    pub fn decrypt(&self, password: &str) -> WalletResult<String> {
+    /// 使用用户密码解密私钥，返回原始十六进制私钥（0x 开头）。
+    ///
+    /// R5-005：返回值以 `Zeroizing<String>` 承载——调用方（`WalletManager::unlock`）
+    /// 解析出 `LocalWallet` 后即随作用域擦除，避免明文私钥在非零化缓冲中长期存活。
+    pub fn decrypt(&self, password: &str) -> WalletResult<Zeroizing<String>> {
         let ciphertext = B64
             .decode(&self.ciphertext)
             .map_err(|_| WalletError::DecryptionFailed)?;
@@ -140,15 +154,20 @@ impl EncryptedKey {
             .decode(&self.nonce)
             .map_err(|_| WalletError::DecryptionFailed)?;
 
-        let mut derived_key = [0u8; KEY_LEN];
-        pbkdf2::pbkdf2_hmac::<sha2::Sha256>(password.as_bytes(), &salt, self.iterations, &mut derived_key);
+        let mut derived_key = Zeroizing::new([0u8; KEY_LEN]);
+        pbkdf2::pbkdf2_hmac::<sha2::Sha256>(
+            password.as_bytes(),
+            &salt,
+            self.iterations,
+            &mut derived_key[..],
+        );
 
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&derived_key));
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&derived_key[..]));
         let nonce = Nonce::from_slice(&nonce_bytes);
-        let plaintext = cipher.decrypt(nonce, ciphertext.as_ref())?;
+        let plaintext = Zeroizing::new(cipher.decrypt(nonce, ciphertext.as_ref())?);
 
-        let hex_str = hex::encode(&plaintext);
-        Ok(format!("0x{hex_str}"))
+        let hex_str = Zeroizing::new(hex::encode(plaintext.as_slice()));
+        Ok(Zeroizing::new(format!("0x{}", hex_str.as_str())))
     }
 }
 
@@ -165,7 +184,7 @@ mod tests {
         let encrypted = EncryptedKey::encrypt(pk, address, password).unwrap();
         let decrypted = encrypted.decrypt(password).unwrap();
 
-        assert_eq!(decrypted, pk);
+        assert_eq!(decrypted.as_str(), pk);
     }
 
     #[test]
@@ -189,13 +208,16 @@ mod tests {
         .unwrap();
 
         ks.insert(ek.clone()).unwrap();
-        assert!(ks.find("0x1234567890abcdef1234567890abcdef12345678").is_some());
+        assert!(ks
+            .find("0x1234567890abcdef1234567890abcdef12345678")
+            .is_some());
         assert_eq!(ks.list_addresses().len(), 1);
 
         // 重复插入应失败
         assert!(ks.insert(ek).is_err());
 
-        ks.remove("0x1234567890abcdef1234567890abcdef12345678").unwrap();
+        ks.remove("0x1234567890abcdef1234567890abcdef12345678")
+            .unwrap();
         assert!(ks.list_addresses().is_empty());
     }
 }

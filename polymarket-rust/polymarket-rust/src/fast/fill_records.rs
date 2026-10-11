@@ -28,7 +28,7 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -74,6 +74,8 @@ impl std::fmt::Display for FillStatus {
 pub struct FillRecord {
     /// 统一订单 ID（交易所 orderID）
     pub order_id: String,
+    /// 成交唯一标识（trade id，fill 级 identity，P0-015 幂等 key）
+    pub trade_id: String,
     /// 市场 token id
     pub token_id: String,
     /// 方向 BUY / SELL
@@ -117,6 +119,7 @@ impl FillRecord {
         let now = now_secs();
         Self {
             order_id,
+            trade_id: String::new(),
             token_id,
             side,
             placed_at: now,
@@ -163,6 +166,101 @@ impl FillRecord {
 }
 
 // ============================================================================
+// OrderFill —— 订单级成交聚合（P1-029）
+// ============================================================================
+
+/// 订单级成交聚合。
+///
+/// 一个订单可能被多笔 partial fill 成交（每笔有不同的成交价/数量/手续费），
+/// `FillRecord` 是「单笔成交」记录，`OrderFill` 则是「订单」维度的累计汇总，
+/// 供订单级 API（`get` / `settle` / `cancel`）使用；每笔 fill 明细存于
+/// `FillLedger.fills`。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrderFill {
+    /// 统一订单 ID（交易所 orderID）
+    pub order_id: String,
+    /// 市场 token id
+    pub token_id: String,
+    /// 方向 BUY / SELL
+    pub side: String,
+    /// 下单时间（unix 秒）
+    pub placed_at: u64,
+    /// 下单价（预期价）
+    pub limit_price: f64,
+    /// 累计成交量
+    pub total_size: f64,
+    /// 加权平均成交价（按 size 加权）
+    pub avg_filled_price: f64,
+    /// 累计手续费（USDC）
+    pub total_fee: f64,
+    /// 累计滑点金额（USDC）
+    pub total_slippage: f64,
+    /// 累计滑点百分比（%）
+    pub total_slippage_pct: f64,
+    /// 状态
+    pub status: FillStatus,
+    /// 结算时间（unix 秒，结算后才有）
+    pub settled_at: Option<u64>,
+    /// 盈亏（USDC，结算后才有）
+    pub pnl: Option<f64>,
+    /// 已成交的 fill 笔数
+    pub fill_count: usize,
+}
+
+impl OrderFill {
+    /// 从首笔 fill 建立聚合。
+    fn from_fill(rec: &FillRecord) -> Self {
+        Self {
+            order_id: rec.order_id.clone(),
+            token_id: rec.token_id.clone(),
+            side: rec.side.clone(),
+            placed_at: rec.placed_at,
+            limit_price: rec.limit_price,
+            total_size: rec.size,
+            avg_filled_price: rec.filled_price,
+            total_fee: rec.fee,
+            total_slippage: rec.slippage,
+            total_slippage_pct: rec.slippage_pct,
+            status: rec.status,
+            settled_at: rec.settled_at,
+            pnl: rec.pnl,
+            fill_count: 1,
+        }
+    }
+
+    /// 累加一笔 fill（累计 size / 加权平均价 / 累计 fee / 累计滑点）。
+    fn accumulate(&mut self, rec: &FillRecord) {
+        let new_total = self.total_size + rec.size;
+        if new_total > 0.0 {
+            self.avg_filled_price = (self.avg_filled_price * self.total_size
+                + rec.filled_price * rec.size)
+                / new_total;
+        }
+        self.total_size = new_total;
+        self.total_fee += rec.fee;
+        self.total_slippage += rec.slippage;
+        self.total_slippage_pct += rec.slippage_pct;
+        self.fill_count += 1;
+        // 状态随最新 fill 推进（Cancelled 优先保持终态，不倒退）
+        if self.status != FillStatus::Cancelled && rec.status != FillStatus::Cancelled {
+            self.status = rec.status;
+        }
+    }
+
+    /// 标记结算。
+    fn mark_settled(&mut self, pnl: f64) {
+        self.settled_at = Some(now_secs());
+        self.pnl = Some(pnl);
+        self.status = FillStatus::Settled;
+    }
+
+    /// 标记取消。
+    fn mark_cancelled(&mut self) {
+        self.status = FillStatus::Cancelled;
+    }
+}
+
+// ============================================================================
 // 滑点计算
 // ============================================================================
 
@@ -205,82 +303,165 @@ pub fn compute_pnl(side: &str, size: f64, filled_price: f64, settlement: f64, fe
 /// 成交记录账簿。
 ///
 /// 线程安全（内部 `RwLock<HashMap>`），可被 executor / service 共享。
+///
+/// ## 双索引结构（P1-029）
+///
+/// - `fills`：fill 级历史，每笔成交独立（key = trade_id，空则回退 order_id），
+///   供 `list` / `stats` / `to_json` 输出「每笔成交」明细，不再互相覆盖。
+/// - `orders`：订单级聚合，`order_id → OrderFill`，累计该订单所有 fill 的
+///   成交量/加权平均价/手续费/滑点，供订单级 API（`get` / `settle` / `cancel`）使用。
 #[derive(Debug, Default)]
 pub struct FillLedger {
-    records: RwLock<HashMap<String, FillRecord>>,
+    /// fill 级历史：fill key → 单笔成交记录（P1-029）
+    fills: RwLock<HashMap<String, FillRecord>>,
+    /// 订单级聚合：order_id → 订单成交汇总（P1-029）
+    orders: RwLock<HashMap<String, OrderFill>>,
+    /// fill 幂等去重集合（trade_id），P0-015
+    seen_trade_ids: RwLock<HashSet<String>>,
 }
 
 impl FillLedger {
     pub fn new() -> Self {
         Self {
-            records: RwLock::new(HashMap::new()),
+            fills: RwLock::new(HashMap::new()),
+            orders: RwLock::new(HashMap::new()),
+            seen_trade_ids: RwLock::new(HashSet::new()),
         }
     }
 
-    /// 记录一笔成交（若 order_id 已存在则覆盖）。
-    pub fn record(&self, rec: FillRecord) {
-        self.records.write().unwrap().insert(rec.order_id.clone(), rec);
+    /// P0-015：fill 幂等去重。首次见到该 `trade_id` 返回 `true`（并登记），
+    /// 已处理过返回 `false`（调用方应忽略）。空 `trade_id` 不启用去重（保持旧行为）。
+    pub fn claim_trade(&self, trade_id: &str) -> bool {
+        if trade_id.is_empty() {
+            return true;
+        }
+        let mut seen = self.seen_trade_ids.write().unwrap();
+        seen.insert(trade_id.to_string())
     }
 
-    /// 获取单笔成交记录。
-    pub fn get(&self, order_id: &str) -> Option<FillRecord> {
-        self.records.read().unwrap().get(order_id).cloned()
+    /// 记录一笔成交。
+    ///
+    /// P1-029：不再以 `order_id` 覆盖式存储——而是：
+    /// 1. 把该笔 fill 写入 `fills`（key = trade_id 非空 ? trade_id : order_id），
+    ///    同订单多笔 fill 各自独立，不互相覆盖；
+    /// 2. 聚合到 `orders[order_id]`（累计 size / 加权平均价 / fee / 滑点）。
+    pub fn record(&self, rec: FillRecord) {
+        let fill_key = if rec.trade_id.is_empty() {
+            rec.order_id.clone()
+        } else {
+            rec.trade_id.clone()
+        };
+        self.fills.write().unwrap().insert(fill_key, rec.clone());
+
+        let mut orders = self.orders.write().unwrap();
+        match orders.get_mut(&rec.order_id) {
+            Some(o) => o.accumulate(&rec),
+            None => {
+                orders.insert(rec.order_id.clone(), OrderFill::from_fill(&rec));
+            }
+        }
+    }
+
+    /// 获取订单级成交聚合。
+    pub fn get(&self, order_id: &str) -> Option<OrderFill> {
+        self.orders.read().unwrap().get(order_id).cloned()
     }
 
     /// 结算：更新指定订单的盈亏（返回是否命中）。
+    ///
+    /// 订单级操作：更新 `orders[order_id]` 的结算状态与盈亏，并回写该订单
+    /// 所有 fill 的状态为 `Settled`（fill 的 `pnl` 保持 `None`，订单盈亏在聚合层）。
     pub fn settle(&self, order_id: &str, pnl: f64) -> bool {
-        let mut records = self.records.write().unwrap();
-        if let Some(rec) = records.get_mut(order_id) {
-            rec.mark_settled(pnl);
-            true
-        } else {
-            false
+        let mut orders = self.orders.write().unwrap();
+        let hit = match orders.get_mut(order_id) {
+            Some(o) => {
+                o.mark_settled(pnl);
+                true
+            }
+            None => false,
+        };
+        drop(orders);
+        if hit {
+            let mut fills = self.fills.write().unwrap();
+            for rec in fills.values_mut() {
+                if rec.order_id == order_id {
+                    rec.status = FillStatus::Settled;
+                    rec.settled_at = Some(now_secs());
+                }
+            }
         }
+        hit
     }
 
     /// 按 token 批量结算：给定某市场的结算结果（outcome 0.0 或 1.0），
     /// 自动结算该市场下所有未结算的成交记录，回填 `settled_at` 与 `pnl`。
     ///
-    /// 返回结算的记录数。
+    /// P1-029：遍历 fill 级历史，每笔 fill 独立计算盈亏并回填（成交价不同，
+    /// 盈亏分别计算更精确），再聚合到订单级。返回结算的 fill 笔数。
     pub fn settle_by_token(&self, token_id: &str, outcome: f64) -> usize {
-        let mut records = self.records.write().unwrap();
+        let mut fills = self.fills.write().unwrap();
+        let mut order_pnl: HashMap<String, f64> = HashMap::new();
         let mut count = 0;
-        for rec in records.values_mut() {
+        for rec in fills.values_mut() {
             if rec.token_id == token_id && rec.status == FillStatus::Filled {
                 let pnl = compute_pnl(&rec.side, rec.size, rec.filled_price, outcome, rec.fee);
                 rec.mark_settled(pnl);
+                *order_pnl.entry(rec.order_id.clone()).or_insert(0.0) += pnl;
                 count += 1;
+            }
+        }
+        drop(fills);
+
+        let mut orders = self.orders.write().unwrap();
+        for (order_id, pnl) in order_pnl {
+            if let Some(o) = orders.get_mut(&order_id) {
+                o.mark_settled(pnl);
             }
         }
         count
     }
 
-    /// 取消：标记指定订单为已取消。
+    /// 取消：标记指定订单为已取消（返回是否命中）。
+    ///
+    /// 订单级操作：更新 `orders[order_id]`，并回写该订单所有 fill 的状态为 `Cancelled`。
     pub fn cancel(&self, order_id: &str) -> bool {
-        let mut records = self.records.write().unwrap();
-        if let Some(rec) = records.get_mut(order_id) {
-            rec.mark_cancelled();
-            true
-        } else {
-            false
+        let mut orders = self.orders.write().unwrap();
+        let hit = match orders.get_mut(order_id) {
+            Some(o) => {
+                o.mark_cancelled();
+                true
+            }
+            None => false,
+        };
+        drop(orders);
+        if hit {
+            let mut fills = self.fills.write().unwrap();
+            for rec in fills.values_mut() {
+                if rec.order_id == order_id {
+                    rec.status = FillStatus::Cancelled;
+                }
+            }
         }
+        hit
     }
 
-    /// 列出全部成交记录（按下单时间升序）。
+    /// 列出全部成交记录（fill 级，每笔成交一条，按下单时间升序）。
+    ///
+    /// P1-029：返回 fill 级历史，同订单多笔 fill 各自独立，不再互相覆盖。
     pub fn list(&self) -> Vec<FillRecord> {
-        let mut v: Vec<FillRecord> = self.records.read().unwrap().values().cloned().collect();
+        let mut v: Vec<FillRecord> = self.fills.read().unwrap().values().cloned().collect();
         v.sort_by_key(|r| r.placed_at);
         v
     }
 
-    /// 记录总数。
+    /// 成交笔数（fill 级）。
     pub fn len(&self) -> usize {
-        self.records.read().unwrap().len()
+        self.fills.read().unwrap().len()
     }
 
     /// 是否为空。
     pub fn is_empty(&self) -> bool {
-        self.records.read().unwrap().is_empty()
+        self.fills.read().unwrap().is_empty()
     }
 
     /// 序列化为 JSON（供 gRPC / 文件持久化）。
@@ -290,13 +471,21 @@ impl FillLedger {
     }
 
     /// 汇总统计。
+    ///
+    /// P1-029：`total`/`total_fee`/`total_slippage`/`avg_slippage_pct` 基于 fill 级历史；
+    /// `settled`/`total_pnl` 基于订单级聚合（盈亏是订单维度的）。
     pub fn stats(&self) -> FillStats {
-        let list = self.list();
+        let fills = self.fills.read().unwrap();
+        let orders = self.orders.read().unwrap();
+        let list: Vec<FillRecord> = fills.values().cloned().collect();
         let total = list.len();
-        let settled = list.iter().filter(|r| r.status == FillStatus::Settled).count();
+        let settled = orders
+            .values()
+            .filter(|o| o.status == FillStatus::Settled)
+            .count();
         let total_fee: f64 = list.iter().map(|r| r.fee).sum();
         let total_slippage: f64 = list.iter().map(|r| r.slippage).sum();
-        let total_pnl: f64 = list.iter().filter_map(|r| r.pnl).sum();
+        let total_pnl: f64 = orders.values().filter_map(|o| o.pnl).sum();
         let avg_slippage_pct = if total > 0 {
             list.iter().map(|r| r.slippage_pct).sum::<f64>() / total as f64
         } else {
@@ -455,12 +644,24 @@ mod tests {
     #[test]
     fn test_ledger_stats() {
         let ledger = FillLedger::new();
-        let mut r1 = FillRecord::new("o1".to_string(), "t1".to_string(), "BUY".to_string(), 0.5, 10.0);
+        let mut r1 = FillRecord::new(
+            "o1".to_string(),
+            "t1".to_string(),
+            "BUY".to_string(),
+            0.5,
+            10.0,
+        );
         r1.mark_filled(0.5, 1.0);
         r1.mark_settled(2.0);
         ledger.record(r1);
 
-        let mut r2 = FillRecord::new("o2".to_string(), "t2".to_string(), "SELL".to_string(), 0.5, 10.0);
+        let mut r2 = FillRecord::new(
+            "o2".to_string(),
+            "t2".to_string(),
+            "SELL".to_string(),
+            0.5,
+            10.0,
+        );
         r2.mark_filled(0.5, 1.0);
         ledger.record(r2);
 
@@ -474,7 +675,13 @@ mod tests {
     #[test]
     fn test_ledger_to_json() {
         let ledger = FillLedger::new();
-        ledger.record(FillRecord::new("o1".to_string(), "t1".to_string(), "BUY".to_string(), 0.5, 10.0));
+        ledger.record(FillRecord::new(
+            "o1".to_string(),
+            "t1".to_string(),
+            "BUY".to_string(),
+            0.5,
+            10.0,
+        ));
         let json = ledger.to_json();
         assert!(json.contains("o1"));
         assert!(json.contains("token"));
@@ -515,15 +722,33 @@ mod tests {
     fn test_ledger_settle_by_token() {
         let ledger = FillLedger::new();
         // 两条同市场记录 + 一条其他市场
-        let mut r1 = FillRecord::new("o1".to_string(), "t1".to_string(), "BUY".to_string(), 0.5, 10.0);
+        let mut r1 = FillRecord::new(
+            "o1".to_string(),
+            "t1".to_string(),
+            "BUY".to_string(),
+            0.5,
+            10.0,
+        );
         r1.mark_filled(0.5, 0.0);
         ledger.record(r1);
 
-        let mut r2 = FillRecord::new("o2".to_string(), "t1".to_string(), "SELL".to_string(), 0.4, 20.0);
+        let mut r2 = FillRecord::new(
+            "o2".to_string(),
+            "t1".to_string(),
+            "SELL".to_string(),
+            0.4,
+            20.0,
+        );
         r2.mark_filled(0.4, 0.0);
         ledger.record(r2);
 
-        let mut r3 = FillRecord::new("o3".to_string(), "t2".to_string(), "BUY".to_string(), 0.6, 5.0);
+        let mut r3 = FillRecord::new(
+            "o3".to_string(),
+            "t2".to_string(),
+            "BUY".to_string(),
+            0.6,
+            5.0,
+        );
         r3.mark_filled(0.6, 0.0);
         ledger.record(r3);
 
@@ -546,5 +771,96 @@ mod tests {
         let o3 = ledger.get("o3").unwrap();
         assert_eq!(o3.status, FillStatus::Filled);
         assert!(o3.pnl.is_none());
+    }
+
+    #[test]
+    fn test_claim_trade_dedup() {
+        let ledger = FillLedger::new();
+        assert!(ledger.claim_trade("trade-1")); // 首次
+        assert!(!ledger.claim_trade("trade-1")); // 重复
+        assert!(ledger.claim_trade("trade-2")); // 不同 trade
+    }
+
+    #[test]
+    fn test_claim_trade_empty_always_true() {
+        let ledger = FillLedger::new();
+        assert!(ledger.claim_trade(""));
+        assert!(ledger.claim_trade(""));
+    }
+
+    /// P1-029：同订单多笔 fill 不互相覆盖——fill 级历史 3 条独立，订单级聚合累计。
+    #[test]
+    fn test_ledger_multi_fill_not_overwritten() {
+        let ledger = FillLedger::new();
+
+        let mut f1 = FillRecord::new("ord-x".to_string(), "t1".to_string(), "BUY".to_string(), 0.5, 30.0);
+        f1.trade_id = "trade-1".to_string();
+        f1.mark_filled(0.50, 0.1);
+        ledger.record(f1);
+
+        let mut f2 = FillRecord::new("ord-x".to_string(), "t1".to_string(), "BUY".to_string(), 0.5, 20.0);
+        f2.trade_id = "trade-2".to_string();
+        f2.mark_filled(0.55, 0.1);
+        ledger.record(f2);
+
+        let mut f3 = FillRecord::new("ord-x".to_string(), "t1".to_string(), "BUY".to_string(), 0.5, 50.0);
+        f3.trade_id = "trade-3".to_string();
+        f3.mark_filled(0.45, 0.1);
+        ledger.record(f3);
+
+        // fill 级历史：3 笔独立，不覆盖
+        assert_eq!(ledger.len(), 3, "同订单 3 笔 fill 应各自独立，不覆盖");
+        assert_eq!(ledger.list().len(), 3);
+
+        // 订单级聚合
+        let agg = ledger.get("ord-x").unwrap();
+        assert_eq!(agg.fill_count, 3);
+        assert!((agg.total_size - 100.0).abs() < 1e-9, "累计成交量应为 100");
+        // 加权平均价 = (0.50*30 + 0.55*20 + 0.45*50) / 100
+        let expected_avg = (0.50 * 30.0 + 0.55 * 20.0 + 0.45 * 50.0) / 100.0;
+        assert!(
+            (agg.avg_filled_price - expected_avg).abs() < 1e-9,
+            "avg={} expected={}",
+            agg.avg_filled_price,
+            expected_avg
+        );
+        assert!((agg.total_fee - 0.3).abs() < 1e-9, "累计手续费应为 0.3");
+    }
+
+    /// P1-029：同订单多笔 fill 结算——每笔独立算盈亏，订单级聚合累加。
+    #[test]
+    fn test_ledger_multi_fill_settle_by_token() {
+        let ledger = FillLedger::new();
+
+        let mut f1 = FillRecord::new("ord-y".to_string(), "t1".to_string(), "BUY".to_string(), 0.5, 30.0);
+        f1.trade_id = "trade-1".to_string();
+        f1.mark_filled(0.50, 0.0);
+        ledger.record(f1);
+
+        let mut f2 = FillRecord::new("ord-y".to_string(), "t1".to_string(), "BUY".to_string(), 0.5, 20.0);
+        f2.trade_id = "trade-2".to_string();
+        f2.mark_filled(0.60, 0.0);
+        ledger.record(f2);
+
+        // 结算 t1（outcome=1.0），应结算 2 笔 fill
+        let n = ledger.settle_by_token("t1", 1.0);
+        assert_eq!(n, 2, "应结算 2 笔 fill");
+
+        // 每笔 fill 独立盈亏之和：30*(1.0-0.5) + 20*(1.0-0.6) = 15 + 8 = 23
+        let fills = ledger.list();
+        let fill_pnl_sum: f64 = fills.iter().filter_map(|r| r.pnl).sum();
+        assert!(
+            (fill_pnl_sum - 23.0).abs() < 1e-9,
+            "每笔 fill 盈亏之和应为 23.0，实际 {}",
+            fill_pnl_sum
+        );
+
+        // 订单级聚合盈亏 = 23.0
+        let agg = ledger.get("ord-y").unwrap();
+        assert_eq!(agg.status, FillStatus::Settled);
+        assert!(
+            (agg.pnl.unwrap() - 23.0).abs() < 1e-9,
+            "订单级盈亏应为 23.0"
+        );
     }
 }

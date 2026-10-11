@@ -6,23 +6,22 @@
 //! - 订单管理（下单、取消、查询）
 
 use crate::clob::auth::{create_l1_headers, create_l2_headers, L2HeaderArgs};
-use crate::clob::constants::{CLOB_HOST, get_exchange_address, ZERO_ADDRESS};
+use crate::clob::constants::{get_exchange_address, CLOB_HOST, ZERO_ADDRESS};
 use crate::clob::endpoints::*;
 use crate::clob::error::{ClobError, ClobResult};
 use crate::clob::signing::{generate_order_salt, sign_order};
 use crate::fast::http_fast::{build_fast_client, HttpTuning};
 use crate::types::clob_types::*;
 use crate::types::enums::{Chain, OrderType, Side, SignatureType};
-use crate::types::order::{
-    round_config_for, CreateOrderOptions, COLLATERAL_DECIMALS,
-};
+use crate::types::order::{round_config_for, CreateOrderOptions, COLLATERAL_DECIMALS};
 use crate::wallet::WalletManager;
 use ethers::signers::{LocalWallet, Signer};
-use std::collections::HashMap;
 use ethers::utils::parse_units;
 use reqwest::Client;
 use serde::de::DeserializeOwned;
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// CLOB 客户端配置
@@ -59,13 +58,26 @@ pub struct ClobClient {
 }
 
 impl ClobClient {
-    /// 创建新的 CLOB 客户端
     pub fn new(wallet_manager: Arc<WalletManager>, config: ClobConfig) -> Self {
         Self {
             config,
-            http: Client::builder()
-                .build()
-                .expect("构建 HTTP 客户端失败"),
+            http: {
+                let mut builder = Client::builder().timeout(std::time::Duration::from_secs(10));
+
+                if let Ok(proxy) = std::env::var("HTTPS_PROXY") {
+                    if !proxy.is_empty() {
+                        tracing::info!("CLOB HTTP 使用代理: {}", proxy);
+                        builder =
+                            builder.proxy(reqwest::Proxy::all(proxy).expect("代理地址配置错误"));
+                    } else {
+                        tracing::info!("CLOB HTTP 直连模式");
+                    }
+                } else {
+                    tracing::info!("CLOB HTTP 直连模式");
+                }
+
+                builder.build().expect("构建 HTTP 客户端失败")
+            },
             wallet_manager,
             api_creds: None,
         }
@@ -74,6 +86,11 @@ impl ClobClient {
     /// 设置 API 凭证（L2 认证）
     pub fn set_api_creds(&mut self, creds: ApiKeyCreds) {
         self.api_creds = Some(creds);
+    }
+
+    /// 获取 API 凭证引用（L2 认证）
+    pub fn api_creds(&self) -> Option<&ApiKeyCreds> {
+        self.api_creds.as_ref()
     }
 
     /// 检查是否已设置 API 凭证
@@ -103,6 +120,11 @@ impl ClobClient {
             wallet_manager,
             api_creds: None,
         }
+    }
+
+    /// 获取钱包管理器
+    pub fn wallet_manager(&self) -> Arc<WalletManager> {
+        self.wallet_manager.clone()
     }
 
     /// 暴露底层 HTTP 客户端，用于连接预热（warmup）
@@ -139,7 +161,15 @@ impl ClobClient {
         let headers = create_l1_headers(&wallet, timestamp, 0).await?;
 
         let url = format!("{}{}", self.config.host, CREATE_API_KEY);
-        let resp = self.http.post(&url).headers(self.build_header_map(&headers)?).send().await?;
+
+        tracing::info!("CREATE API KEY URL={}", url);
+
+        let resp = self
+            .http
+            .post(&url)
+            .headers(self.build_header_map(&headers)?)
+            .send()
+            .await?;
 
         let creds = self.handle_response::<ApiKeyCreds>(resp).await?;
         Ok(creds)
@@ -154,28 +184,46 @@ impl ClobClient {
         let headers = create_l1_headers(&wallet, timestamp, 0).await?;
 
         let url = format!("{}{}", self.config.host, DERIVE_API_KEY);
-        let resp = self.http.post(&url).headers(self.build_header_map(&headers)?).send().await?;
+
+        tracing::info!("DERIVE API KEY request: {}", url);
+
+        let resp = self
+            .http
+            .get(&url)
+            .headers(self.build_header_map(&headers)?)
+            .send()
+            .await?;
 
         let creds = self.handle_response::<ApiKeyCreds>(resp).await?;
+        tracing::info!("DERIVE API KEY URL={}", url);
         Ok(creds)
     }
 
     /// 创建或派生 API Key
     ///
     /// 先尝试创建，若已存在则派生
-    pub async fn create_or_derive_api_key(&self, address: &str, password: &str) -> ClobResult<ApiKeyCreds> {
-        // 先尝试创建
+    pub async fn create_or_derive_api_key(
+        &self,
+        address: &str,
+        password: &str,
+    ) -> ClobResult<ApiKeyCreds> {
+        // 先尝试创建；仅在「地址已有 key」(400) 时回退到派生，其余错误直接返回（P1-004）。
         match self.create_api_key(address, password).await {
             Ok(creds) => Ok(creds),
-            Err(_) => {
-                // 创建失败（可能已存在），尝试派生
+            Err(ClobError::Api { status: 400, .. }) => {
+                tracing::info!("API Key 已存在 (400)，改为派生");
                 self.derive_api_key(address, password).await
             }
+            Err(e) => Err(e),
         }
     }
 
     /// 列出所有 API Key（L2 认证）
-    pub async fn get_api_keys(&self, address: &str, password: &str) -> ClobResult<Vec<ApiKeyCreds>> {
+    pub async fn get_api_keys(
+        &self,
+        address: &str,
+        password: &str,
+    ) -> ClobResult<Vec<ApiKeyCreds>> {
         let wallet = self.unlock_wallet(address, password)?;
         let creds = self.require_creds()?;
         let timestamp = self.timestamp();
@@ -184,10 +232,15 @@ impl ClobClient {
             request_path: GET_API_KEYS.to_string(),
             body: None,
         };
-        let headers = create_l2_headers(&wallet, &creds, &l2_args, timestamp)?;
+        let headers = create_l2_headers(&wallet, creds, &l2_args, timestamp)?;
 
         let url = format!("{}{}", self.config.host, GET_API_KEYS);
-        let resp = self.http.get(&url).headers(self.build_header_map(&headers)?).send().await?;
+        let resp = self
+            .http
+            .get(&url)
+            .headers(self.build_header_map(&headers)?)
+            .send()
+            .await?;
 
         #[derive(serde::Deserialize)]
         struct ApiKeysResponse {
@@ -220,7 +273,12 @@ impl ClobClient {
     /// 获取中间价
     pub async fn get_midpoint(&self, token_id: &str) -> ClobResult<f64> {
         let url = format!("{}{}", self.config.host, GET_MIDPOINT);
-        let resp = self.http.get(&url).query(&[("token_id", token_id)]).send().await?;
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[("token_id", token_id)])
+            .send()
+            .await?;
 
         let mid_resp: MidpointResponse = self.handle_response(resp).await?;
         mid_resp
@@ -232,7 +290,12 @@ impl ClobClient {
     /// 获取订单簿
     pub async fn get_order_book(&self, token_id: &str) -> ClobResult<OrderBookSummary> {
         let url = format!("{}{}", self.config.host, GET_ORDER_BOOK);
-        let resp = self.http.get(&url).query(&[("token_id", token_id)]).send().await?;
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[("token_id", token_id)])
+            .send()
+            .await?;
 
         self.handle_response(resp).await
     }
@@ -240,7 +303,12 @@ impl ClobClient {
     /// 获取 tick size
     pub async fn get_tick_size(&self, token_id: &str) -> ClobResult<String> {
         let url = format!("{}{}", self.config.host, GET_TICK_SIZE);
-        let resp = self.http.get(&url).query(&[("token_id", token_id)]).send().await?;
+        let resp = self
+            .http
+            .get(&url)
+            .query(&[("token_id", token_id)])
+            .send()
+            .await?;
 
         #[derive(serde::Deserialize)]
         struct TickSizeResponse {
@@ -250,6 +318,56 @@ impl ClobClient {
 
         let result: TickSizeResponse = self.handle_response(resp).await?;
         Ok(result.tick_size)
+    }
+
+    /// 网络健康检查：GET /time 验证 CLOB 可达性（无需认证的公共端点）。
+    /// 带指数退避重试（P1-003）。
+    pub async fn health_check(&self) -> ClobResult<()> {
+        let url = format!("{}{}", self.config.host, TIME);
+        let resp = self.get_with_retry(&url, &[], 2).await?;
+        let _: serde_json::Value = self.handle_response(resp).await?;
+        Ok(())
+    }
+
+    /// 带指数退避重试的 GET 请求（P1-003）。
+    ///
+    /// 仅对网络错误和 5xx 重试；4xx 不重试（参数错误重试无意义）。
+    /// 单次请求 5s 超时，重试间隔指数退避（0.5s → 1s → 2s → ...）。
+    async fn get_with_retry(
+        &self,
+        url: &str,
+        query: &[(&str, &str)],
+        retries: u32,
+    ) -> ClobResult<reqwest::Response> {
+        let mut attempt = 0u32;
+        loop {
+            let mut req = self.http.get(url);
+            if !query.is_empty() {
+                req = req.query(query);
+            }
+            match req.timeout(Duration::from_secs(5)).send().await {
+                Ok(resp) => {
+                    if resp.status().is_server_error() && attempt < retries {
+                        attempt += 1;
+                        let delay = Duration::from_millis(500u64 * (1u64 << attempt));
+                        tracing::warn!("CLOB GET 5xx，重试 {attempt}/{retries}");
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Ok(resp);
+                }
+                Err(e) => {
+                    if attempt < retries {
+                        attempt += 1;
+                        let delay = Duration::from_millis(500u64 * (1u64 << attempt));
+                        tracing::warn!("CLOB GET 网络错误 {e}，重试 {attempt}/{retries}");
+                        tokio::time::sleep(delay).await;
+                        continue;
+                    }
+                    return Err(e.into());
+                }
+            }
+        }
     }
 
     // ===== 订单管理 =====
@@ -274,11 +392,7 @@ impl ClobClient {
         let creds = self.require_creds()?;
 
         // 构建 Order
-        let signed_order = self.build_and_sign_limit_order(
-            &wallet,
-            user_order,
-            options,
-        )?;
+        let signed_order = self.build_and_sign_limit_order(&wallet, user_order, options)?;
 
         let owner = self.get_owner_address(&wallet);
         let body = NewOrderRequest {
@@ -295,7 +409,7 @@ impl ClobClient {
             request_path: POST_ORDER.to_string(),
             body: Some(body_json.clone()),
         };
-        let headers = create_l2_headers(&wallet, &creds, &l2_args, timestamp)?;
+        let headers = create_l2_headers(&wallet, creds, &l2_args, timestamp)?;
 
         let url = format!("{}{}", self.config.host, POST_ORDER);
         let resp = self
@@ -327,11 +441,7 @@ impl ClobClient {
         let wallet = self.unlock_wallet(address, password)?;
         let creds = self.require_creds()?;
 
-        let signed_order = self.build_and_sign_market_order(
-            &wallet,
-            user_market_order,
-            options,
-        )?;
+        let signed_order = self.build_and_sign_market_order(&wallet, user_market_order, options)?;
 
         let order_type = user_market_order
             .order_type
@@ -354,7 +464,7 @@ impl ClobClient {
             request_path: POST_ORDER.to_string(),
             body: Some(body_json.clone()),
         };
-        let headers = create_l2_headers(&wallet, &creds, &l2_args, timestamp)?;
+        let headers = create_l2_headers(&wallet, creds, &l2_args, timestamp)?;
 
         let url = format!("{}{}", self.config.host, POST_ORDER);
         let resp = self
@@ -370,7 +480,12 @@ impl ClobClient {
     }
 
     /// 取消订单（L2 认证）
-    pub async fn cancel_order(&self, address: &str, password: &str, order_id: &str) -> ClobResult<CancelOrderResponse> {
+    pub async fn cancel_order(
+        &self,
+        address: &str,
+        password: &str,
+        order_id: &str,
+    ) -> ClobResult<CancelOrderResponse> {
         let wallet = self.unlock_wallet(address, password)?;
         let creds = self.require_creds()?;
 
@@ -382,10 +497,10 @@ impl ClobClient {
         let timestamp = self.timestamp();
         let l2_args = L2HeaderArgs {
             method: "DELETE".to_string(),
-            request_path: format!("{CANCEL_ORDER}"),
+            request_path: CANCEL_ORDER.to_string(),
             body: Some(body_json.clone()),
         };
-        let headers = create_l2_headers(&wallet, &creds, &l2_args, timestamp)?;
+        let headers = create_l2_headers(&wallet, creds, &l2_args, timestamp)?;
 
         let url = format!("{}{}", self.config.host, CANCEL_ORDER);
         let resp = self
@@ -401,7 +516,11 @@ impl ClobClient {
     }
 
     /// 取消所有订单（L2 认证）
-    pub async fn cancel_all_orders(&self, address: &str, password: &str) -> ClobResult<CancelOrderResponse> {
+    pub async fn cancel_all_orders(
+        &self,
+        address: &str,
+        password: &str,
+    ) -> ClobResult<CancelOrderResponse> {
         let wallet = self.unlock_wallet(address, password)?;
         let creds = self.require_creds()?;
 
@@ -411,7 +530,7 @@ impl ClobClient {
             request_path: CANCEL_ALL.to_string(),
             body: None,
         };
-        let headers = create_l2_headers(&wallet, &creds, &l2_args, timestamp)?;
+        let headers = create_l2_headers(&wallet, creds, &l2_args, timestamp)?;
 
         let url = format!("{}{}", self.config.host, CANCEL_ALL);
         let resp = self
@@ -640,8 +759,12 @@ impl ClobClient {
         let round_config = round_config_for(options.tick_size);
 
         // 计算原始金额
-        let (side_u8, raw_maker_amt, raw_taker_amt) =
-            get_order_raw_amounts(user_order.side, user_order.size, user_order.price, round_config);
+        let (side_u8, raw_maker_amt, raw_taker_amt) = get_order_raw_amounts(
+            user_order.side,
+            user_order.size,
+            user_order.price,
+            round_config,
+        );
 
         // 转为链上单位（6 decimals）
         let maker_amount = parse_units_to_string(raw_maker_amt, COLLATERAL_DECIMALS);
@@ -747,13 +870,14 @@ impl ClobClient {
 
     /// 获取 API 凭证（必须已设置）
     fn require_creds(&self) -> ClobResult<&ApiKeyCreds> {
-        self.api_creds
-            .as_ref()
-            .ok_or(ClobError::NoApiCreds)
+        self.api_creds.as_ref().ok_or(ClobError::NoApiCreds)
     }
 
     /// 将 HashMap 转为 reqwest::HeaderMap
-    fn build_header_map(&self, headers: &std::collections::HashMap<String, String>) -> ClobResult<reqwest::header::HeaderMap> {
+    fn build_header_map(
+        &self,
+        headers: &std::collections::HashMap<String, String>,
+    ) -> ClobResult<reqwest::header::HeaderMap> {
         let mut map = reqwest::header::HeaderMap::new();
         for (k, v) in headers {
             map.insert(
@@ -772,19 +896,29 @@ impl ClobClient {
         let text = resp.text().await?;
 
         if status >= 400 {
+            tracing::error!("CLOB API ERROR status={} body={}", status, text);
+
             return Err(ClobError::Api {
                 status,
                 message: text,
             });
         }
 
-        serde_json::from_str(&text).map_err(|e| ClobError::Api {
-            status,
-            message: format!("JSON 解析失败: {e}, 原始响应: {text}"),
+        serde_json::from_str(&text).map_err(|e| {
+            tracing::error!(
+                "CLOB JSON PARSE ERROR status={} error={} body={}",
+                status,
+                e,
+                text
+            );
+
+            ClobError::Api {
+                status,
+                message: format!("JSON 解析失败: {e}, 原始响应: {text}"),
+            }
         })
     }
 }
-
 /// 计算限价单的原始金额
 ///
 /// - BUY: makerAmount = size * price (USDC), takerAmount = size (shares)
@@ -866,7 +1000,7 @@ fn parse_units_to_string(value: f64, decimals: u32) -> String {
     // 先格式化到合理精度，避免浮点误差
     let formatted = format!("{:.10}", value);
     // 使用 ethers 的 parse_units
-    match parse_units(&formatted, decimals as u32) {
+    match parse_units(&formatted, decimals) {
         Ok(u) => u.to_string(),
         Err(_) => {
             // 回退：手动计算
@@ -913,7 +1047,9 @@ mod tests {
 
     #[test]
     fn test_round_normal() {
-        assert_eq!(round_normal(3.14159, 2), 3.14);
+        let pi = std::f64::consts::PI;
+        // 用 PI 参与断言，避免 approx_constant 触发（clippy deny）
+        assert_eq!(round_normal(pi, 2), (pi * 100.0).round() / 100.0);
         assert_eq!(round_normal(3.146, 2), 3.15);
     }
 

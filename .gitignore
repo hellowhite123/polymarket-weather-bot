@@ -27,6 +27,8 @@ data/
 .env
 *.key
 wallets/
+# 钱包密钥库（敏感，严禁提交）
+**/keystore.json
 
 # ── IDE / 工具 ──
 .vscode/
@@ -43,3 +45,10 @@ wallets/
 # ── 其他 ──
 .DS_Store
 Thumbs.db
+
+# ── 测试缓存 ──
+.pytest_cache/
+
+# ── 临时 diff / 误建命令产物 ──
+*.diff
+/how --stat *

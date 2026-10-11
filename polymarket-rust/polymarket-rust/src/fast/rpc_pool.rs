@@ -193,7 +193,10 @@ impl RpcNode {
 
     /// 是否可用于请求
     pub fn is_available(&self) -> bool {
-        matches!(*self.state.read().unwrap(), NodeState::Healthy | NodeState::Degraded)
+        matches!(
+            *self.state.read().unwrap(),
+            NodeState::Healthy | NodeState::Degraded
+        )
     }
 
     /// 最近一次健康检查延迟 (ms)
@@ -367,13 +370,7 @@ impl RpcPool {
         let req = JsonRpcRequest::new("eth_blockNumber", serde_json::json!([]));
         let start = Instant::now();
 
-        match self
-            .client
-            .post(&node.url)
-            .json(&req)
-            .send()
-            .await
-        {
+        match self.client.post(&node.url).json(&req).send().await {
             Ok(resp) => match resp.json::<JsonRpcResponse>().await {
                 Ok(rpc_resp) => {
                     if let Some(err) = rpc_resp.error {
@@ -381,7 +378,7 @@ impl RpcPool {
                         node.mark_dead();
                         false
                     } else {
-                        let block = hex_str_to_u64(&rpc_resp.result.as_str().unwrap_or("0x0"));
+                        let block = hex_str_to_u64(rpc_resp.result.as_str().unwrap_or("0x0"));
                         let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
                         node.record_sample(latency_ms, block);
                         true
@@ -470,7 +467,8 @@ impl RpcPool {
             let idx = ((self.current_index.load(Ordering::Relaxed) + offset) % total) as usize;
             let node = &self.nodes[idx];
             if node.is_available() {
-                self.current_index.store((idx as u64 + 1) % total, Ordering::Relaxed);
+                self.current_index
+                    .store((idx as u64 + 1) % total, Ordering::Relaxed);
                 return Some(node.clone());
             }
         }
@@ -543,10 +541,7 @@ impl RpcPool {
         tx_hash: &str,
     ) -> Result<Option<TransactionReceipt>, String> {
         let result = self
-            .rpc_call(
-                "eth_getTransactionReceipt",
-                serde_json::json!([tx_hash]),
-            )
+            .rpc_call("eth_getTransactionReceipt", serde_json::json!([tx_hash]))
             .await?;
 
         if result.is_null() {
@@ -602,9 +597,7 @@ impl TransactionReceipt {
 
     /// 解析块号
     pub fn block_number_u64(&self) -> Option<u64> {
-        self.block_number
-            .as_deref()
-            .map(hex_str_to_u64)
+        self.block_number.as_deref().map(hex_str_to_u64)
     }
 }
 

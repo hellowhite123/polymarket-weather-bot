@@ -227,16 +227,8 @@ impl PreSignedPool {
             if let Some(by_price) = b.get_mut(&key) {
                 // 选出符合条件的最优价格档
                 let best: Option<i64> = match side {
-                    Side::Buy => by_price
-                        .keys()
-                        .filter(|t| **t <= limit)
-                        .max()
-                        .copied(),
-                    Side::Sell => by_price
-                        .keys()
-                        .filter(|t| **t >= limit)
-                        .min()
-                        .copied(),
+                    Side::Buy => by_price.keys().filter(|t| **t <= limit).max().copied(),
+                    Side::Sell => by_price.keys().filter(|t| **t >= limit).min().copied(),
                 };
 
                 if let Some(ticks) = best {

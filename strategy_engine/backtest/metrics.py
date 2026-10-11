@@ -10,7 +10,8 @@
 
 import logging
 import math
-from typing import Dict, List, Optional, Tuple
+from collections import deque
+from typing import Deque, Dict, List, Optional, Tuple
 
 from .models import TradeRecord, EquityPoint, TradeAction
 
@@ -59,8 +60,9 @@ class MetricsCalculator:
         else:
             annualized = roi
 
-        # Sharpe / Sortino
-        sharpe, sortino = self._calc_sharpe_sortino(equity_curve)
+        # Sharpe / Sortino（R5-007：年化因子按实际采样间隔反推）
+        periods_per_year = self._resolve_periods_per_year(equity_curve, total_hours)
+        sharpe, sortino = self._calc_sharpe_sortino(equity_curve, periods_per_year)
 
         # 最大回撤
         max_dd, max_dd_pct = self._calc_max_drawdown(equity_curve)
@@ -112,6 +114,38 @@ class MetricsCalculator:
     # ================================================================
     # 内部计算方法
     # ================================================================
+
+    def _resolve_periods_per_year(
+        self,
+        equity_curve: List[EquityPoint],
+        total_hours: float,
+    ) -> float:
+        """由**真实采样间隔**反推年化因子，替代硬编码 `365 × 4`。
+
+        注意：`total_hours` 的生产定义（`engine.py`）是**回测窗口首尾跨度**
+        （`events[0].deadline - 48h` → `events[-1].deadline + 1h`），并非
+        equity_curve 的首尾跨度；因此**不能**用 `total_hours / len(curve)` 作为
+        采样间隔（既混用了窗口与曲线，又把 n 个点当成 n 个间隔——实际只有 n-1 个）。
+
+        取值优先级：
+        1. **真实时间戳**：`interval = (last_ts - first_ts) / (n - 1)`（推荐）；
+        2. 回退：`interval = total_hours / (n - 1)`（时间戳不可用时，仍按 n-1 个间隔）；
+        3. 信息不足（点数 < 2 / 跨度 ≤ 0）时回退旧默认（每 6h 一个采样点）。
+        """
+        n = len(equity_curve)
+        if n >= 2:
+            span_hours = (
+                equity_curve[-1].timestamp - equity_curve[0].timestamp
+            ).total_seconds() / 3600.0
+            if span_hours > 0:
+                interval_hours = span_hours / (n - 1)
+                if interval_hours > 0:
+                    return (365.25 * 24) / interval_hours
+            if total_hours > 0:
+                interval_hours = total_hours / (n - 1)
+                if interval_hours > 0:
+                    return (365.25 * 24) / interval_hours
+        return 365 * 4
 
     def _calc_sharpe_sortino(
         self,
@@ -191,20 +225,22 @@ class MetricsCalculator:
     def _calc_avg_hold_time(self, trades: List[TradeRecord]) -> float:
         """计算平均持仓时间 (小时)。
 
-        匹配 OPEN 和 SETTLE 交易, 计算时间差。
+        R5-008：同一 token 可能多次开平。旧实现用 `Dict[token_id] = OPEN` 会互相
+        覆盖，导致同 token 的多笔开仓只剩最后一笔被匹配、持仓时间错配。
+        改为按 token 维护 OPEN 队列、FIFO 匹配最早未平仓的 OPEN，保证一一对应。
         """
-        open_trades: Dict[str, TradeRecord] = {}
+        open_queues: Dict[str, Deque[TradeRecord]] = {}
         hold_times = []
 
         for t in trades:
             if t.action == TradeAction.OPEN:
-                open_trades[t.token_id] = t
+                open_queues.setdefault(t.token_id, deque()).append(t)
             elif t.action == TradeAction.SETTLE:
-                if t.token_id in open_trades:
-                    open_t = open_trades[t.token_id]
+                queue = open_queues.get(t.token_id)
+                if queue:
+                    open_t = queue.popleft()
                     delta = (t.timestamp - open_t.timestamp).total_seconds() / 3600
                     hold_times.append(delta)
-                    del open_trades[t.token_id]
 
         return (sum(hold_times) / len(hold_times)) if hold_times else 0.0
 

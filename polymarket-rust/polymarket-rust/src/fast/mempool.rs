@@ -490,11 +490,32 @@ impl PendingOrderTracker {
 
     /// 使用默认参数创建
     pub fn with_defaults() -> Self {
-        Self::new(DEFAULT_PENDING_TTL, DEFAULT_MAX_PENDING_PER_TOKEN, DEFAULT_MAX_PENDING_GLOBAL)
+        Self::new(
+            DEFAULT_PENDING_TTL,
+            DEFAULT_MAX_PENDING_PER_TOKEN,
+            DEFAULT_MAX_PENDING_GLOBAL,
+        )
+    }
+
+    /// A6：全局容量只统计 active（Submitted/Accepted）条目；terminal 不占用容量。
+    fn active_global_count(orders: &std::collections::HashMap<String, PendingEntry>) -> usize {
+        orders
+            .values()
+            .filter(|e| {
+                matches!(
+                    e.status,
+                    PendingStatus::Submitted | PendingStatus::Accepted
+                )
+            })
+            .count()
     }
 
     /// 检查是否允许新增 pending 订单（不实际添加）
+    ///
+    /// 锁顺序统一为「先 orders 后 counts」，与写锁路径（`try_submit`）
+    /// 一致，避免读写锁交叉死锁。
     pub fn check_capacity(&self, token_id: &str) -> ClobResult<()> {
+        let orders = self.orders.read().unwrap();
         let counts = self.per_token_counts.read().unwrap();
 
         // 检查 per-token 上限
@@ -507,34 +528,61 @@ impl PendingOrderTracker {
             }
         }
 
-        // 检查全局上限
-        let orders = self.orders.read().unwrap();
-        if orders.len() >= self.max_global {
+        // 检查全局上限（A6：只统计 active 条目，terminal 不占用容量）
+        let active = Self::active_global_count(&orders);
+        if active >= self.max_global {
             return Err(ClobError::OrderFailed(format!(
                 "全局 Pending 上限: 已有 {} 笔挂单 (上限 {})",
-                orders.len(), self.max_global
+                active,
+                self.max_global
             )));
         }
 
         Ok(())
     }
 
-    /// 记录一笔新提交的订单
+    /// 原子提交（P0-012）：capacity check + reservation 在同一写锁内完成，
+    /// 杜绝并发 submit 同时通过容量检查导致突破 per-token/global 上限。
+    pub fn try_submit(&self, key: String, entry: PendingEntry) -> ClobResult<()> {
+        let token_id = entry.fingerprint.token_id.clone();
+
+        // 统一锁顺序：先 orders 后 counts，两个写锁内完成 check + reserve
+        let mut orders = self.orders.write().unwrap();
+        let mut counts = self.per_token_counts.write().unwrap();
+
+        // 检查 per-token 上限
+        let per_token = counts.get(&token_id).copied().unwrap_or(0);
+        if per_token >= self.max_per_token {
+            return Err(ClobError::OrderFailed(format!(
+                "Pending 上限: token={} 已有 {} 笔挂单 (上限 {})",
+                token_id, per_token, self.max_per_token
+            )));
+        }
+
+        // 检查全局上限（A6：只统计 active 条目，terminal 不占用容量）
+        let active = Self::active_global_count(&orders);
+        if active >= self.max_global {
+            return Err(ClobError::OrderFailed(format!(
+                "全局 Pending 上限: 已有 {} 笔挂单 (上限 {})",
+                active,
+                self.max_global
+            )));
+        }
+
+        // reserve（原子）
+        orders.insert(key, entry);
+        *counts.entry(token_id).or_insert(0) += 1;
+        self.total_submitted.fetch_add(1, Ordering::Relaxed);
+
+        Ok(())
+    }
+
+    /// 记录一笔新提交的订单（委托 [`PendingOrderTracker::try_submit`]，兼容旧调用）。
     ///
     /// `key` 应该是唯一标识（可用临时 key 如 `"tmp_{timestamp}_{nonce}"`，
     /// 后续收到 orderID 后通过 `update_order_id()` 更新）。
     pub fn submit(&self, key: String, entry: PendingEntry) -> ClobResult<()> {
-        // 先检查容量
-        self.check_capacity(&entry.fingerprint.token_id)?;
-
-        let mut orders = self.orders.write().unwrap();
-        let mut counts = self.per_token_counts.write().unwrap();
-
-        orders.insert(key.clone(), entry.clone());
-        *counts.entry(entry.fingerprint.token_id.clone()).or_insert(0) += 1;
-        self.total_submitted.fetch_add(1, Ordering::Relaxed);
-
-        Ok(())
+        self.try_submit(key, entry)
     }
 
     /// 用正式 orderID 替换临时 key
@@ -552,15 +600,16 @@ impl PendingOrderTracker {
             let old_status = entry.status;
             entry.status = status;
             // 状态从非终态转为终态时更新统计
-            if matches!(old_status, PendingStatus::Submitted | PendingStatus::Accepted)
-                && matches!(
-                    status,
-                    PendingStatus::Confirmed
-                        | PendingStatus::Cancelled
-                        | PendingStatus::Failed
-                        | PendingStatus::Stale
-                )
-            {
+            if matches!(
+                old_status,
+                PendingStatus::Submitted | PendingStatus::Accepted
+            ) && matches!(
+                status,
+                PendingStatus::Confirmed
+                    | PendingStatus::Cancelled
+                    | PendingStatus::Failed
+                    | PendingStatus::Stale
+            ) {
                 self.total_confirmed.fetch_add(1, Ordering::Relaxed);
                 // 减少 per_token 计数
                 let mut counts = self.per_token_counts.write().unwrap();
@@ -591,7 +640,10 @@ impl PendingOrderTracker {
             .iter()
             .filter(|(_, e)| {
                 now.duration_since(e.submitted_at) > self.ttl
-                    && !matches!(e.status, PendingStatus::Confirmed | PendingStatus::Cancelled)
+                    && !matches!(
+                        e.status,
+                        PendingStatus::Confirmed | PendingStatus::Cancelled
+                    )
             })
             .map(|(k, _)| k.clone())
             .collect();
@@ -599,7 +651,9 @@ impl PendingOrderTracker {
         let count = stale_keys.len();
         for key in stale_keys {
             if let Some(entry) = orders.remove(&key) {
-                *counts.entry(entry.fingerprint.token_id.clone()).or_insert(0) =
+                *counts
+                    .entry(entry.fingerprint.token_id.clone())
+                    .or_insert(0) =
                     (*counts.get(&entry.fingerprint.token_id).unwrap_or(&1)).saturating_sub(1);
                 // 标记为 stale（如果还在的话——已被 remove）
                 self.total_expired.fetch_add(1, Ordering::Relaxed);
@@ -614,9 +668,7 @@ impl PendingOrderTracker {
             .read()
             .unwrap()
             .values()
-            .filter(|e| {
-                matches!(e.status, PendingStatus::Submitted | PendingStatus::Accepted)
-            })
+            .filter(|e| matches!(e.status, PendingStatus::Submitted | PendingStatus::Accepted))
             .count()
     }
 
@@ -800,8 +852,7 @@ impl MempoolMonitor {
 
     /// 启用/禁用
     pub fn set_enabled(&self, enabled: bool) {
-        self.enabled
-            .store(enabled as u64, Ordering::Release);
+        self.enabled.store(enabled as u64, Ordering::Release);
     }
 
     /// 是否启用
@@ -837,24 +888,19 @@ impl MempoolMonitor {
         }
 
         // 1. 频率限制（最先做，因为最轻量且能挡住风暴）
-        self.rate_limiter
-            .check(token_id)
-            .map_err(|e| {
-                self.total_blocked.fetch_add(1, Ordering::Relaxed);
-                e
-            })?;
+        self.rate_limiter.check(token_id).inspect_err(|_e| {
+            self.total_blocked.fetch_add(1, Ordering::Relaxed);
+        })?;
 
         // 2. 去重
         let fp = OrderFingerprint::new(token_id, side, price, size, tick);
-        self.dedup.check(&fp).map_err(|e| {
+        self.dedup.check(&fp).inspect_err(|_e| {
             self.total_blocked.fetch_add(1, Ordering::Relaxed);
-            e
         })?;
 
         // 3. Pending 容量
-        self.pending.check_capacity(token_id).map_err(|e| {
+        self.pending.check_capacity(token_id).inspect_err(|_e| {
             self.total_blocked.fetch_add(1, Ordering::Relaxed);
-            e
         })?;
 
         // 4. 抢跑检测
@@ -866,10 +912,7 @@ impl MempoolMonitor {
             }
             FrontRunVerdict::Danger(msg) => {
                 self.total_blocked.fetch_add(1, Ordering::Relaxed);
-                return Err(ClobError::OrderFailed(format!(
-                    "抢跑检测阻断: {}",
-                    msg
-                )));
+                return Err(ClobError::OrderFailed(format!("抢跑检测阻断: {}", msg)));
             }
         }
 
@@ -919,7 +962,8 @@ impl MempoolMonitor {
     /// 确认订单（收到 exchange 回执后调用）
     pub fn confirm(&self, temp_key: &str, order_id: &str) {
         self.pending.update_order_id(temp_key, order_id);
-        self.pending.update_status(order_id, PendingStatus::Confirmed);
+        self.pending
+            .update_status(order_id, PendingStatus::Confirmed);
     }
 
     /// 标记订单失败
@@ -1091,7 +1135,7 @@ mod tests {
         assert!(rl.check("t1").is_ok());
         assert!(rl.check("t1").is_ok());
         assert!(rl.check("t1").is_err()); // 第 3 个被拒
-        // 不同 token 不受影响
+                                          // 不同 token 不受影响
         assert!(rl.check("t2").is_ok());
     }
 
@@ -1136,7 +1180,7 @@ mod tests {
     #[test]
     fn test_pending_capacity_limit() {
         let tracker = PendingOrderTracker::new(Duration::from_secs(30), 2, 100);
-        let make_entry = |i: u32| {
+        let make_entry = |_i: u32| {
             let fp = OrderFingerprint::new("t", Side::Buy, 0.5, 10.0, 0.01);
             PendingEntry {
                 fingerprint: fp,
@@ -1169,9 +1213,77 @@ mod tests {
 
         tracker.update_order_id("o1", "exchange-id-123");
         tracker.update_status("exchange-id-123", PendingStatus::Confirmed);
-        assert_eq!(tracker.get_status("exchange-id-123"), Some(PendingStatus::Confirmed));
+        assert_eq!(
+            tracker.get_status("exchange-id-123"),
+            Some(PendingStatus::Confirmed)
+        );
         // confirmed 后不再计入 pending
         assert_eq!(tracker.pending_count_for_token("t"), 0);
+    }
+
+    // ========== A6：terminal 状态释放全局容量 ==========
+
+    fn a6_entry(token: &str) -> PendingEntry {
+        PendingEntry {
+            fingerprint: OrderFingerprint::new(token, Side::Buy, 0.5, 10.0, 0.01),
+            order_id: None,
+            submitted_at: Instant::now(),
+            status: PendingStatus::Submitted,
+            price: 0.5,
+            size: 10.0,
+        }
+    }
+
+    /// A6：Confirmed/Cancelled 后全局容量必须可复用（旧实现用 orders.len() 永久占用）。
+    #[test]
+    fn test_a6_terminal_frees_global_capacity() {
+        let tracker = PendingOrderTracker::new(Duration::from_secs(30), 10, 2);
+        tracker.try_submit("o1".into(), a6_entry("t")).unwrap();
+        tracker.try_submit("o2".into(), a6_entry("t")).unwrap();
+        // 全局满 → 第三个拒绝
+        assert!(tracker.try_submit("o3".into(), a6_entry("t")).is_err());
+
+        tracker.update_status("o1", PendingStatus::Confirmed);
+        assert!(
+            tracker.try_submit("o3".into(), a6_entry("t")).is_ok(),
+            "Confirmed 后应释放全局容量"
+        );
+
+        tracker.update_status("o2", PendingStatus::Cancelled);
+        assert!(
+            tracker.try_submit("o4".into(), a6_entry("t")).is_ok(),
+            "Cancelled 后应释放全局容量"
+        );
+    }
+
+    /// A6：Failed/Stale 也属于可回收终态。
+    #[test]
+    fn test_a6_failed_stale_free_global_capacity() {
+        let tracker = PendingOrderTracker::new(Duration::from_secs(30), 10, 1);
+        tracker.try_submit("o1".into(), a6_entry("t")).unwrap();
+        assert!(tracker.try_submit("o2".into(), a6_entry("t")).is_err());
+
+        tracker.update_status("o1", PendingStatus::Failed);
+        assert!(tracker.try_submit("o2".into(), a6_entry("t")).is_ok());
+
+        tracker.update_status("o2", PendingStatus::Stale);
+        assert!(tracker.try_submit("o3".into(), a6_entry("t")).is_ok());
+    }
+
+    /// A6：重复终态更新不应重复扣减 / 泄漏容量。
+    #[test]
+    fn test_a6_repeated_terminal_update_idempotent() {
+        let tracker = PendingOrderTracker::new(Duration::from_secs(30), 10, 1);
+        tracker.try_submit("o1".into(), a6_entry("t")).unwrap();
+        tracker.update_status("o1", PendingStatus::Confirmed);
+        tracker.update_status("o1", PendingStatus::Confirmed); // 重复
+        assert!(tracker.try_submit("o2".into(), a6_entry("t")).is_ok());
+
+        // temp key → exchange key 迁移不改变 active 计数
+        tracker.update_order_id("o2", "ex-2");
+        assert!(tracker.try_submit("o3".into(), a6_entry("t")).is_err());
+        tracker.update_status("ex-2", PendingStatus::Cancelled);
+        assert!(tracker.try_submit("o3".into(), a6_entry("t")).is_ok());
     }
 
     #[test]
@@ -1203,11 +1315,13 @@ mod tests {
 
     #[test]
     fn test_monitor_blocks_rate_limit() {
-        let mut cfg = MempoolConfig::default();
-        cfg.global_rate = 1.0; // 1 op/sec
-        cfg.global_burst = 0.002; // burst = 2 tokens
-        cfg.token_rate = 100.0; // per-token rate high enough not to trigger
-        cfg.dedup_window = Duration::from_secs(0); // 关闭去重，单独测限频
+        let cfg = MempoolConfig {
+            global_rate: 1.0, // 1 op/sec
+            global_burst: 0.002, // burst = 2 tokens
+            token_rate: 100.0, // per-token rate high enough not to trigger
+            dedup_window: Duration::from_secs(0), // 关闭去重，单独测限频
+            ..Default::default()
+        };
         let mon = MempoolMonitor::with_config(cfg);
         // 前两笔消耗 burst，第三笔因速率限制被拒绝
         mon.check_before_submit("t", Side::Buy, 0.51, 10.0, 0.01)
@@ -1285,20 +1399,11 @@ mod tests {
 
     #[test]
     fn test_monitor_sweep() {
-        let mon = MempoolMonitor::with_config({
-            let mut c = MempoolConfig::default();
-            c.pending_ttl = Duration::from_millis(10); // 极短 TTL 方便测试
-            c
+        let mon = MempoolMonitor::with_config(MempoolConfig {
+            pending_ttl: Duration::from_millis(10), // 极短 TTL 方便测试
+            ..Default::default()
         });
-        mon.on_submitted(
-            "tmp-1".to_string(),
-            "t",
-            Side::Buy,
-            0.5,
-            10.0,
-            0.01,
-            None,
-        );
+        mon.on_submitted("tmp-1".to_string(), "t", Side::Buy, 0.5, 10.0, 0.01, None);
         std::thread::sleep(Duration::from_millis(20));
         let swept = mon.sweep();
         assert!(swept >= 1);
@@ -1334,6 +1439,44 @@ mod tests {
     fn test_warning_does_not_block() {
         let mon = MempoolMonitor::new().with_front_run_detector(WarningOnlyDetector);
         // warning 不阻断
-        assert!(mon.check_before_submit("t", Side::Buy, 0.5, 10.0, 0.01).is_ok());
+        assert!(mon
+            .check_before_submit("t", Side::Buy, 0.5, 10.0, 0.01)
+            .is_ok());
+    }
+
+    // ========== P0-012：Mempool capacity TOCTOU ==========
+
+    #[test]
+    fn test_try_submit_atomic_capacity() {
+        // 全局上限 2，per-token 上限放宽到 10（聚焦全局容量的并发原子性）
+        let tracker = Arc::new(PendingOrderTracker::new(Duration::from_secs(30), 10, 2));
+        let success = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut handles = Vec::new();
+
+        for i in 0..8 {
+            let t = tracker.clone();
+            let s = success.clone();
+            handles.push(std::thread::spawn(move || {
+                let fp = OrderFingerprint::new("token-x", Side::Buy, 0.5, 10.0, 0.01);
+                let entry = PendingEntry {
+                    fingerprint: fp,
+                    order_id: None,
+                    submitted_at: Instant::now(),
+                    status: PendingStatus::Submitted,
+                    price: 0.5,
+                    size: 10.0,
+                };
+                if t.try_submit(format!("ord-{}", i), entry).is_ok() {
+                    s.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // 并发下只有 2 笔成功（全局上限 2），不会突破
+        assert_eq!(success.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(tracker.pending_count(), 2);
     }
 }

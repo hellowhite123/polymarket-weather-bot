@@ -15,8 +15,9 @@
 
 pub mod service;
 
-pub use service::ExecutionServiceImpl;
+pub use service::{consume_trade_events, ExecutionServiceImpl};
 
+use std::sync::Arc;
 use tonic::transport::Server;
 
 /// 启动 gRPC 服务器。
@@ -25,7 +26,7 @@ use tonic::transport::Server;
 ///   service: 执行服务实现
 ///   addr: 监听地址, 如 "127.0.0.1:50051" 或 "[::1]:50051"
 pub async fn serve(
-    service: ExecutionServiceImpl,
+    service: Arc<ExecutionServiceImpl>,
     addr: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let addr: std::net::SocketAddr = addr.parse()?;
@@ -33,7 +34,9 @@ pub async fn serve(
     tracing::info!("gRPC 执行层服务启动, 监听 {}", addr);
 
     Server::builder()
-        .add_service(polymarket::execution_service_server::ExecutionServiceServer::new(service))
+        .add_service(polymarket::execution_service_server::ExecutionServiceServer::new(
+            (*service).clone(),
+        ))
         .serve(addr)
         .await?;
 

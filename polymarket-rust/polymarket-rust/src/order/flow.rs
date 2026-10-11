@@ -48,7 +48,13 @@ pub struct PlaceOrderParams {
 
 impl PlaceOrderParams {
     /// 创建买入参数
-    pub fn buy(wallet_address: &str, password: &str, token_id: &str, price: f64, size: f64) -> Self {
+    pub fn buy(
+        wallet_address: &str,
+        password: &str,
+        token_id: &str,
+        price: f64,
+        size: f64,
+    ) -> Self {
         Self {
             wallet_address: wallet_address.to_string(),
             password: password.to_string(),
@@ -63,7 +69,13 @@ impl PlaceOrderParams {
     }
 
     /// 创建卖出参数
-    pub fn sell(wallet_address: &str, password: &str, token_id: &str, price: f64, size: f64) -> Self {
+    pub fn sell(
+        wallet_address: &str,
+        password: &str,
+        token_id: &str,
+        price: f64,
+        size: f64,
+    ) -> Self {
         Self {
             wallet_address: wallet_address.to_string(),
             password: password.to_string(),
@@ -173,7 +185,12 @@ impl OrderFlow {
     }
 
     /// 取消订单
-    pub async fn cancel_order(&self, address: &str, password: &str, order_id: &str) -> ClobResult<()> {
+    pub async fn cancel_order(
+        &self,
+        address: &str,
+        password: &str,
+        order_id: &str,
+    ) -> ClobResult<()> {
         let _ = self
             .client
             .cancel_order(address, password, order_id)

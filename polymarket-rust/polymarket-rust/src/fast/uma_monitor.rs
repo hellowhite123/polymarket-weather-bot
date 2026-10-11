@@ -26,7 +26,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 // ============================================================================
 // 常量
@@ -166,12 +166,15 @@ impl UmaMonitor {
         self.polls.fetch_add(1, Ordering::Relaxed);
 
         let current_block = self.rpc.block_number().await?;
-        let mut last = self.last_block.write().unwrap();
 
-        let from_block = if *last == 0 {
-            current_block.saturating_sub(self.block_range)
-        } else {
-            *last + 1
+        // 读取上次块高后立即释放锁，避免持锁跨越 await（clippy await_holding_lock）。
+        let from_block = {
+            let last = self.last_block.read().unwrap();
+            if *last == 0 {
+                current_block.saturating_sub(self.block_range)
+            } else {
+                *last + 1
+            }
         };
         let to_block = current_block;
 
@@ -180,7 +183,9 @@ impl UmaMonitor {
         }
 
         let events = self.fetch_uma_logs(from_block, to_block).await?;
-        *last = to_block;
+
+        // 轮询成功后再推进游标（失败时保持原值，下次重试同一区间）。
+        *self.last_block.write().unwrap() = to_block;
 
         Ok(events)
     }
@@ -196,21 +201,26 @@ impl UmaMonitor {
         // keccak256("ProposePrice(address,bytes32,uint256,bytes,address,uint256,uint256,address)")
         let propose_topic = "0x9a97c27ef7eb41d57c2bafed28a934460bda276ae798b23e133748eb6d242061";
 
-        let result = self.rpc.rpc_call(
-            "eth_getLogs",
-            serde_json::json!([{
-                "address": self.uma_contract,
-                "fromBlock": format!("0x{:x}", from),
-                "toBlock": format!("0x{:x}", to),
-                "topics": [propose_topic],
-            }]),
-        ).await?;
+        let result = self
+            .rpc
+            .rpc_call(
+                "eth_getLogs",
+                serde_json::json!([{
+                    "address": self.uma_contract,
+                    "fromBlock": format!("0x{:x}", from),
+                    "toBlock": format!("0x{:x}", to),
+                    "topics": [propose_topic],
+                }]),
+            )
+            .await?;
 
         if let Some(logs) = result.as_array() {
             for log in logs {
                 if let Ok(event) = self.parse_propose_event(log) {
                     self.proposals_seen.fetch_add(1, Ordering::Relaxed);
-                    self.active_proposals.write().unwrap()
+                    self.active_proposals
+                        .write()
+                        .unwrap()
                         .insert(event.identifier.clone(), event.clone());
                     events.push(UmaEvent::PriceProposed(event));
                 }
@@ -220,15 +230,18 @@ impl UmaMonitor {
         // === DisputePrice 事件 ===
         let dispute_topic = "0x34efe5c1ccb02c70ab625b41848ac7f2c7bd2eafc61c9fb98e76a479c3ecaf52";
 
-        let result = self.rpc.rpc_call(
-            "eth_getLogs",
-            serde_json::json!([{
-                "address": self.uma_contract,
-                "fromBlock": format!("0x{:x}", from),
-                "toBlock": format!("0x{:x}", to),
-                "topics": [dispute_topic],
-            }]),
-        ).await?;
+        let result = self
+            .rpc
+            .rpc_call(
+                "eth_getLogs",
+                serde_json::json!([{
+                    "address": self.uma_contract,
+                    "fromBlock": format!("0x{:x}", from),
+                    "toBlock": format!("0x{:x}", to),
+                    "topics": [dispute_topic],
+                }]),
+            )
+            .await?;
 
         if let Some(logs) = result.as_array() {
             for log in logs {
@@ -259,7 +272,9 @@ impl UmaMonitor {
 
         // data = timestamp(uint256) + ancillaryData(offset, bytes) + proposer(address) + proposedPrice(uint256) + expirationTimestamp(uint256) + currency(address)
         let data_clean = data.trim_start_matches("0x");
-        if data_clean.len() < 64 { return Err("data too short".into()); }
+        if data_clean.len() < 64 {
+            return Err("data too short".into());
+        }
 
         // First word: timestamp (uint256)
         let timestamp = u64::from_str_radix(&data_clean[0..64], 16).unwrap_or(0);
@@ -289,7 +304,9 @@ impl UmaMonitor {
         let data_clean = data.trim_start_matches("0x");
         let timestamp = if data_clean.len() >= 64 {
             u64::from_str_radix(&data_clean[0..64], 16).unwrap_or(0)
-        } else { 0 };
+        } else {
+            0
+        };
 
         Ok(PriceDisputedEvent {
             tx_hash,
@@ -307,7 +324,12 @@ impl UmaMonitor {
 
     /// 获取所有活跃提议
     pub fn active_proposals(&self) -> Vec<PriceProposedEvent> {
-        self.active_proposals.read().unwrap().values().cloned().collect()
+        self.active_proposals
+            .read()
+            .unwrap()
+            .values()
+            .cloned()
+            .collect()
     }
 
     /// 获取争议历史
@@ -317,12 +339,19 @@ impl UmaMonitor {
 
     /// 检查指定 identifier 是否有活跃提议
     pub fn has_active_proposal(&self, identifier: &str) -> bool {
-        self.active_proposals.read().unwrap().contains_key(identifier)
+        self.active_proposals
+            .read()
+            .unwrap()
+            .contains_key(identifier)
     }
 
     /// 检查指定 identifier 是否有争议
     pub fn has_dispute(&self, identifier: &str) -> bool {
-        self.disputes.read().unwrap().iter().any(|d| d.identifier == identifier)
+        self.disputes
+            .read()
+            .unwrap()
+            .iter()
+            .any(|d| d.identifier == identifier)
     }
 
     /// 统计报告
@@ -393,9 +422,13 @@ mod tests {
 
     #[test]
     fn test_topic_to_address() {
-        let topic = serde_json::json!("0x000000000000000000000000ee3afe347d5c74317041e2618c49534daf887c24");
+        let topic =
+            serde_json::json!("0x000000000000000000000000ee3afe347d5c74317041e2618c49534daf887c24");
         let addr = topic_to_address(Some(&topic));
-        assert_eq!(addr.to_lowercase(), "0xee3afe347d5c74317041e2618c49534daf887c24");
+        assert_eq!(
+            addr.to_lowercase(),
+            "0xee3afe347d5c74317041e2618c49534daf887c24"
+        );
     }
 
     #[test]

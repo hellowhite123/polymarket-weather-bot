@@ -36,9 +36,9 @@
 
 use crate::clob::error::{ClobError, ClobResult};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::RwLock;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing;
 
 // ============================================================================
@@ -143,31 +143,118 @@ impl Default for RiskConfig {
     }
 }
 
+impl RiskConfig {
+    /// P0-009：配置校验——拒绝 NaN/Inf/负值/非法比例，非法配置 fail-fast。
+    pub fn validate(&self) -> ClobResult<()> {
+        fn pos(name: &str, v: f64) -> ClobResult<()> {
+            if !v.is_finite() || v <= 0.0 {
+                return Err(ClobError::OrderFailed(format!(
+                    "RiskConfig.{name} 非法: {v}"
+                )));
+            }
+            Ok(())
+        }
+        fn nonneg(name: &str, v: f64) -> ClobResult<()> {
+            if !v.is_finite() || v < 0.0 {
+                return Err(ClobError::OrderFailed(format!(
+                    "RiskConfig.{name} 非法: {v}"
+                )));
+            }
+            Ok(())
+        }
+        fn ratio(name: &str, v: f64) -> ClobResult<()> {
+            if !v.is_finite() || v <= 0.0 || v > 1.0 {
+                return Err(ClobError::OrderFailed(format!(
+                    "RiskConfig.{name} 非法: {v}"
+                )));
+            }
+            Ok(())
+        }
+
+        pos("max_position_per_market", self.max_position_per_market)?;
+        pos("max_global_exposure", self.max_global_exposure)?;
+        ratio("max_concentration", self.max_concentration)?;
+        nonneg("daily_loss_warn", self.daily_loss_warn)?;
+        nonneg("daily_loss_limit", self.daily_loss_limit)?;
+        nonneg("daily_loss_halt", self.daily_loss_halt)?;
+        ratio("max_drawdown_warn", self.max_drawdown_warn)?;
+        ratio(
+            "oracle_deviation_threshold",
+            self.oracle_deviation_threshold,
+        )?;
+        if self.max_gas_gwei == 0 {
+            return Err(ClobError::OrderFailed(
+                "RiskConfig.max_gas_gwei 必须 > 0".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// P0-009：下单输入校验——拒绝 NaN/Inf/≤0 的 notional/qty。
+fn validate_order_inputs(notional: f64, qty: f64) -> ClobResult<()> {
+    for (name, v) in [("notional", notional), ("qty", qty)] {
+        if !v.is_finite() {
+            return Err(ClobError::OrderFailed(format!(
+                "风控输入校验: {name} 含 NaN/Inf"
+            )));
+        }
+        if v <= 0.0 {
+            return Err(ClobError::OrderFailed(format!(
+                "风控输入校验: {name} 必须 > 0"
+            )));
+        }
+    }
+    Ok(())
+}
+
 // ============================================================================
 // PositionLimits — 仓位硬限制
 // ============================================================================
+
+/// 单市场持仓 + 预留状态。
+///
+/// - `qty` / `notional`: 已真实成交的持仓（filled）
+/// - `reserved`: 已通过 `check_and_reserve` 预留、但尚未成交的名义价值（pending）
+#[derive(Debug, Clone, Copy, Default)]
+struct PositionEntry {
+    qty: f64,
+    notional: f64,
+    reserved: f64,
+}
 
 /// 仓位硬限制检查器
 ///
 /// 路线图 #1: 单市场最大仓位 + 全局最大暴露
 pub struct PositionLimits {
     config: RiskConfig,
-    /// 当前持仓 {token_id: (quantity, notional_usdc)}
-    positions: RwLock<HashMap<String, (f64, f64)>>,
+    /// 当前持仓 + 预留 {token_id: PositionEntry}
+    positions: RwLock<HashMap<String, PositionEntry>>,
 }
 
 impl PositionLimits {
     pub fn new(config: RiskConfig) -> Self {
-        Self { config, positions: RwLock::new(HashMap::new()) }
+        Self {
+            config,
+            positions: RwLock::new(HashMap::new()),
+        }
     }
 
     /// 预检：新开仓是否超限
     ///
     /// `side`: Buy = 增加暴露, Sell = 减少暴露
     /// `notional`: 名义价值 (USDC)
-    pub fn pre_check(&self, token_id: &str, side: crate::types::enums::Side, notional: f64) -> ClobResult<()> {
+    pub fn pre_check(
+        &self,
+        token_id: &str,
+        side: crate::types::enums::Side,
+        notional: f64,
+    ) -> ClobResult<()> {
         let positions = self.positions.read().unwrap();
-        let current_pos = positions.get(token_id).map(|(_, v)| *v).unwrap_or(0.0);
+        let current_pos = positions
+            .get(token_id)
+            .map(|e| e.notional + e.reserved)
+            .unwrap_or(0.0);
 
         if matches!(side, crate::types::enums::Side::Buy) {
             // 新增仓位: 检查单市场上限
@@ -179,8 +266,8 @@ impl PositionLimits {
                 )));
             }
 
-            // 检查全局暴露
-            let current_global: f64 = positions.values().map(|(_, v)| *v).sum();
+            // 检查全局暴露（含已预留 pending 额度）
+            let current_global: f64 = positions.values().map(|e| e.notional + e.reserved).sum();
             let new_global = current_global + notional;
             if new_global > self.config.max_global_exposure {
                 return Err(ClobError::OrderFailed(format!(
@@ -192,30 +279,223 @@ impl PositionLimits {
         Ok(())
     }
 
-    /// 后检：更新持仓
-    pub fn post_check(&self, token_id: &str, side: crate::types::enums::Side, qty: f64, notional: f64) {
+    /// 原子「检查 + 预留」（P0-008）：在单次写锁内完成仓位上限校验与
+    /// notional 预留，杜绝两个并发订单同时通过检查、双双成交导致超限。
+    ///
+    /// - Buy：校验市场/全局上限后，把 notional 计入 `reserved`
+    /// - Sell：减少暴露，无需预留（仅校验输入）
+    pub fn check_and_reserve(
+        &self,
+        token_id: &str,
+        side: crate::types::enums::Side,
+        notional: f64,
+    ) -> ClobResult<()> {
+        validate_order_inputs(notional, notional)?;
+
         let mut positions = self.positions.write().unwrap();
-        let entry = positions.entry(token_id.to_string()).or_insert((0.0, 0.0));
+        if matches!(side, crate::types::enums::Side::Buy) {
+            // 先算全局 committed（含各市场 filled+reserved），再取当前市场 entry，避免借用冲突
+            let committed_global: f64 = positions.values().map(|e| e.notional + e.reserved).sum();
+            let new_global = committed_global + notional;
+            if new_global > self.config.max_global_exposure {
+                return Err(ClobError::OrderFailed(format!(
+                    "全局暴露限制: {:.2} > 上限 {:.2} USDC",
+                    new_global, self.config.max_global_exposure
+                )));
+            }
+
+            let entry = positions.entry(token_id.to_string()).or_default();
+            let committed_market = entry.notional + entry.reserved;
+            let new_market = committed_market + notional;
+            if new_market > self.config.max_position_per_market {
+                return Err(ClobError::OrderFailed(format!(
+                    "仓位硬限制: {} 市场仓位(含预留) {:.2} > 上限 {:.2} USDC",
+                    token_id, new_market, self.config.max_position_per_market
+                )));
+            }
+
+            entry.reserved += notional;
+        }
+        Ok(())
+    }
+
+    /// 释放预留（订单被拒/取消/过期，未成交时回退预留额度）。
+    pub fn release_reserve(&self, token_id: &str, notional: f64) {
+        if !notional.is_finite() || notional <= 0.0 {
+            return;
+        }
+        let mut positions = self.positions.write().unwrap();
+        if let Some(entry) = positions.get_mut(token_id) {
+            entry.reserved = (entry.reserved - notional).max(0.0);
+        }
+    }
+
+    /// 后检：更新持仓（成交后把预留额度冲抵为真实持仓）
+    pub fn post_check(
+        &self,
+        token_id: &str,
+        side: crate::types::enums::Side,
+        qty: f64,
+        notional: f64,
+    ) {
+        let mut positions = self.positions.write().unwrap();
+        let entry = positions.entry(token_id.to_string()).or_default();
         match side {
             crate::types::enums::Side::Buy => {
-                entry.0 += qty;
-                entry.1 += notional;
+                // 预留 → 成交：先冲抵 reserved，再累加 filled
+                let moved = entry.reserved.min(notional);
+                entry.reserved -= moved;
+                entry.qty += qty;
+                entry.notional += notional;
             }
             crate::types::enums::Side::Sell => {
-                entry.0 = (entry.0 - qty).max(0.0);
-                entry.1 = (entry.1 - notional).max(0.0);
+                entry.qty = (entry.qty - qty).max(0.0);
+                entry.notional = (entry.notional - notional).max(0.0);
             }
         }
     }
 
-    /// 当前全局暴露
-    pub fn global_exposure(&self) -> f64 {
-        self.positions.read().unwrap().values().map(|(_, v)| *v).sum()
+    /// B1 / P1-008：**订单级**成交记账。
+    ///
+    /// 与 [`PositionLimits::post_check`] 的关键区别：预留释放按**订单 limit price**
+    /// 计算（`reserve_release = limit_price × 本笔增量`），而成交暴露按**实际执行价**
+    /// （`filled_notional = execution_price × 本笔增量`）计入。旧实现用执行名义去冲抵
+    /// limit 预留，在 price improvement（BUY 执行价 < 限价）时留下无法回收的残余预留，
+    /// 并在执行价 > 限价时过度释放。
+    ///
+    /// `reserve_release` 语义（冻结）：
+    /// - `Some(x)`：订单身份/限价已知，从 `reserved` 释放 `x`（仅 Buy）；
+    /// - `None`：订单身份或限价未知 → **保守持有预留**（不精确释放），交由
+    ///   对账/reconciliation（B2）以权威信息修正；**绝不**静默按执行名义释放。
+    ///
+    /// Sell 不产生开仓预留，忽略 `reserve_release`。
+    ///
+    /// 订单归属守恒：per-token 池化 `reserved` 满足
+    /// `Σ_orders release_i = Σ_orders limit_i × filled_qty_i`（每笔挂在各自 order
+    /// 的限价上），因此多订单同 token、不同限价也能正确守恒。
+    pub fn apply_fill_order(
+        &self,
+        token_id: &str,
+        side: crate::types::enums::Side,
+        qty: f64,
+        filled_notional: f64,
+        reserve_release: Option<f64>,
+    ) {
+        if !qty.is_finite() || qty <= 0.0 || !filled_notional.is_finite() || filled_notional < 0.0 {
+            return;
+        }
+        let mut positions = self.positions.write().unwrap();
+        let entry = positions.entry(token_id.to_string()).or_default();
+        match side {
+            crate::types::enums::Side::Buy => {
+                if let Some(release) = reserve_release {
+                    if release.is_finite() && release > 0.0 {
+                        entry.reserved = (entry.reserved - release).max(0.0);
+                    }
+                }
+                entry.qty += qty;
+                entry.notional += filled_notional;
+            }
+            crate::types::enums::Side::Sell => {
+                entry.qty = (entry.qty - qty).max(0.0);
+                entry.notional = (entry.notional - filled_notional).max(0.0);
+            }
+        }
     }
 
-    /// 获取指定市场仓位
+    /// 当前全局暴露（已成交的 filled notional）
+    pub fn global_exposure(&self) -> f64 {
+        self.positions
+            .read()
+            .unwrap()
+            .values()
+            .map(|e| e.notional)
+            .sum()
+    }
+
+    /// R5-001：全市场 committed 暴露 = filled notional + pending reserved。
+    ///
+    /// 集中度检查的分母必须用此口径，否则并发 pending 预留被漏计、
+    /// 组合总暴露被低估，集中度门禁（`future_total > 2 × 单市场上限`）可能
+    /// 被错误跳过。与 `global_exposure()`（仅 filled，供快照展示）区分。
+    pub fn committed_total(&self) -> f64 {
+        self.positions
+            .read()
+            .unwrap()
+            .values()
+            .map(|e| e.notional + e.reserved)
+            .sum()
+    }
+
+    /// P0-007B：对账恢复——以远端为权威重建/删除指定市场仓位。
+    ///
+    /// 与 `post_check` 的增量累加不同，本方法把 `(qty, notional)` 直接覆盖为
+    /// 权威值，并清空该市场的 `reserved`（可能是下线前残留的幽灵预留）。
+    /// `qty` 与 `notional` 均为 0 时删除该市场条目。
+    pub fn sync_position(&self, token_id: &str, qty: f64, notional: f64) {
+        if !qty.is_finite() || !notional.is_finite() {
+            return;
+        }
+        let mut positions = self.positions.write().unwrap();
+        if qty.abs() < 1e-9 && notional.abs() < 1e-9 {
+            positions.remove(token_id);
+        } else {
+            let entry = positions.entry(token_id.to_string()).or_default();
+            entry.qty = qty;
+            entry.notional = notional.max(0.0);
+            entry.reserved = 0.0;
+        }
+    }
+
+    /// P1-031：重建预留额度。
+    ///
+    /// `sync_position` 重建仓位时会清空 `reserved`（下线前残留的幽灵预留），
+    /// 但远端仍 open 的 BUY 订单（本地下单、未成交、仍在挂单）对应的 pending
+    /// 预留没有随之重建，导致恢复后全局暴露检查遗漏这些 open 订单的额度。
+    ///
+    /// 本方法按 token 累加 `reserved`，跳过上限校验——恢复时以远端为权威，
+    /// 不在恢复路径重复做下单前的上限判断（避免因顺序/权威性误拒）。
+    pub fn rebuild_reserve(&self, token_id: &str, notional: f64) {
+        if !notional.is_finite() || notional <= 0.0 {
+            return;
+        }
+        let mut positions = self.positions.write().unwrap();
+        let entry = positions.entry(token_id.to_string()).or_default();
+        entry.reserved += notional;
+    }
+
+    /// 获取指定市场仓位 (quantity, notional)
     pub fn market_position(&self, token_id: &str) -> Option<(f64, f64)> {
-        self.positions.read().unwrap().get(token_id).copied()
+        self.positions
+            .read()
+            .unwrap()
+            .get(token_id)
+            .map(|e| (e.qty, e.notional))
+    }
+
+    /// A7：单市场 committed 暴露 = filled notional + reserved。
+    ///
+    /// 集中度检查的**分子**必须用此口径（与分母 `committed_total` 统一），
+    /// 否则同市场 pending 预留被漏计入分子，集中度被低估。
+    pub fn market_committed(&self, token_id: &str) -> f64 {
+        self.positions
+            .read()
+            .unwrap()
+            .get(token_id)
+            .map(|e| e.notional + e.reserved)
+            .unwrap_or(0.0)
+    }
+    /// 返回当前所有市场的仓位数量快照。
+    ///
+    /// key: token_id
+    /// value: token quantity
+    pub fn snapshot_positions(&self) -> HashMap<String, f64> {
+        self.positions
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(token_id, e)| (token_id.clone(), e.qty))
+            .collect()
     }
 }
 
@@ -240,12 +520,18 @@ pub struct TimeWindowGuard {
 
 impl TimeWindowGuard {
     pub fn new(freeze_window: Duration) -> Self {
-        Self { freeze_window, settlements: RwLock::new(HashMap::new()) }
+        Self {
+            freeze_window,
+            settlements: RwLock::new(HashMap::new()),
+        }
     }
 
     /// 注册市场的结算时间
     pub fn set_settlement(&self, token_id: &str, unix_timestamp: u64) {
-        self.settlements.write().unwrap().insert(token_id.to_string(), unix_timestamp);
+        self.settlements
+            .write()
+            .unwrap()
+            .insert(token_id.to_string(), unix_timestamp);
     }
 
     /// 批量注册结算时间
@@ -266,7 +552,10 @@ impl TimeWindowGuard {
 
         let settlements = self.settlements.read().unwrap();
         if let Some(&settlement_ts) = settlements.get(token_id) {
-            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
             let time_until = settlement_ts.saturating_sub(now);
 
             if time_until <= self.freeze_window.as_secs() {
@@ -282,7 +571,10 @@ impl TimeWindowGuard {
 
     /// 列出即将结算的市场
     pub fn upcoming_settlements(&self) -> Vec<(String, u64)> {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
         let threshold = now + self.freeze_window.as_secs();
         self.settlements
             .read()
@@ -402,7 +694,9 @@ impl DailyLossLimit {
     pub fn daily_drawdown(&self) -> f64 {
         let daily = *self.daily_pnl.read().unwrap();
         let peak = *self.daily_peak.read().unwrap();
-        if peak <= 0.0 { return 0.0; }
+        if peak <= 0.0 {
+            return 0.0;
+        }
         (peak - daily) / peak
     }
 }
@@ -453,13 +747,22 @@ impl OracleDisputeMonitor {
 
     /// 注入气象数据源的预期结果 (由 Python 策略引擎推送)
     pub fn set_expected_outcome(&self, token_id: &str, expected: f64) {
-        self.expected_outcomes.write().unwrap().insert(token_id.to_string(), expected);
+        self.expected_outcomes
+            .write()
+            .unwrap()
+            .insert(token_id.to_string(), expected);
     }
 
     /// 注入 UMA 结算结果 (由链上事件或 API 获取)
     pub fn set_uma_result(&self, token_id: &str, price: f64) {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        self.uma_results.write().unwrap().insert(token_id.to_string(), (price, now));
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        self.uma_results
+            .write()
+            .unwrap()
+            .insert(token_id.to_string(), (price, now));
     }
 
     /// 检测单个市场的预言机偏差
@@ -595,7 +898,11 @@ impl DrawdownTracker {
             *peak = equity;
         }
 
-        let drawdown = if *peak > 0.0 { (*peak - equity) / *peak } else { 0.0 };
+        let drawdown = if *peak > 0.0 {
+            (*peak - equity) / *peak
+        } else {
+            0.0
+        };
         let mut max_dd = self.max_drawdown.write().unwrap();
         if drawdown > *max_dd {
             *max_dd = drawdown;
@@ -675,6 +982,11 @@ pub struct RiskEngine {
 
 impl RiskEngine {
     pub fn new(config: RiskConfig) -> Self {
+        // P0-009：启动即校验配置，非法配置 fail-fast
+        config
+            .validate()
+            .expect("RiskConfig 校验失败: 风控配置非法（NaN/Inf/负值/非法比例）");
+
         Self {
             position_limits: PositionLimits::new(config.clone()),
             time_window: TimeWindowGuard::new(config.settlement_freeze_window),
@@ -691,9 +1003,10 @@ impl RiskEngine {
     // 钩子 A: 下单前预检 (pre_check)
     // ========================================================================
 
-    /// 下单前全面风控检查
+    /// 下单前全面风控检查（只读，不预留）。
     ///
-    /// 返回 `Ok(())` 表示可以下单，`Err` 表示被某个检查拦截。
+    /// 并发下单场景应使用 [`RiskEngine::check_and_reserve`]——本方法只做
+    /// 只读检查，不保证并发下单下不会超限。
     pub fn pre_check(
         &self,
         token_id: &str,
@@ -702,7 +1015,67 @@ impl RiskEngine {
         qty: f64,
         gas_gwei: u64,
     ) -> ClobResult<()> {
-        // 0. 熔断检查 (最高优先级)
+        self.check_gates(token_id, side, notional, qty, gas_gwei)?;
+        self.position_limits.pre_check(token_id, side, notional)?;
+        self.check_concentration(token_id, side, notional, false)?;
+        Ok(())
+    }
+
+    /// 原子「检查 + 预留」（P0-008）：下单前全面风控检查 + 原子预留仓位额度。
+    ///
+    /// 并发下单场景唯一安全入口——两个并发订单不会同时通过仓位上限检查。
+    pub fn check_and_reserve(
+        &self,
+        token_id: &str,
+        side: crate::types::enums::Side,
+        notional: f64,
+        qty: f64,
+        gas_gwei: u64,
+    ) -> ClobResult<()> {
+        self.check_gates(token_id, side, notional, qty, gas_gwei)?;
+        self.position_limits
+            .check_and_reserve(token_id, side, notional)?;
+        // P1-033①：集中度检查在「预留」之后执行，若失败须回滚刚才的预留额度，
+        // 否则预留泄漏（订单不会成交，也没有后续冲抵）。
+        //
+        // R5-001：`already_reserved` 仅对 **Buy** 成立——Buy 在上一步已把 notional 计入
+        // `reserved`（`committed_total` 已含本单）；而 **Sell 不预留**，若同样传 `true`
+        // 会漏算本单 notional，使 `future_total` 偏小，集中度门禁（`> 2 × 单市场上限`）
+        // 与比率检查被低估，与 `pre_check(.., false)` 口径不一致。
+        let already_reserved = matches!(side, crate::types::enums::Side::Buy);
+        if let Err(e) = self.check_concentration(token_id, side, notional, already_reserved) {
+            // 仅 Buy 会预留（Sell 不预留；对 Sell 调用 release 会误扣其他 pending 预留）。
+            if matches!(side, crate::types::enums::Side::Buy) {
+                self.position_limits.release_reserve(token_id, notional);
+            }
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// 释放预留额度（订单被拒/取消/过期）。
+    pub fn release_reserve(&self, token_id: &str, notional: f64) {
+        self.position_limits.release_reserve(token_id, notional);
+    }
+
+    /// P1-031：重建预留额度（对账恢复后，远端仍 open 的 BUY 订单需重建 pending 预留）。
+    pub fn rebuild_reserve(&self, token_id: &str, notional: f64) {
+        self.position_limits.rebuild_reserve(token_id, notional);
+    }
+
+    /// 公共门槛检查：输入校验 → 熔断 → Gas → 时间窗口。
+    fn check_gates(
+        &self,
+        token_id: &str,
+        side: crate::types::enums::Side,
+        notional: f64,
+        qty: f64,
+        gas_gwei: u64,
+    ) -> ClobResult<()> {
+        // 0. P0-009 输入校验（NaN/Inf/负值全拒）
+        validate_order_inputs(notional, qty)?;
+
+        // 1. 熔断检查 (最高优先级)
         let level = self.daily_loss.current_level();
         match level {
             BreachLevel::Halted => {
@@ -724,29 +1097,55 @@ impl RiskEngine {
             BreachLevel::Normal => {}
         }
 
-        // 1. Gas 费检查
+        // 2. Gas 费检查
         self.gas_protector.pre_check(gas_gwei)?;
 
-        // 2. 时间窗口检查 (结算前 2h)
+        // 3. 时间窗口检查 (结算前 2h)
         self.time_window.pre_check(token_id, side)?;
 
-        // 3. 仓位硬限制
-        self.position_limits.pre_check(token_id, side, notional)?;
+        Ok(())
+    }
 
-        // 4. 集中度检查 (仅在总暴露 > 2 倍单市场上限时生效，避免空仓第一笔被拦截)
-        let market_pos = self.position_limits.market_position(token_id).map(|(_, v)| v).unwrap_or(0.0);
-        let new_market = if matches!(side, crate::types::enums::Side::Buy) {
-            market_pos + notional
-        } else {
-            (market_pos - notional).max(0.0)
+    /// 集中度检查 (仅在总暴露 > 2 倍单市场上限时生效，避免空仓第一笔被拦截)。
+    ///
+    /// R5-001：分母统一采用 committed 口径（filled + pending reserved），杜绝
+    /// 并发 pending 预留漏计导致的暴露低估。`already_reserved` 表明本单 notional
+    /// 是否已写入 `reserved`：
+    /// - `check_and_reserve` 在预留之后调用 → `true`，本单已含在 committed 中，不再重复加；
+    /// - `pre_check` 在预留之前调用 → `false`，本单尚未计入，需补 notional。
+    ///
+    /// 两者得到同一个「下单后的 prospective committed total」，禁止混用口径。
+    fn check_concentration(
+        &self,
+        token_id: &str,
+        side: crate::types::enums::Side,
+        notional: f64,
+        already_reserved: bool,
+    ) -> ClobResult<()> {
+        // A7：分子改用 committed（filled + reserved），与分母 committed_total 统一口径。
+        // `already_reserved=true` 表示本单 notional 已进入 reserved（Buy 预留后调用），
+        // 此时不得再重复加 notional。
+        let market_committed = self.position_limits.market_committed(token_id);
+        let new_market = match side {
+            crate::types::enums::Side::Buy => {
+                if already_reserved {
+                    market_committed
+                } else {
+                    market_committed + notional
+                }
+            }
+            crate::types::enums::Side::Sell => (market_committed - notional).max(0.0),
         };
-        let total = self.position_limits.global_exposure();
-        let future_total = total + notional;
+        let committed = self.position_limits.committed_total();
+        let future_total = if already_reserved {
+            committed
+        } else {
+            committed + notional
+        };
         // 仅当 portfolio 已经有一定规模时才检查集中度
         if future_total > self.config.max_position_per_market * 2.0 {
             self.concentration_checker.check(new_market, future_total)?;
         }
-
         Ok(())
     }
 
@@ -767,7 +1166,8 @@ impl RiskEngine {
         equity: f64,
     ) {
         // 更新持仓
-        self.position_limits.post_check(token_id, side, qty, notional);
+        self.position_limits
+            .post_check(token_id, side, qty, notional);
 
         // 更新日盈亏和熔断
         let level = self.daily_loss.report_pnl(pnl);
@@ -783,7 +1183,51 @@ impl RiskEngine {
         // 更新回撤
         self.drawdown_tracker.update(equity);
     }
+    // ========================================================================
+    // 钩子 C: 真实成交后更新持仓
+    // ========================================================================
+    /// 真实成交后更新 RiskEngine 的仓位暴露。
+    ///
+    /// 与 post_check() 不同：
+    /// - 只更新 PositionLimits
+    /// - 不修改日 PnL
+    /// - 不修改 Equity / Drawdown
+    ///
+    /// 用于实时成交路径，避免在缺少可靠 PnL / Equity 数据时
+    /// 错误污染风控状态。
+    ///
+    /// B1 / P1-008：`filled_notional` 为**实际执行价**计入的成交暴露；
+    /// `reserve_release` 为**订单限价**计算的预留释放额（`None` = 身份/限价未知，
+    /// 保守持有预留）。调用方（service 适配层）负责解析订单身份与限价。
+    pub fn on_fill(
+        &self,
+        token_id: &str,
+        side: crate::types::enums::Side,
+        qty: f64,
+        filled_notional: f64,
+        reserve_release: Option<f64>,
+    ) {
+        self.position_limits
+            .apply_fill_order(token_id, side, qty, filled_notional, reserve_release);
+    }
 
+    /// B1：暴露当前全市场 committed（filled notional + pending reserved）口径，
+    /// 供成交/对账链路与测试断言预留释放是否精确。
+    pub fn committed_total(&self) -> f64 {
+        self.position_limits.committed_total()
+    }
+
+    /// P0-007B：对账恢复——以远端为权威重建指定市场仓位。
+    ///
+    /// 用于 StateSync 恢复计划（`RebuildPosition`），直接覆盖仓位并清空残留预留。
+    pub fn sync_position(&self, token_id: &str, qty: f64, notional: f64) {
+        self.position_limits.sync_position(token_id, qty, notional);
+    }
+
+    /// 当前所有市场的仓位数量快照（token_id → quantity）。
+    pub fn snapshot_positions(&self) -> HashMap<String, f64> {
+        self.position_limits.snapshot_positions()
+    }
     // ========================================================================
     // 辅助方法
     // ========================================================================
@@ -834,7 +1278,12 @@ impl RiskEngine {
             peak_equity: self.drawdown_tracker.peak_equity(),
             gas_rejected: self.gas_protector.rejected_count(),
             upcoming_settlements: self.time_window.upcoming_settlements(),
-            oracle_alerts: self.oracle_monitor.check_all().into_iter().filter(|s| s.alert).count(),
+            oracle_alerts: self
+                .oracle_monitor
+                .check_all()
+                .into_iter()
+                .filter(|s| s.alert)
+                .count(),
         }
     }
 }
@@ -905,17 +1354,23 @@ mod tests {
     fn test_position_limit_per_market() {
         let engine = make_engine();
         // 开仓 400 USDC (上限 500)
-        assert!(engine.pre_check("market-1", Side::Buy, 400.0, 400.0, 50).is_ok());
+        assert!(engine
+            .pre_check("market-1", Side::Buy, 400.0, 400.0, 50)
+            .is_ok());
         engine.post_check("market-1", Side::Buy, 400.0, 400.0, 0.0, 10000.0);
         // 再开 200 → 600 > 500 上限
-        assert!(engine.pre_check("market-1", Side::Buy, 200.0, 200.0, 50).is_err());
+        assert!(engine
+            .pre_check("market-1", Side::Buy, 200.0, 200.0, 50)
+            .is_err());
     }
 
     #[test]
     fn test_position_limit_global() {
-        let mut cfg = RiskConfig::default();
-        cfg.max_position_per_market = 10000.0; // 放宽单市场限制
-        cfg.max_global_exposure = 1000.0;
+        let cfg = RiskConfig {
+            max_position_per_market: 10000.0, // 放宽单市场限制
+            max_global_exposure: 1000.0,
+            ..Default::default()
+        };
         let engine = RiskEngine::new(cfg);
         assert!(engine.pre_check("m1", Side::Buy, 600.0, 600.0, 50).is_ok());
         engine.post_check("m1", Side::Buy, 600.0, 600.0, 0.0, 10000.0);
@@ -935,7 +1390,10 @@ mod tests {
     #[test]
     fn test_settlement_freeze_new_buy() {
         let guard = TimeWindowGuard::new(Duration::from_secs(3600)); // 1h
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         // 30 分钟后结算 → 在冻结窗口内
         guard.set_settlement("near", now + 1800);
         assert!(guard.pre_check("near", Side::Buy).is_err());
@@ -944,16 +1402,22 @@ mod tests {
     #[test]
     fn test_settlement_freeze_sell_ok() {
         let guard = TimeWindowGuard::new(Duration::from_secs(3600));
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         guard.set_settlement("near", now + 600); // 10 分钟后结算
-        // Sell 始终允许
+                                                 // Sell 始终允许
         assert!(guard.pre_check("near", Side::Sell).is_ok());
     }
 
     #[test]
     fn test_settlement_far_future_ok() {
         let guard = TimeWindowGuard::new(Duration::from_secs(3600));
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         guard.set_settlement("far", now + 86400 * 7); // 7 天后
         assert!(guard.pre_check("far", Side::Buy).is_ok());
     }
@@ -970,8 +1434,10 @@ mod tests {
 
     #[test]
     fn test_daily_loss_warning() {
-        let mut cfg = RiskConfig::default();
-        cfg.daily_loss_warn = 50.0;
+        let cfg = RiskConfig {
+            daily_loss_warn: 50.0,
+            ..Default::default()
+        };
         let dll = DailyLossLimit::new(&cfg);
         let level = dll.report_pnl(-75.0);
         assert_eq!(level, BreachLevel::Warning);
@@ -979,8 +1445,10 @@ mod tests {
 
     #[test]
     fn test_daily_loss_halted() {
-        let mut cfg = RiskConfig::default();
-        cfg.daily_loss_halt = 100.0;
+        let cfg = RiskConfig {
+            daily_loss_halt: 100.0,
+            ..Default::default()
+        };
         let dll = DailyLossLimit::new(&cfg);
         let level = dll.report_pnl(-150.0);
         assert_eq!(level, BreachLevel::Halted);
@@ -988,10 +1456,12 @@ mod tests {
 
     #[test]
     fn test_daily_loss_progression() {
-        let mut cfg = RiskConfig::default();
-        cfg.daily_loss_warn = 50.0;
-        cfg.daily_loss_limit = 150.0;
-        cfg.daily_loss_halt = 300.0;
+        let cfg = RiskConfig {
+            daily_loss_warn: 50.0,
+            daily_loss_limit: 150.0,
+            daily_loss_halt: 300.0,
+            ..Default::default()
+        };
         let dll = DailyLossLimit::new(&cfg);
         assert_eq!(dll.report_pnl(-60.0), BreachLevel::Warning);
         assert_eq!(dll.report_pnl(-100.0), BreachLevel::Restricted);
@@ -1019,8 +1489,8 @@ mod tests {
     fn test_drawdown_tracking() {
         let dt = DrawdownTracker::new(0.05);
         dt.update(10000.0); // peak=10000
-        dt.update(9500.0);  // dd=5%
-        dt.update(9000.0);  // dd=10%
+        dt.update(9500.0); // dd=5%
+        dt.update(9000.0); // dd=10%
         dt.update(10500.0); // new peak
         let dd = dt.current_drawdown();
         assert!(dd >= 0.05);
@@ -1044,16 +1514,20 @@ mod tests {
 
     #[test]
     fn test_engine_pre_check_all_pass() {
-        let mut cfg = RiskConfig::default();
-        cfg.max_position_per_market = 10000.0;
+        let cfg = RiskConfig {
+            max_position_per_market: 10000.0,
+            ..Default::default()
+        };
         let engine = RiskEngine::new(cfg);
         assert!(engine.pre_check("t", Side::Buy, 100.0, 100.0, 50).is_ok());
     }
 
     #[test]
     fn test_engine_pre_check_halted() {
-        let mut cfg = RiskConfig::default();
-        cfg.daily_loss_halt = 1.0; // 极低阈值，一亏就熔断
+        let cfg = RiskConfig {
+            daily_loss_halt: 1.0, // 极低阈值，一亏就熔断
+            ..Default::default()
+        };
         let engine = RiskEngine::new(cfg);
         engine.post_check("t", Side::Buy, 100.0, 100.0, -50.0, 10000.0);
         assert!(engine.pre_check("t", Side::Buy, 100.0, 100.0, 50).is_err());
@@ -1087,5 +1561,476 @@ mod tests {
         assert_eq!(today.len(), 10);
         assert!(today.chars().nth(4) == Some('-'));
         assert!(today.chars().nth(7) == Some('-'));
+    }
+
+    // ========== P0-009：输入校验（NaN/Inf/负值全拒） ==========
+
+    #[test]
+    fn test_reject_nan_notional() {
+        let engine = make_engine();
+        assert!(engine
+            .check_and_reserve("t", Side::Buy, f64::NAN, 1.0, 50)
+            .is_err());
+        assert!(engine.pre_check("t", Side::Buy, f64::NAN, 1.0, 50).is_err());
+    }
+
+    #[test]
+    fn test_reject_inf_notional() {
+        let engine = make_engine();
+        assert!(engine
+            .check_and_reserve("t", Side::Buy, f64::INFINITY, 1.0, 50)
+            .is_err());
+    }
+
+    #[test]
+    fn test_reject_negative_notional() {
+        let engine = make_engine();
+        assert!(engine
+            .check_and_reserve("t", Side::Buy, -100.0, 1.0, 50)
+            .is_err());
+    }
+
+    #[test]
+    fn test_reject_zero_or_negative_qty() {
+        let engine = make_engine();
+        assert!(engine
+            .check_and_reserve("t", Side::Buy, 100.0, 0.0, 50)
+            .is_err());
+        assert!(engine
+            .check_and_reserve("t", Side::Buy, 100.0, -1.0, 50)
+            .is_err());
+    }
+
+    #[test]
+    fn test_risk_config_validate_invalid() {
+        let cfg = RiskConfig {
+            max_position_per_market: f64::NAN,
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+
+        let cfg2 = RiskConfig {
+            max_global_exposure: -1.0,
+            ..Default::default()
+        };
+        assert!(cfg2.validate().is_err());
+
+        let cfg3 = RiskConfig {
+            max_concentration: 1.5, // > 1
+            ..Default::default()
+        };
+        assert!(cfg3.validate().is_err());
+
+        assert!(RiskConfig::default().validate().is_ok());
+    }
+
+    // ========== P0-008：check-and-reserve 原子 ==========
+
+    #[test]
+    fn test_check_and_reserve_blocks_second_order() {
+        let engine = make_engine();
+        // 第一笔预留 400（上限 500）
+        assert!(engine
+            .check_and_reserve("m", Side::Buy, 400.0, 400.0, 50)
+            .is_ok());
+        // 第二笔 200 → 400 + 200 = 600 > 500，被拒
+        assert!(engine
+            .check_and_reserve("m", Side::Buy, 200.0, 200.0, 50)
+            .is_err());
+    }
+
+    #[test]
+    fn test_check_and_reserve_global_limit() {
+        let cfg = RiskConfig {
+            max_position_per_market: 10000.0,
+            max_global_exposure: 1000.0,
+            ..Default::default()
+        };
+        let engine = RiskEngine::new(cfg);
+        assert!(engine
+            .check_and_reserve("m1", Side::Buy, 600.0, 600.0, 50)
+            .is_ok());
+        // 600 已预留，再 500 → 1100 > 1000
+        assert!(engine
+            .check_and_reserve("m2", Side::Buy, 500.0, 500.0, 50)
+            .is_err());
+    }
+
+    #[test]
+    fn test_on_fill_converts_reserve_to_filled() {
+        let engine = make_engine();
+        engine
+            .check_and_reserve("m", Side::Buy, 400.0, 400.0, 50)
+            .unwrap();
+        // 成交路径：预留 → 成交（限价 1.0 × 400 = 释放 400）
+        engine.on_fill("m", Side::Buy, 400.0, 400.0, Some(400.0));
+        // 成交后 global_exposure = 400（预留已冲抵）
+        assert_eq!(engine.snapshot().global_exposure, 400.0);
+    }
+
+    #[test]
+    fn test_release_reserve_frees_capacity() {
+        let engine = make_engine();
+        engine
+            .check_and_reserve("m", Side::Buy, 400.0, 400.0, 50)
+            .unwrap();
+        // 释放预留
+        engine.release_reserve("m", 400.0);
+        // 现在又能再预留 400
+        assert!(engine
+            .check_and_reserve("m", Side::Buy, 400.0, 400.0, 50)
+            .is_ok());
+    }
+
+    /// P1-033①：集中度检查失败后回滚预留，不泄漏。
+    ///
+    /// 集中度检查在 `position_limits.check_and_reserve`（已预留）之后执行，失败时必须
+    /// 回滚，否则该市场 reserved 泄漏，后续下单被误拒。
+    #[test]
+    fn test_check_and_reserve_concentration_failure_rolls_back() {
+        let cfg = RiskConfig {
+            max_position_per_market: 1000.0,
+            max_global_exposure: 10000.0,
+            max_concentration: 0.3, // 30%
+            ..Default::default()
+        };
+        let engine = RiskEngine::new(cfg);
+
+        // 另一市场已持仓 2000（全局 filled = 2000）
+        engine.on_fill("other", Side::Buy, 2000.0, 2000.0, None);
+
+        // 集中度失败：new_market=900, future_total=2900 → 900/2900 ≈ 31% > 30%
+        assert!(engine
+            .check_and_reserve("t", Side::Buy, 900.0, 900.0, 50)
+            .is_err());
+
+        // 关键断言：回滚后 reserved("t") 应为 0。
+        // 若泄漏 900，则下面 500 会让 market = 900 + 500 = 1400 > 1000 → Err；
+        // 回滚成功则 market = 0 + 500 = 500 ≤ 1000，且 concentration 500/2500=20% 不触发 → Ok。
+        assert!(engine
+            .check_and_reserve("t", Side::Buy, 500.0, 500.0, 50)
+            .is_ok());
+    }
+
+    /// R5-001：集中度检查分母必须计入 pending 预留（`committed_total`）。
+    ///
+    /// 旧实现分母用 `global_exposure()`（仅 filled），并发 pending 预留被漏计，
+    /// 组合暴露被低估，集中度门禁（`future_total > 2 × 单市场上限`）可能被错误跳过。
+    #[test]
+    fn test_concentration_counts_pending_reserves() {
+        let cfg = RiskConfig {
+            max_position_per_market: 5000.0,
+            max_global_exposure: 100_000.0,
+            max_concentration: 0.4,
+            ..Default::default()
+        };
+        let engine = RiskEngine::new(cfg);
+
+        // 两笔 pending 预留（未成交），合计 6000：只计入 committed_total，
+        // 不计入 global_exposure（filled 暴露仍为 0）。
+        engine
+            .check_and_reserve("a1", Side::Buy, 3000.0, 3000.0, 50)
+            .unwrap();
+        engine
+            .check_and_reserve("a2", Side::Buy, 3000.0, 3000.0, 50)
+            .unwrap();
+        assert_eq!(engine.snapshot().global_exposure, 0.0);
+        assert_eq!(engine.position_limits.committed_total(), 6000.0);
+
+        // 下单 B：committed 将达 10500 > 2 × 5000，new_market = 4500，
+        // 4500 / 10500 ≈ 42.9% > 40% → 必须拒绝。
+        // 若分母漏计 pending（旧口径 future_total = 0 + 4500 = 4500 未过门禁），
+        // 集中度检查被跳过、此单会被错误放行。
+        assert!(engine
+            .check_and_reserve("b", Side::Buy, 4500.0, 4500.0, 50)
+            .is_err());
+    }
+
+    /// A7：集中度**分子**必须计入同 token 的 pending reserve（committed 口径）。
+    ///
+    /// 旧实现分子用 `market_position()`（仅 filled）→ 同 token pending 预留被漏计，
+    /// 集中度被低估而错误放行。
+    #[test]
+    fn test_a7_concentration_numerator_counts_pending_reserve() {
+        let cfg = RiskConfig {
+            max_position_per_market: 10_000.0,
+            max_global_exposure: 1_000_000.0,
+            max_concentration: 0.3,
+            ..Default::default()
+        };
+        let engine = RiskEngine::new(cfg);
+
+        // 另一市场 X 已成交 21000（> 2×max 以触发集中度门禁）
+        engine.on_fill("X", Side::Buy, 21000.0, 21000.0, None);
+        // 同 token "t" 已有 pending 预留 7500（filled=0）
+        engine
+            .check_and_reserve("t", Side::Buy, 7500.0, 7500.0, 0)
+            .unwrap();
+
+        // 再下 Buy 2000：position limit PASS（t committed 9500 ≤ 10000）、
+        // global PASS；A7 分子 = market_committed(t) = 9500 → 9500/30500 ≈ 31.2% > 30% → 拒。
+        // 旧（filled-only）分子 = 0 + 2000 = 2000 → 2000/30500 ≈ 6.6% → 错误放行。
+        assert!(
+            engine
+                .check_and_reserve("t", Side::Buy, 2000.0, 2000.0, 0)
+                .is_err(),
+            "同 token pending reserve 必须计入集中度分子"
+        );
+    }
+
+    /// R5-001（Test A）：Sell 只因**集中度**被拒——Position Limit / Global Exposure 均 PASS。
+    ///
+    /// 构造：committed = 9900 ≤ 2×5000，加入本单 Sell 200 → future_total = 10100 > 10000
+    /// 才触发集中度门禁；new_market = 4000 - 200 = 3800 → 3800/10100 ≈ 37.6% > 30% → 拒。
+    /// 旧实现（对 Sell 传 `already_reserved=true`）→ future_total = 9900 ≤ 10000 → 门禁被跳过 → 错误放行。
+    #[test]
+    fn test_sell_concentration_rejected_without_position_limit_breach() {
+        let cfg = RiskConfig {
+            max_position_per_market: 5000.0,
+            max_global_exposure: 100_000.0,
+            max_concentration: 0.3,
+            ..Default::default()
+        };
+        let engine = RiskEngine::new(cfg);
+
+        // "t" 持仓 4000（< 5000 → Position Limit PASS）；另一市场 5900（Global Exposure PASS）
+        engine.on_fill("t", Side::Buy, 4000.0, 4000.0, None);
+        engine.on_fill("other", Side::Buy, 5900.0, 5900.0, None);
+        assert_eq!(engine.position_limits.committed_total(), 9900.0);
+
+        // 唯一拒绝原因必须是「集中度」
+        let pre = engine
+            .pre_check("t", Side::Sell, 200.0, 200.0, 50)
+            .unwrap_err();
+        assert!(
+            pre.to_string().contains("集中度限制"),
+            "pre_check 应因集中度拒绝，实际: {pre}"
+        );
+        assert!(!pre.to_string().contains("仓位硬限制"));
+        assert!(!pre.to_string().contains("全局暴露限制"));
+
+        let res = engine
+            .check_and_reserve("t", Side::Sell, 200.0, 200.0, 50)
+            .unwrap_err();
+        assert!(
+            res.to_string().contains("集中度限制"),
+            "check_and_reserve 应因集中度拒绝，实际: {res}"
+        );
+
+        // Sell 不产生预留
+        assert_eq!(engine.position_limits.committed_total(), 9900.0);
+    }
+
+    /// R5-001（Test B）：Sell 集中度失败**不得释放**已存在的 Buy 预留。
+    #[test]
+    fn test_sell_concentration_failure_does_not_release_existing_reserve() {
+        let cfg = RiskConfig {
+            max_position_per_market: 5000.0,
+            max_global_exposure: 100_000.0,
+            max_concentration: 0.3,
+            ..Default::default()
+        };
+        let engine = RiskEngine::new(cfg);
+
+        // 已存在的 Buy 预留（另一 token）：reserved = 500
+        engine
+            .check_and_reserve("r", Side::Buy, 500.0, 500.0, 50)
+            .unwrap();
+        // 持仓：t=4000、other=5400 → committed = 4000 + 5400 + 500 = 9900
+        engine.on_fill("t", Side::Buy, 4000.0, 4000.0, None);
+        engine.on_fill("other", Side::Buy, 5400.0, 5400.0, None);
+        let before = engine.position_limits.committed_total();
+        assert_eq!(before, 9900.0);
+
+        // Sell 因集中度失败
+        assert!(engine
+            .check_and_reserve("t", Side::Sell, 200.0, 200.0, 50)
+            .is_err());
+
+        // 既有 Buy 预留未被释放（回滚仅作用于 Buy 分支）
+        assert_eq!(engine.position_limits.committed_total(), before);
+    }
+
+    /// P0-007B：sync_position 以远端为权威重建/删除仓位，并清空残留 reserved。
+    #[test]
+    fn test_sync_position_rebuild_and_remove() {
+        let engine = make_engine();
+        // 先制造一笔真实成交 + 一笔残留预留
+        engine
+            .check_and_reserve("m1", Side::Buy, 400.0, 400.0, 50)
+            .unwrap();
+        engine.on_fill("m1", Side::Buy, 400.0, 400.0, Some(400.0));
+        engine
+            .check_and_reserve("m1", Side::Buy, 50.0, 50.0, 50)
+            .unwrap(); // 残留 reserved=50
+
+        // 远端权威：qty=300, notional=150（覆盖本地，清空 reserved）
+        engine.sync_position("m1", 300.0, 150.0);
+        assert_eq!(engine.snapshot_positions().get("m1"), Some(&300.0));
+        assert_eq!(engine.snapshot().global_exposure, 150.0);
+
+        // 删除：qty=0 notional=0 → 条目移除
+        engine.sync_position("m1", 0.0, 0.0);
+        assert!(!engine.snapshot_positions().contains_key("m1"));
+        assert_eq!(engine.snapshot().global_exposure, 0.0);
+    }
+
+    /// sync_position 忽略 NaN/Inf，避免污染风控状态。
+    #[test]
+    fn test_sync_position_ignores_non_finite() {
+        let engine = make_engine();
+        engine.sync_position("m1", f64::NAN, 100.0);
+        engine.sync_position("m1", 100.0, f64::INFINITY);
+        assert!(!engine.snapshot_positions().contains_key("m1"));
+        assert_eq!(engine.snapshot().global_exposure, 0.0);
+    }
+
+    /// P1-031：rebuild_reserve 重建预留额度，计入后续 check_and_reserve 的暴露检查。
+    #[test]
+    fn test_rebuild_reserve_blocks_subsequent_order() {
+        let cfg = RiskConfig {
+            max_position_per_market: 1000.0,
+            max_global_exposure: 1000.0,
+            ..Default::default()
+        };
+        let engine = RiskEngine::new(cfg);
+
+        // 重建 reserved = 600（模拟远端仍 open 的订单预留）
+        engine.rebuild_reserve("t1", 600.0);
+
+        // 再 reserve 500 → 600 + 500 = 1100 > 1000 → Err（暴露检查计入重建的预留）
+        assert!(engine
+            .check_and_reserve("t1", Side::Buy, 500.0, 500.0, 50)
+            .is_err());
+
+        // 再 reserve 400 → 600 + 400 = 1000 = 上限（不大于）→ Ok
+        assert!(engine
+            .check_and_reserve("t1", Side::Buy, 400.0, 400.0, 50)
+            .is_ok());
+    }
+
+    /// P1-031：rebuild_reserve 忽略非法 notional（NaN / ≤0），不污染风控状态。
+    #[test]
+    fn test_rebuild_reserve_ignores_invalid() {
+        let engine = make_engine();
+        engine.rebuild_reserve("t1", f64::NAN);
+        engine.rebuild_reserve("t1", -5.0);
+        engine.rebuild_reserve("t1", 0.0);
+        // 未污染：仍能正常预留
+        assert!(engine
+            .check_and_reserve("t1", Side::Buy, 100.0, 100.0, 50)
+            .is_ok());
+    }
+
+    // ========== B1 / P1-008：订单级预留释放（按 limit price） ==========
+
+    /// B1 核心：price improvement 下预留按**限价**完整释放，不留残余。
+    ///
+    /// 预留 = limit(0.60) × 100 = 60；执行价 0.50 全额成交 → filled notional = 50。
+    /// 释放必须按限价 0.60 × 100 = 60（而非执行 50），否则残留 reserved=10。
+    ///
+    /// **Mutation guard**：若把 `on_fill` 的释放回退为「执行名义抵扣预留」，
+    /// `committed_total()` 会变成 60（reserved 10 + filled 50），本断言即失败。
+    #[test]
+    fn test_b1_price_improvement_releases_limit_reserve() {
+        let engine = make_engine();
+        engine
+            .check_and_reserve("m", Side::Buy, 60.0, 100.0, 50)
+            .unwrap();
+        // 执行价 0.50，全成交，释放 60（=0.60×100）
+        engine.on_fill("m", Side::Buy, 100.0, 50.0, Some(60.0));
+
+        assert_eq!(engine.snapshot().global_exposure, 50.0, "filled 暴露按执行价");
+        assert_eq!(
+            engine.committed_total(),
+            50.0,
+            "预留必须按限价完整释放（无残余）"
+        );
+    }
+
+    /// B1：多笔 partial fill 按各自增量的限价释放，累计恰好冲抵整单预留。
+    #[test]
+    fn test_b1_partial_fills_then_full_releases_limit_reserve() {
+        let engine = make_engine();
+        // limit 0.60, qty 100 → reserve 60
+        engine
+            .check_and_reserve("m", Side::Buy, 60.0, 100.0, 50)
+            .unwrap();
+
+        // 第一笔 30 @0.50：释放 0.60×30=18，filled += 15
+        engine.on_fill("m", Side::Buy, 30.0, 15.0, Some(18.0));
+        // reserved=42, filled=15 → committed=57
+        assert_eq!(engine.committed_total(), 57.0);
+
+        // 第二笔 70 @0.50：释放 0.60×70=42，filled += 35
+        engine.on_fill("m", Side::Buy, 70.0, 35.0, Some(42.0));
+        assert_eq!(engine.committed_total(), 50.0, "整单预留精确冲抵");
+        assert_eq!(engine.snapshot().global_exposure, 50.0);
+    }
+
+    /// B1：同 token 两笔不同限价的订单，各自按自身限价释放，归属守恒。
+    #[test]
+    fn test_b1_two_orders_different_limits_same_token() {
+        let engine = make_engine();
+        // order A: limit 0.4, qty 100 → reserve 40
+        engine
+            .check_and_reserve("m", Side::Buy, 40.0, 100.0, 50)
+            .unwrap();
+        // order B: limit 0.6, qty 100 → reserve 60
+        engine
+            .check_and_reserve("m", Side::Buy, 60.0, 100.0, 50)
+            .unwrap();
+        assert_eq!(engine.committed_total(), 100.0);
+
+        // A 全额成交 @0.4 → 释放 40
+        engine.on_fill("m", Side::Buy, 100.0, 40.0, Some(40.0));
+        // B 全额成交 @0.6 → 释放 60
+        engine.on_fill("m", Side::Buy, 100.0, 60.0, Some(60.0));
+
+        assert_eq!(engine.committed_total(), 100.0);
+        assert_eq!(engine.snapshot().global_exposure, 100.0, "两单 filled 累加");
+    }
+
+    /// B1：身份/限价未知时**保守持有**预留，不按执行名义释放。
+    #[test]
+    fn test_b1_unknown_limit_holds_reserve_conservatively() {
+        let engine = make_engine();
+        engine
+            .check_and_reserve("m", Side::Buy, 60.0, 100.0, 50)
+            .unwrap();
+        // reserve_release = None（限价未知）→ 不释放预留
+        engine.on_fill("m", Side::Buy, 100.0, 50.0, None);
+
+        assert_eq!(engine.snapshot().global_exposure, 50.0);
+        assert_eq!(
+            engine.committed_total(),
+            110.0,
+            "限价未知时预留保守持有（60 reserved + 50 filled）"
+        );
+    }
+
+    /// B1：Sell 不释放同 token 的 Buy 开仓预留。
+    #[test]
+    fn test_b1_sell_does_not_release_buy_reserve() {
+        let engine = make_engine();
+        // Buy 全额成交，预留清零：filled=50
+        engine
+            .check_and_reserve("m", Side::Buy, 60.0, 100.0, 50)
+            .unwrap();
+        engine.on_fill("m", Side::Buy, 100.0, 50.0, Some(60.0));
+        // 新的 Buy 挂单预留 40
+        engine
+            .check_and_reserve("m", Side::Buy, 40.0, 100.0, 50)
+            .unwrap();
+
+        // Sell 30 @0.5：不得触碰 reserved
+        engine.on_fill("m", Side::Sell, 30.0, 15.0, None);
+
+        assert_eq!(engine.snapshot().global_exposure, 35.0, "filled 50-15");
+        assert_eq!(
+            engine.committed_total(),
+            75.0,
+            "reserved 40 保持不变 + filled 35"
+        );
     }
 }

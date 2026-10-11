@@ -30,7 +30,7 @@
 //! fetch_add。
 
 use crate::fast::rpc_pool::RpcPool;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -58,19 +58,45 @@ pub const DEFAULT_MAX_RETRIES: u32 = 5;
 // NonceTracker
 // ============================================================================
 
+/// Nonce 生命周期状态（P0-011 状态机）
+///
+/// ```text
+/// Allocated ──broadcast──> Pending ──confirmed──> 从 tracker 移除，推进 onchain watermark
+///     │                        │
+///     │ 发送前失败             │ 发送后失败 / RBF 耗尽
+///     └───────────────────────┴──────────> 从 tracker 移除（mark_failed）
+/// ```
+///
+/// - `Allocated`：`next_nonce()` 已分配，但尚未广播上链。
+/// - `Pending`：已广播，等待链上确认。
+/// - `Confirmed` / `Failed` 是终态，通过「从 `nonce_states` 移除」表达，不占 map 条目。
+///
+/// 说明：`broadcasted` 与 `Pending` 在链上语义中等价（广播即等待确认），
+/// 故合并为同一状态；`failed-but-not-broadcasted` = `Allocated` 状态下直接
+/// `mark_failed`，nonce 未上链可复用（分配游标不因此回退，由上层决定）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NonceState {
+    /// 已分配，未广播
+    Allocated,
+    /// 已广播，等待确认
+    Pending,
+}
+
 /// Nonce 追踪器
 ///
 /// 维护链上账户的 nonce 状态：
-/// - `current`: 从链上读取的最新 confirmed nonce（最保守）
-/// - `next_local`: 本地分配的下一个 nonce（current + pending_count）
-/// - `pending`: 当前在 mempool 中等待确认的 nonce 集合
+/// - `onchain_nonce`: 链上已确认 nonce watermark（confirmed）
+/// - `next_local`: 下一个待分配的 nonce 游标（原子递增，P0-010 并发安全）
+/// - `nonce_states`: 已分配未确认的 nonce 及其状态（P0-011 状态机）
 pub struct NonceTracker {
-    /// 从链上读取的 confirmed nonce
+    /// 从链上读取的 confirmed nonce watermark
     onchain_nonce: AtomicU64,
+    /// 下一个待分配的 nonce 游标（`fetch_add` 原子递增）
+    next_local: AtomicU64,
+    /// 已分配未确认的 nonce 状态 {nonce: NonceState}
+    nonce_states: RwLock<HashMap<u64, NonceState>>,
     /// 缓存的过期时间
     cache_expires_at: RwLock<Instant>,
-    /// pending 中的 nonce 集合
-    pending_nonces: RwLock<HashSet<u64>>,
     /// 最后一次向链上同步结果
     last_sync: RwLock<Instant>,
     /// 缓存 TTL
@@ -82,44 +108,49 @@ impl NonceTracker {
     pub fn new(onchain_nonce: u64) -> Self {
         Self {
             onchain_nonce: AtomicU64::new(onchain_nonce),
+            next_local: AtomicU64::new(onchain_nonce),
+            nonce_states: RwLock::new(HashMap::new()),
             cache_expires_at: RwLock::new(Instant::now() + DEFAULT_NONCE_CACHE_TTL),
-            pending_nonces: RwLock::new(HashSet::new()),
             last_sync: RwLock::new(Instant::now()),
             cache_ttl: DEFAULT_NONCE_CACHE_TTL,
         }
     }
 
-    /// 获取下一个可用 nonce（并标记为 pending）
+    /// 获取下一个可用 nonce（原子递增分配，P0-010 并发安全）。
     ///
-    /// 返回可用于下一笔交易的 nonce。如果存在 pending nonce，
-    /// 则在 highest_pending + 1 继续递增。
+    /// 分配游标 `next_local` 用 `fetch_add` 原子递增，与 pending 集合解耦，
+    /// 并发调用各自拿到唯一 nonce，不会重复。
     pub fn next_nonce(&self) -> u64 {
-        let pending = self.pending_nonces.read().unwrap();
-        let max_pending = pending.iter().max().copied();
-        let onchain = self.onchain_nonce.load(Ordering::Acquire);
-
-        let next = match max_pending {
-            Some(max) => (max + 1).max(onchain),
-            None => onchain,
-        };
-
-        drop(pending);
-        self.pending_nonces.write().unwrap().insert(next);
+        let next = self.next_local.fetch_add(1, Ordering::SeqCst);
+        self.nonce_states
+            .write()
+            .unwrap()
+            .insert(next, NonceState::Allocated);
         next
     }
 
-    /// 标记 nonce 为已确认（从 pending 中移除）
-    pub fn confirm(&self, nonce: u64) {
-        self.pending_nonces.write().unwrap().remove(&nonce);
-        // 推进 onchain nonce 到已确认的 nonce+1
-        let new_onchain = nonce + 1;
-        self.onchain_nonce
-            .fetch_max(new_onchain, Ordering::AcqRel);
+    /// 标记 nonce 已广播（Allocated → Pending）。
+    pub fn mark_pending(&self, nonce: u64) {
+        if let Some(state) = self.nonce_states.write().unwrap().get_mut(&nonce) {
+            *state = NonceState::Pending;
+        }
     }
 
-    /// 标记 nonce 为失败（例如 tx reverted）
+    /// 标记 nonce 为已确认（Pending → Confirmed：移除 + 推进 watermark）。
+    pub fn confirm(&self, nonce: u64) {
+        self.nonce_states.write().unwrap().remove(&nonce);
+        // 推进 onchain watermark（只影响 confirmed 追踪，不影响分配游标）
+        self.onchain_nonce.fetch_max(nonce + 1, Ordering::AcqRel);
+    }
+
+    /// 标记 nonce 为失败（Allocated/Pending → Failed：移除）。
     pub fn mark_failed(&self, nonce: u64) {
-        self.pending_nonces.write().unwrap().remove(&nonce);
+        self.nonce_states.write().unwrap().remove(&nonce);
+    }
+
+    /// 查询指定 nonce 的当前状态（终态 Confirmed/Failed 返回 None）。
+    pub fn nonce_state(&self, nonce: u64) -> Option<NonceState> {
+        self.nonce_states.read().unwrap().get(&nonce).copied()
     }
 
     /// 获取当前链上 nonce（已确认）
@@ -127,9 +158,15 @@ impl NonceTracker {
         self.onchain_nonce.load(Ordering::Acquire)
     }
 
-    /// 获取所有 pending nonce
+    /// 获取所有未确认（Allocated + Pending）nonce
     pub fn pending_nonces(&self) -> Vec<u64> {
-        let mut v: Vec<u64> = self.pending_nonces.read().unwrap().iter().copied().collect();
+        let mut v: Vec<u64> = self
+            .nonce_states
+            .read()
+            .unwrap()
+            .keys()
+            .copied()
+            .collect();
         v.sort_unstable();
         v
     }
@@ -146,26 +183,26 @@ impl NonceTracker {
         let old = self.onchain_nonce.load(Ordering::Acquire);
         let max_nonce = old.max(new_onchain_nonce);
         self.onchain_nonce.store(max_nonce, Ordering::Release);
+        // 同步分配游标，避免分配到链上已确认的 nonce（只增不减）
+        self.next_local.fetch_max(max_nonce, Ordering::SeqCst);
         *self.cache_expires_at.write().unwrap() = Instant::now() + self.cache_ttl;
         *self.last_sync.write().unwrap() = Instant::now();
-        tracing::info!(
-            "nonce_manager: 同步链上 nonce {} → {}",
-            old,
-            max_nonce
-        );
+        tracing::info!("nonce_manager: 同步链上 nonce {} → {}", old, max_nonce);
     }
 
     /// 重置追踪器状态（紧急恢复用）
     pub fn reset(&self, new_onchain_nonce: u64) {
-        self.onchain_nonce.store(new_onchain_nonce, Ordering::Release);
-        self.pending_nonces.write().unwrap().clear();
+        self.onchain_nonce
+            .store(new_onchain_nonce, Ordering::Release);
+        self.next_local.store(new_onchain_nonce, Ordering::SeqCst);
+        self.nonce_states.write().unwrap().clear();
         *self.cache_expires_at.write().unwrap() = Instant::now() + self.cache_ttl;
         *self.last_sync.write().unwrap() = Instant::now();
     }
 
-    /// 获取 pending 计数
+    /// 获取 pending 计数（未确认 nonce 数 = allocated + pending）
     pub fn pending_count(&self) -> usize {
-        self.pending_nonces.read().unwrap().len()
+        self.nonce_states.read().unwrap().len()
     }
 }
 
@@ -284,8 +321,19 @@ impl NonceManager {
         self.tracker.next_nonce()
     }
 
-    /// 注册一笔已发送的交易（用于 stuck 检测）
+    /// 标记 nonce 已广播（Allocated → Pending）。
+    pub fn mark_pending(&self, nonce: u64) {
+        self.tracker.mark_pending(nonce);
+    }
+
+    /// 查询指定 nonce 的当前状态（终态 Confirmed/Failed 返回 None）。
+    pub fn nonce_state(&self, nonce: u64) -> Option<NonceState> {
+        self.tracker.nonce_state(nonce)
+    }
+
+    /// 注册一笔已发送的交易（用于 stuck 检测），并把 nonce 标记为 Pending。
     pub fn register_tx(&self, nonce: u64, tx_hash: &str, gas_price: u64) {
+        self.tracker.mark_pending(nonce);
         self.stuck_txs.write().unwrap().insert(
             nonce,
             StuckTxEntry {
@@ -342,21 +390,18 @@ impl NonceManager {
         // 收集需要标记为 stuck 的条目
         let stuck_keys: Vec<u64> = stuck
             .iter()
-            .filter(|(_, entry)| {
-                now.duration_since(entry.sent_at) > self.stuck_timeout
-            })
+            .filter(|(_, entry)| now.duration_since(entry.sent_at) > self.stuck_timeout)
             .map(|(k, _)| *k)
             .collect();
 
         for nonce in stuck_keys {
             // 先检查是否已耗尽（用不可变借用）
-            let is_exhausted = stuck.get(&nonce).map_or(true, |e| e.exhausted(self.max_retries));
+            let is_exhausted = stuck
+                .get(&nonce)
+                .is_none_or(|e| e.exhausted(self.max_retries));
             if is_exhausted {
                 stuck.remove(&nonce);
-                tracing::warn!(
-                    "nonce_manager: 放弃 nonce={} (已重试达上限)",
-                    nonce,
-                );
+                tracing::warn!("nonce_manager: 放弃 nonce={} (已重试达上限)", nonce,);
             } else if let Some(entry) = stuck.get(&nonce) {
                 result.push(entry.clone());
             }
@@ -444,10 +489,7 @@ impl NonceManager {
             onchain_nonce: self.tracker.onchain_nonce(),
             pending_count: self.tracker.pending_count(),
             stuck_count: stuck.len(),
-            stuck_entries: stuck
-                .values()
-                .map(|e| (e.nonce, e.rbf_retries))
-                .collect(),
+            stuck_entries: stuck.values().map(|e| (e.nonce, e.rbf_retries)).collect(),
         }
     }
 }
@@ -580,7 +622,7 @@ mod tests {
     fn test_manager_pending_nonces() {
         let mgr = NonceManager::new(200);
         let n1 = mgr.next_nonce();
-        let n2 = mgr.next_nonce();
+        let _n2 = mgr.next_nonce();
         assert_eq!(mgr.pending_nonces(), vec![200, 201]);
         mgr.confirm(n1);
         assert_eq!(mgr.pending_nonces(), vec![201]);
@@ -643,5 +685,81 @@ mod tests {
         assert_eq!(stats.onchain_nonce, 800);
         assert_eq!(stats.pending_count, 1);
         assert_eq!(stats.stuck_count, 1);
+    }
+
+    // ========== P0-010：并发 nonce 分配原子 ==========
+
+    #[test]
+    fn test_nonce_concurrent_allocation_unique() {
+        let tracker = Arc::new(NonceTracker::new(0));
+        let results = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut handles = Vec::new();
+
+        for _ in 0..8 {
+            let t = tracker.clone();
+            let r = results.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..100 {
+                    let n = t.next_nonce();
+                    r.lock().unwrap().push(n);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let mut all = results.lock().unwrap().clone();
+        all.sort_unstable();
+        let mut dedup = all.clone();
+        dedup.dedup();
+        assert_eq!(all.len(), dedup.len(), "并发分配出现重复 nonce");
+        assert_eq!(all.len(), 800);
+        assert_eq!(all.first(), Some(&0));
+        assert_eq!(all.last(), Some(&799));
+    }
+
+    // ========== P0-011：Nonce 状态机 ==========
+
+    #[test]
+    fn test_nonce_state_machine_transitions() {
+        let tracker = NonceTracker::new(10);
+        let n = tracker.next_nonce(); // 10, Allocated
+        assert_eq!(tracker.nonce_state(n), Some(NonceState::Allocated));
+
+        tracker.mark_pending(n); // Allocated -> Pending
+        assert_eq!(tracker.nonce_state(n), Some(NonceState::Pending));
+
+        tracker.confirm(n); // Pending -> Confirmed（移除）
+        assert_eq!(tracker.nonce_state(n), None);
+        assert_eq!(tracker.onchain_nonce(), 11);
+        assert_eq!(tracker.pending_count(), 0);
+    }
+
+    #[test]
+    fn test_nonce_out_of_order_confirm_no_skip() {
+        let tracker = NonceTracker::new(10);
+        let n1 = tracker.next_nonce(); // 10
+        let n2 = tracker.next_nonce(); // 11
+        let n3 = tracker.next_nonce(); // 12
+
+        // 乱序确认：先确认 n3，n1/n2 仍 pending
+        tracker.confirm(n3);
+        assert_eq!(tracker.pending_nonces(), vec![n1, n2]);
+
+        // 分配游标与确认解耦：下一 nonce = 13，不跳过 pending、不重复已确认
+        let n4 = tracker.next_nonce();
+        assert_eq!(n4, 13);
+        assert_eq!(tracker.pending_nonces(), vec![n1, n2, n4]);
+    }
+
+    #[test]
+    fn test_nonce_sync_advances_allocator() {
+        let tracker = NonceTracker::new(10);
+        let _ = tracker.next_nonce(); // 10
+        let _ = tracker.next_nonce(); // 11
+        tracker.sync(100); // 链上前进到 100
+        let n = tracker.next_nonce();
+        assert!(n >= 100, "sync 后分配游标应同步到链上 nonce");
     }
 }

@@ -45,10 +45,26 @@ pub struct RoundConfig {
 /// 根据 tickSize 获取舍入配置
 pub fn round_config_for(tick: TickSize) -> RoundConfig {
     match tick {
-        TickSize::Point1 => RoundConfig { price: 1, size: 2, amount: 3 },
-        TickSize::Point01 => RoundConfig { price: 2, size: 2, amount: 4 },
-        TickSize::Point001 => RoundConfig { price: 3, size: 2, amount: 5 },
-        TickSize::Point0001 => RoundConfig { price: 4, size: 2, amount: 6 },
+        TickSize::Point1 => RoundConfig {
+            price: 1,
+            size: 2,
+            amount: 3,
+        },
+        TickSize::Point01 => RoundConfig {
+            price: 2,
+            size: 2,
+            amount: 4,
+        },
+        TickSize::Point001 => RoundConfig {
+            price: 3,
+            size: 2,
+            amount: 5,
+        },
+        TickSize::Point0001 => RoundConfig {
+            price: 4,
+            size: 2,
+            amount: 6,
+        },
     }
 }
 

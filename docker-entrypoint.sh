@@ -22,11 +22,18 @@ case "$MODE" in
 
         # 保持容器运行，监听信号
         trap "log 收到退出信号; kill $PID_DISCOVERY 2>/dev/null; exit 0" TERM INT
-        while kill -0 $PID_DISCOVERY 2>/dev/null; do
+
+        # R5-009（方案 1）：市场发现子进程退出时**不退出容器**——保持容器 Up，
+        # 交由 healthcheck（探测 `market_discovery` argv）在 3 次重试后转 `unhealthy`。
+        # 原实现 `exit 1` 会立即触发 `restart: unless-stopped`，healthcheck 来不及反映。
+        EXITED=0
+        while true; do
+            if [ "$EXITED" -eq 0 ] && ! kill -0 "$PID_DISCOVERY" 2>/dev/null; then
+                log "market_discovery 异常退出；容器保持运行，healthcheck 将转 unhealthy（等待人工/编排处置）"
+                EXITED=1
+            fi
             sleep 5
         done
-        log "market_discovery 异常退出"
-        exit 1
         ;;
 
     paper-trading)

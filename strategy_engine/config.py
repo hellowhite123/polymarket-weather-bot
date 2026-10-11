@@ -66,6 +66,12 @@ class MultiSourceStrategyParams:
     # 分歧放大因子: 分歧越大, 置信度乘数越高 (0.0~1.0)
     divergence_confidence_boost: float = 0.3
 
+    # R5-002：advisory sizing 资本参数。
+    # 仅作 dataclass fallback；生产运行由装配层从 AGG_BASE_CAPITAL /
+    # AGG_KELLY_FRACTION（AggregatorParams）注入，策略内部不得自行读环境变量。
+    base_capital: float = 1000.0
+    kelly_fraction: float = 0.25
+
     # 持久化
     persist_tracker: bool = True
 
@@ -164,6 +170,9 @@ class StrategyConfig:
     @classmethod
     def from_env(cls) -> "StrategyConfig":
         """从环境变量加载配置。"""
+        # R5-002：资本唯一权威来源——先解析 Aggregator 配置，再注入 MultiSource，
+        # 避免两处各自 os.getenv 产生第二套资本权威。
+        aggregator = AggregatorParams.from_env()
         deviation = DeviationStrategyParams(
             deviation_threshold_sigma=float(
                 os.getenv("DEVIATION_SIGMA", "2.0")
@@ -213,6 +222,9 @@ class StrategyConfig:
             divergence_confidence_boost=float(
                 os.getenv("DIVERGENCE_CONF_BOOST", "0.3")
             ),
+            # R5-002：资本从 Aggregator（AGG_*）注入，不在此重复读 env
+            base_capital=aggregator.base_capital,
+            kelly_fraction=aggregator.kelly_fraction,
             persist_tracker=os.getenv("PERSIST_DIV_TRACKER", "true").lower() != "false",
         )
         return cls(
@@ -280,5 +292,5 @@ class StrategyConfig:
             signal_output_path=os.getenv(
                 "SIGNAL_OUTPUT_PATH", "./data/signals"
             ),
-            aggregator=AggregatorParams.from_env(),
+            aggregator=aggregator,
         )

@@ -44,23 +44,23 @@ pub mod wallet;
 // 重导出常用类型
 pub use clob::{ClobClient, ClobConfig, ClobError, ClobResult};
 pub use order::{OrderBuilder, OrderFlow, PlaceOrderParams};
-pub use types::{ApiKeyCreds, OrderResponse, SignedOrder, UserOrder, UserMarketOrder};
 pub use types::enums::{OrderType, Side, SignatureType, TickSize};
+pub use types::{ApiKeyCreds, OrderResponse, SignedOrder, UserMarketOrder, UserOrder};
 pub use wallet::{WalletError, WalletManager, WalletResult};
 
 // 亚秒级执行层
 pub use fast::executor::{ExecutionSource, FastExecutor, FastOrderParams, FastOrderResult};
 pub use fast::mempool::{
     DedupStats, FrontRunDetector, FrontRunVerdict, MempoolConfig, MempoolMonitor, MempoolStats,
-    OrderFingerprint, PendingEntry, PendingOrderTracker, PendingStatus, PendingStats, RateLimitStats,
-    RateLimiter,
+    OrderFingerprint, PendingEntry, PendingOrderTracker, PendingStats, PendingStatus,
+    RateLimitStats, RateLimiter,
 };
 
 // 交易生命周期追踪与 Nonce 管理
 pub use fast::nonce_manager::{NonceManager, NonceStats, NonceTracker, StuckTxEntry};
 pub use fast::tx_lifecycle::{
-    calculate_rbf_gas_price, prepare_rbf_replacement, TxEntry, TxState, TxStats, TxTracker,
-    RbfParams,
+    calculate_rbf_gas_price, prepare_rbf_replacement, RbfParams, TxEntry, TxState, TxStats,
+    TxTracker,
 };
 
 // 多 RPC 节点池
@@ -73,9 +73,9 @@ pub use fast::daemon::BackgroundDaemon;
 
 // 风控系统
 pub use fast::risk_engine::{
-    BreachLevel, DailyLossLimit, DrawdownTracker, GasFeeProtector, OracleDisputeMonitor,
-    OracleStatus, PositionLimits, RiskConfig, RiskEngine, RiskSnapshot, TimeWindowGuard,
-    ConcentrationChecker,
+    BreachLevel, ConcentrationChecker, DailyLossLimit, DrawdownTracker, GasFeeProtector,
+    OracleDisputeMonitor, OracleStatus, PositionLimits, RiskConfig, RiskEngine, RiskSnapshot,
+    TimeWindowGuard,
 };
 
 // 市场事件监听 + 状态同步
