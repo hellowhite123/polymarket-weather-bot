@@ -732,6 +732,19 @@ impl StateSync {
         report
     }
 
+    /// B2 / P1-009：解析 in-doubt 订单 → 远端 open order 的唯一绑定（方法入口）。
+    ///
+    /// 匹配逻辑见 [`resolve_in_doubt_orders`]（纯函数，可单测；本方法仅作
+    /// `StateSync` 调用面封装，不含网络 IO，调用方先自行 `fetch_open_orders`）。
+    pub fn resolve_in_doubt_orders(
+        &self,
+        local: &[InDoubtOrder],
+        remote_open_orders: &[serde_json::Value],
+        known_remote_ids: &std::collections::HashSet<String>,
+    ) -> InDoubtResolution {
+        resolve_in_doubt_orders(local, remote_open_orders, known_remote_ids)
+    }
+
     // ========================================================================
     // 恢复计划构建（P0-007B）
     // ========================================================================
@@ -1091,6 +1104,274 @@ pub fn build_recovery_plan(
     }
 
     plan
+}
+
+// ============================================================================
+// B2 / P1-009 — in-doubt 订单解析（匹配远端 open order）
+//
+// 冻结语义（Design V2 §B2 + DCR-001 方案 A）：
+//   - in-doubt = Received 且无 exchange_order_id 的本地订单（下单结果未知）。
+//   - 匹配优先级：exchange_order_id（in-doubt 结构性不适用）→ 精确 client_order_id
+//     → 唯一 fingerprint → unresolved；≥2 远端命中或互惠不唯一 → ambiguous →
+//     unresolved，绝不自动挑选第一个。
+//   - unresolved/ambiguous 保守持有预留：TTL 到期不构成释放授权（本实现不存在
+//     任何按时间释放预留的路径），并使 TradingGate 保持非 READY。
+//   - 内存态（无持久化）：重启不恢复，durable-restart 测试 DEFERRED（DCR-001 方案 A）。
+// ============================================================================
+
+/// in-doubt 本地订单的指纹要素（service 层从 `OrderState` 提取）。
+#[derive(Debug, Clone)]
+pub struct InDoubtOrder {
+    pub client_order_id: String,
+    pub token_id: String,
+    pub side: String,
+    pub price: f64,
+    pub size: f64,
+    pub created_at: u64,
+}
+
+/// 匹配来源（in-doubt 天然没有 exchange_order_id，第一步结构性跳过）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchVia {
+    ClientOrderId,
+    Fingerprint,
+}
+
+/// 唯一命中绑定：把 in-doubt 本地订单映射到远端 open order。
+#[derive(Debug, Clone)]
+pub struct InDoubtBinding {
+    pub client_order_id: String,
+    pub exchange_order_id: String,
+    pub via: MatchVia,
+}
+
+/// 解析结果：`bindings` = 唯一命中；`unresolved` = 全部未绑定项（含 `ambiguous`）。
+#[derive(Debug, Default, Clone)]
+pub struct InDoubtResolution {
+    pub bindings: Vec<InDoubtBinding>,
+    pub unresolved: Vec<String>,
+    pub ambiguous: Vec<String>,
+}
+
+impl InDoubtResolution {
+    pub fn has_unresolved(&self) -> bool {
+        !self.unresolved.is_empty()
+    }
+}
+
+/// 定点十进制归一化（8 位小数、去尾零），抵御 f64 抖动；非有限值返回 None。
+pub fn canonical_decimal(v: f64) -> Option<String> {
+    if !v.is_finite() {
+        return None;
+    }
+    let s = format!("{:.8}", v);
+    let s = s.trim_end_matches('0').trim_end_matches('.');
+    Some(if s.is_empty() || s == "-" || s == "-0" {
+        "0".to_string()
+    } else {
+        s.to_string()
+    })
+}
+
+/// 远端 open order 的字段提取结果（None = 字段缺失，fingerprint 按「缺失跳过」处理）。
+struct RemoteOpen {
+    id: String,
+    client_order_id: Option<String>,
+    token_id: Option<String>,
+    side: Option<String>,
+    price: Option<f64>,
+    size: Option<f64>,
+    created_at: Option<u64>,
+}
+
+/// 依次取第一个「非空白字符串」字段。
+fn first_str(v: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|k| {
+        v.get(*k)
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    })
+}
+
+/// 依次取第一个可解析的数值字段（字符串或数字编码均可）。
+fn first_f64(v: &serde_json::Value, keys: &[&str]) -> Option<f64> {
+    keys.iter().find_map(|k| v.get(*k).and_then(|x| parse_json_f64(x).ok()))
+}
+
+/// 依次取第一个时间戳字段（按秒；0 视为缺失）。
+fn first_secs(v: &serde_json::Value, keys: &[&str]) -> Option<u64> {
+    first_f64(v, keys)
+        .filter(|n| n.is_finite() && *n >= 0.0)
+        .map(|n| n as u64)
+        .filter(|n| *n > 0)
+}
+
+/// fingerprint 精确匹配（互惠唯一性由调用方保证）。
+///
+/// 字段规则（Design V2 §B2）：token_id / side 双方必须有且**原样**相等；
+/// price / size 走 canonical 十进制相等；created_at 归一到秒——远端**提供**时
+/// 必须相等，双方都缺失则跳过比较。
+fn fingerprint_match(local: &InDoubtOrder, remote: &RemoteOpen) -> bool {
+    let rt = match remote.token_id.as_deref() {
+        Some(x) => x,
+        None => return false,
+    };
+    let rs = match remote.side.as_deref() {
+        Some(x) => x,
+        None => return false,
+    };
+    if rt != local.token_id || rs != local.side {
+        return false;
+    }
+    let rp = match remote.price {
+        Some(x) => x,
+        None => return false,
+    };
+    let rz = match remote.size {
+        Some(x) => x,
+        None => return false,
+    };
+    let same_price = matches!(
+        (canonical_decimal(local.price), canonical_decimal(rp)),
+        (Some(a), Some(b)) if a == b
+    );
+    let same_size = matches!(
+        (canonical_decimal(local.size), canonical_decimal(rz)),
+        (Some(a), Some(b)) if a == b
+    );
+    if !same_price || !same_size {
+        return false;
+    }
+    if let Some(rc) = remote.created_at {
+        if rc != local.created_at {
+            return false;
+        }
+    }
+    true
+}
+
+/// B2 / P1-009：解析 in-doubt 订单 → 远端 open order 的唯一绑定。
+///
+/// 匹配优先级（Design V2 §B2）：
+///   1. exchange_order_id 精确命中 —— in-doubt 结构性不适用（无 exchange id）；
+///   2. 精确 client_order_id（远端若提供该字段；命中 ≥2 → ambiguous）；
+///   3. 唯一 fingerprint，且**互惠唯一**（本地候选恰 1 且该远端只被本本地命中），
+///      否则 ambiguous —— 绝不自动挑第一个；
+///   4. 无命中 → unresolved（保守持有预留，不释放、不停摆匹配外的其它订单）。
+///
+/// `known_remote_ids` = 本地已通过 exchange_order_id 持有的远端订单，排除避免误配。
+pub fn resolve_in_doubt_orders(
+    local: &[InDoubtOrder],
+    remote_open_orders: &[serde_json::Value],
+    known_remote_ids: &std::collections::HashSet<String>,
+) -> InDoubtResolution {
+    let mut res = InDoubtResolution::default();
+    if local.is_empty() {
+        return res;
+    }
+
+    // 远端候选：排除本地已认领的 exchange order id
+    let remotes: Vec<RemoteOpen> = remote_open_orders
+        .iter()
+        .filter_map(|o| {
+            let id = first_str(o, &["id"])?;
+            if known_remote_ids.contains(&id) {
+                return None;
+            }
+            Some(RemoteOpen {
+                id,
+                client_order_id: first_str(o, &["clientOrderId", "client_order_id"]),
+                token_id: first_str(o, &["asset_id", "assetId", "asset"]),
+                side: first_str(o, &["side"]),
+                price: first_f64(o, &["price"]),
+                size: first_f64(o, &["original_size", "size"]),
+                created_at: first_secs(o, &["created_at", "createdAt"]),
+            })
+        })
+        .collect();
+
+    let mut handled = vec![false; local.len()];
+    let mut bound_remote: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // 优先级 2：精确 client_order_id
+    for (i, l) in local.iter().enumerate() {
+        let hits: Vec<&RemoteOpen> = remotes
+            .iter()
+            .filter(|r| !bound_remote.contains(&r.id))
+            .filter(|r| r.client_order_id.as_deref() == Some(l.client_order_id.as_str()))
+            .collect();
+        if hits.len() == 1 {
+            let r = hits[0];
+            bound_remote.insert(r.id.clone());
+            res.bindings.push(InDoubtBinding {
+                client_order_id: l.client_order_id.clone(),
+                exchange_order_id: r.id.clone(),
+                via: MatchVia::ClientOrderId,
+            });
+            handled[i] = true;
+        } else if hits.len() > 1 {
+            res.ambiguous.push(l.client_order_id.clone());
+            handled[i] = true;
+        }
+    }
+
+    // 优先级 3：唯一 fingerprint（互惠唯一）
+    let mut fp_candidates: Vec<Vec<usize>> = vec![Vec::new(); local.len()];
+    for (i, l) in local.iter().enumerate() {
+        if handled[i] {
+            continue;
+        }
+        for (j, r) in remotes.iter().enumerate() {
+            if bound_remote.contains(&r.id) {
+                continue;
+            }
+            if fingerprint_match(l, r) {
+                fp_candidates[i].push(j);
+            }
+        }
+    }
+    // 每个远端被多少个本地命中（互惠唯一性）
+    let mut remote_hits = vec![0usize; remotes.len()];
+    for c in &fp_candidates {
+        for j in c {
+            remote_hits[*j] += 1;
+        }
+    }
+    for (i, cands) in fp_candidates.iter().enumerate() {
+        if handled[i] {
+            continue;
+        }
+        if cands.len() == 1 && remote_hits[cands[0]] == 1 {
+            let r = &remotes[cands[0]];
+            bound_remote.insert(r.id.clone());
+            res.bindings.push(InDoubtBinding {
+                client_order_id: local[i].client_order_id.clone(),
+                exchange_order_id: r.id.clone(),
+                via: MatchVia::Fingerprint,
+            });
+            handled[i] = true;
+        } else if !cands.is_empty() {
+            // ≥2 远端命中 或 互惠不唯一 → ambiguous，绝不自动挑第一个
+            res.ambiguous.push(local[i].client_order_id.clone());
+            handled[i] = true;
+        }
+        // cands 为空 → 无命中，落入 unresolved
+    }
+
+    // 未绑定 → unresolved（含 ambiguous 合并）
+    for (i, l) in local.iter().enumerate() {
+        if !handled[i] {
+            res.unresolved.push(l.client_order_id.clone());
+        }
+    }
+    for a in &res.ambiguous {
+        if !res.unresolved.contains(a) {
+            res.unresolved.push(a.clone());
+        }
+    }
+    res
 }
 
 // ============================================================================
@@ -1912,5 +2193,206 @@ mod tests {
         let sync = test_sync_host(&server.uri());
         let trades = sync.fetch_trades().await.unwrap();
         assert_eq!(trades.len(), 2);
+    }
+
+    // ------------------------------------------------------------------
+    // B2 / P1-009 — in-doubt 解析
+    // ------------------------------------------------------------------
+
+    fn in_doubt(
+        id: &str,
+        token: &str,
+        side: &str,
+        price: f64,
+        size: f64,
+        created_at: u64,
+    ) -> InDoubtOrder {
+        InDoubtOrder {
+            client_order_id: id.to_string(),
+            token_id: token.to_string(),
+            side: side.to_string(),
+            price,
+            size,
+            created_at,
+        }
+    }
+
+    fn no_known() -> std::collections::HashSet<String> {
+        std::collections::HashSet::new()
+    }
+
+    /// B2：canonical_decimal 固定点归一化（f64 抖动防护）。
+    #[test]
+    fn test_canonical_decimal() {
+        assert_eq!(canonical_decimal(0.6).as_deref(), Some("0.6"));
+        assert_eq!(canonical_decimal(0.6000000000000001).as_deref(), Some("0.6"));
+        assert_eq!(canonical_decimal(100.0).as_deref(), Some("100"));
+        assert_eq!(canonical_decimal(0.0).as_deref(), Some("0"));
+        assert_eq!(canonical_decimal(-0.0).as_deref(), Some("0"));
+        assert_eq!(canonical_decimal(10.0).as_deref(), Some("10"));
+        assert_eq!(canonical_decimal(1.0 / 3.0).as_deref(), Some("0.33333333"));
+        assert_eq!(canonical_decimal(f64::NAN), None);
+        assert_eq!(canonical_decimal(f64::INFINITY), None);
+    }
+
+    /// B2：唯一 fingerprint 命中 → 绑定；远端未提供 created_at/clientOrderId 时按缺失跳过。
+    #[test]
+    fn test_resolve_unique_fingerprint_matches() {
+        let local = vec![in_doubt("c1", "tok-1", "BUY", 0.6, 100.0, 1748779200)];
+        let remote = vec![serde_json::json!({
+            "id": "ex-1",
+            "asset_id": "tok-1",
+            "side": "BUY",
+            "price": "0.60",
+            "original_size": "100.0"
+        })];
+        let res = resolve_in_doubt_orders(&local, &remote, &no_known());
+        assert_eq!(res.bindings.len(), 1);
+        assert_eq!(res.bindings[0].client_order_id, "c1");
+        assert_eq!(res.bindings[0].exchange_order_id, "ex-1");
+        assert_eq!(res.bindings[0].via, MatchVia::Fingerprint);
+        assert!(res.unresolved.is_empty());
+        assert!(res.ambiguous.is_empty());
+        assert!(!res.has_unresolved());
+    }
+
+    /// B2：优先级 2 —— 精确 client_order_id 优先于 fingerprint。
+    #[test]
+    fn test_resolve_client_order_id_priority() {
+        let local = vec![in_doubt("c1", "tok-1", "BUY", 0.6, 100.0, 1748779200)];
+        // price 与本地 fingerprint 不一致，但 clientOrderId 精确回显 → 信任交易所回执
+        let remote = vec![serde_json::json!({
+            "id": "ex-9",
+            "clientOrderId": "c1",
+            "asset_id": "tok-1",
+            "side": "BUY",
+            "price": "0.99",
+            "original_size": "100"
+        })];
+        let res = resolve_in_doubt_orders(&local, &remote, &no_known());
+        assert_eq!(res.bindings.len(), 1);
+        assert_eq!(res.bindings[0].via, MatchVia::ClientOrderId);
+        assert_eq!(res.bindings[0].exchange_order_id, "ex-9");
+        assert!(res.unresolved.is_empty());
+    }
+
+    /// B2：两个完全相同的远端候选 → ambiguous → unresolved，绝不自动挑第一个。
+    #[test]
+    fn test_resolve_ambiguous_stays_unresolved() {
+        let local = vec![in_doubt("c1", "tok-1", "BUY", 0.6, 100.0, 1748779200)];
+        let dup = serde_json::json!({
+            "id": "ex-dup",
+            "asset_id": "tok-1",
+            "side": "BUY",
+            "price": "0.6",
+            "original_size": "100"
+        });
+        let remote = vec![dup.clone(), {
+            let mut d = dup;
+            d["id"] = serde_json::json!("ex-dup-2");
+            d
+        }];
+        let res = resolve_in_doubt_orders(&local, &remote, &no_known());
+        assert!(res.bindings.is_empty());
+        assert_eq!(res.ambiguous, vec!["c1".to_string()]);
+        assert_eq!(res.unresolved, vec!["c1".to_string()]);
+    }
+
+    /// B2：互惠唯一 —— 两个本地命中同一远端 → 双双 ambiguous（单远端不可拆分归属）。
+    #[test]
+    fn test_resolve_reciprocal_uniqueness() {
+        let local = vec![
+            in_doubt("c1", "tok-1", "BUY", 0.6, 100.0, 1748779200),
+            in_doubt("c2", "tok-1", "BUY", 0.6, 100.0, 1748779200),
+        ];
+        let remote = vec![serde_json::json!({
+            "id": "ex-1",
+            "asset_id": "tok-1",
+            "side": "BUY",
+            "price": "0.6",
+            "original_size": "100"
+        })];
+        let res = resolve_in_doubt_orders(&local, &remote, &no_known());
+        assert!(res.bindings.is_empty());
+        assert_eq!(res.unresolved.len(), 2);
+        assert_eq!(res.ambiguous.len(), 2);
+    }
+
+    /// B2：known_remote_ids（本地已认领的 exchange id）必须排除，不得误配。
+    #[test]
+    fn test_resolve_excludes_known_remote_ids() {
+        let local = vec![in_doubt("c1", "tok-1", "BUY", 0.6, 100.0, 1748779200)];
+        let remote = vec![serde_json::json!({
+            "id": "ex-known",
+            "asset_id": "tok-1",
+            "side": "BUY",
+            "price": "0.6",
+            "original_size": "100"
+        })];
+        let known: std::collections::HashSet<String> = ["ex-known".to_string()].into_iter().collect();
+        let res = resolve_in_doubt_orders(&local, &remote, &known);
+        assert!(res.bindings.is_empty());
+        assert_eq!(res.unresolved, vec!["c1".to_string()]);
+        assert!(res.ambiguous.is_empty());
+    }
+
+    /// B2：created_at 归一到秒 —— 远端提供时必须相等；不相等 → 无命中。
+    #[test]
+    fn test_resolve_created_at_mismatch_no_match() {
+        let local = vec![in_doubt("c1", "tok-1", "BUY", 0.6, 100.0, 1748779200)];
+        let remote = vec![serde_json::json!({
+            "id": "ex-1",
+            "asset_id": "tok-1",
+            "side": "BUY",
+            "price": "0.6",
+            "original_size": "100",
+            "created_at": 1748779300u64
+        })];
+        let res = resolve_in_doubt_orders(&local, &remote, &no_known());
+        assert!(res.bindings.is_empty());
+        assert_eq!(res.unresolved, vec!["c1".to_string()]);
+        assert!(res.ambiguous.is_empty());
+    }
+
+    /// B2：token/side 必须原样精确相等（方向错误不得匹配），缺字段 → 无命中。
+    #[test]
+    fn test_resolve_token_side_must_match_exactly() {
+        // side 不一致
+        let local = vec![in_doubt("c1", "tok-1", "BUY", 0.6, 100.0, 1748779200)];
+        let remote = vec![serde_json::json!({
+            "id": "ex-1", "asset_id": "tok-1", "side": "SELL",
+            "price": "0.6", "original_size": "100"
+        })];
+        assert!(resolve_in_doubt_orders(&local, &remote, &no_known())
+            .bindings
+            .is_empty());
+
+        // token 不一致
+        let remote = vec![serde_json::json!({
+            "id": "ex-2", "asset_id": "tok-OTHER", "side": "BUY",
+            "price": "0.6", "original_size": "100"
+        })];
+        assert!(resolve_in_doubt_orders(&local, &remote, &no_known())
+            .bindings
+            .is_empty());
+
+        // 远端缺 price → 无法验证，保守不匹配
+        let remote = vec![serde_json::json!({
+            "id": "ex-3", "asset_id": "tok-1", "side": "BUY",
+            "original_size": "100"
+        })];
+        let res = resolve_in_doubt_orders(&local, &remote, &no_known());
+        assert!(res.bindings.is_empty());
+        assert_eq!(res.unresolved, vec!["c1".to_string()]);
+    }
+
+    /// B2：空输入快速返回；无本地 in-doubt 不做任何事。
+    #[test]
+    fn test_resolve_empty_local_is_noop() {
+        let remote = vec![serde_json::json!({"id": "ex-1"})];
+        let res = resolve_in_doubt_orders(&[], &remote, &no_known());
+        assert!(res.bindings.is_empty());
+        assert!(res.unresolved.is_empty());
+        assert!(!res.has_unresolved());
     }
 }

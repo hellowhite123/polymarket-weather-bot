@@ -453,6 +453,52 @@ impl OrderStore {
             })
             .collect()
     }
+
+    /// B2 / P1-009：返回 in-doubt（下单结果未知）的本地订单快照。
+    ///
+    /// in-doubt 定义：`status == Received` 且尚无 `exchange_order_id`
+    /// （submit 超时 / 5xx / 连接中断，无法得知交易所是否已受理）。
+    /// 这类订单**没有**交易所订单 ID，无法参与 `pending_exchange_order_ids`
+    /// 的按 ID 对账（P1-009 根因），必须单独作为 reconciliation 候选，
+    /// 由 `state_sync::resolve_in_doubt_orders` 匹配远端 open order。
+    pub fn in_doubt_orders(&self) -> Vec<OrderState> {
+        self.orders
+            .read()
+            .unwrap()
+            .values()
+            .filter(|s| s.status == OrderStateStatus::Received && s.exchange_order_id.is_none())
+            .cloned()
+            .collect()
+    }
+
+    /// B2：把 in-doubt 订单绑定到远端唯一命中的 open order（Received → Submitted）。
+    ///
+    /// - 幂等：重复绑定返回 `None`（已 Submitted / 已有 exchange id）——重放对账无副作用。
+    /// - 一对一冲突防护：任何**其他**本地订单已持有同一 `exchange_order_id` 时拒绝。
+    /// - 绑定不改变预留：订单始终是 active，reserve 已持有，无释放/累加。
+    pub fn bind_remote_order(
+        &self,
+        client_order_id: &str,
+        exchange_order_id: &str,
+    ) -> Option<OrderState> {
+        if exchange_order_id.trim().is_empty() {
+            return None;
+        }
+        let mut orders = self.orders.write().unwrap();
+        let duplicate = orders.values().any(|s| {
+            s.client_order_id != client_order_id
+                && s.exchange_order_id.as_deref() == Some(exchange_order_id)
+        });
+        if duplicate {
+            return None;
+        }
+        let state = orders.get_mut(client_order_id)?;
+        if state.status != OrderStateStatus::Received || state.exchange_order_id.is_some() {
+            return None;
+        }
+        state.mark_submitted(exchange_order_id.to_string());
+        Some(state.clone())
+    }
 }
 
 // ============================================================================
@@ -869,5 +915,61 @@ mod tests {
         let active = store.active_orders();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].client_order_id, "a");
+    }
+
+    /// B2 / P1-009：in_doubt_orders 只返回 Received 且无 exchange id 的订单。
+    #[test]
+    fn test_in_doubt_orders_selection() {
+        let store = OrderStore::new();
+        // in-doubt：Received、无 exchange id
+        store.create("doubt".to_string(), "t1".to_string(), "BUY".to_string(), 10.0);
+        // 已提交 → 非 in-doubt
+        store.create("ok".to_string(), "t1".to_string(), "BUY".to_string(), 10.0);
+        if let Some(mut st) = store.get("ok") {
+            st.mark_submitted("ex-ok".to_string());
+            store.upsert(st);
+        }
+        // 终态 → 非 in-doubt
+        store.create("done".to_string(), "t1".to_string(), "BUY".to_string(), 10.0);
+        if let Some(mut st) = store.get("done") {
+            st.update_fill(10.0);
+            store.upsert(st);
+        }
+
+        let in_doubt = store.in_doubt_orders();
+        assert_eq!(in_doubt.len(), 1);
+        assert_eq!(in_doubt[0].client_order_id, "doubt");
+        // in-doubt 不进入按 exchange id 的对账集合
+        assert!(!store.pending_exchange_order_ids().contains("doubt"));
+    }
+
+    /// B2：bind_remote_order 幂等 + 一对一冲突防护 + 绑定后进入对账集合。
+    #[test]
+    fn test_bind_remote_order_idempotent_and_conflict() {
+        let store = OrderStore::new();
+        store.create("a".to_string(), "t1".to_string(), "BUY".to_string(), 10.0);
+        store.create("b".to_string(), "t1".to_string(), "BUY".to_string(), 10.0);
+
+        let bound = store.bind_remote_order("a", "ex-1").expect("首次绑定成功");
+        assert_eq!(bound.status, OrderStateStatus::Submitted);
+        assert_eq!(bound.exchange_order_id.as_deref(), Some("ex-1"));
+        assert!(store.pending_exchange_order_ids().contains("ex-1"));
+
+        // 幂等：再次绑定同一订单 → None（状态不变）
+        assert!(store.bind_remote_order("a", "ex-1").is_none());
+        // 空 exchange id 拒绝
+        assert!(store.bind_remote_order("b", "").is_none());
+        assert!(store
+            .bind_remote_order("b", "   ")
+            .is_none());
+        // 一对一：其他订单已持有 ex-1 → 拒绝
+        assert!(store.bind_remote_order("b", "ex-1").is_none());
+        // 未命中 client_order_id → None
+        assert!(store.bind_remote_order("missing", "ex-2").is_none());
+        // b 仍未绑定
+        assert_eq!(
+            store.get("b").map(|s| s.status),
+            Some(OrderStateStatus::Received)
+        );
     }
 }

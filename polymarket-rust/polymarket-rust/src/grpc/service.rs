@@ -19,7 +19,9 @@ use crate::fast::fill_records::{compute_slippage, FillLedger, FillRecord};
 use crate::fast::market_events::{MarketEvent, TradeEvent};
 use crate::fast::order_state::OrderStore;
 use crate::fast::risk_engine::RiskEngine;
-use crate::fast::state_sync::{RecoveryAction, RecoveryPlan};
+use crate::fast::state_sync::{
+    InDoubtOrder, InDoubtResolution, RecoveryAction, RecoveryPlan,
+};
 use crate::fast::trading_gate::TradingGate;
 use crate::order::OrderFlow;
 use crate::types::enums::{OrderType, Side};
@@ -73,6 +75,27 @@ fn format_unix(secs: u64) -> String {
     chrono::DateTime::<chrono::Utc>::from_timestamp(secs as i64, 0)
         .map(|dt| dt.to_rfc3339())
         .unwrap_or_default()
+}
+
+/// A2 + B2：对账后的 TradingGate 输入决策（fail-closed，可单测）。
+///
+/// - 预留重建失败 → `(false, false)`（A2 冻结语义：预留不一致不得进入 READY）；
+/// - 存在 unresolved（in-doubt 未唯一命中 / 无法分类的消失订单）→ 订单视为未同步，
+///   闸门不得进入 READY（B2 冻结语义）；
+/// - 否则透传 positions / orders 的同步结论。
+pub fn gate_after_reconcile(
+    pos_in_sync: bool,
+    orders_in_sync: bool,
+    reserve_rebuild_ok: bool,
+    unresolved_count: usize,
+) -> (bool, bool) {
+    if !reserve_rebuild_ok {
+        return (false, false);
+    }
+    if unresolved_count > 0 {
+        return (pos_in_sync, false);
+    }
+    (pos_in_sync, orders_in_sync)
 }
 
 /// 根据 CLOB order status 映射执行状态（P0-03 修复：accepted ≠ filled）。
@@ -273,6 +296,70 @@ impl ExecutionServiceImpl {
     pub fn snapshot_pending_exchange_order_ids(&self) -> std::collections::HashSet<String> {
         self.order_store.pending_exchange_order_ids()
     }
+
+    /// B2 / P1-009：in-doubt（下单结果未知）订单快照，供 StateSync 匹配远端 open order。
+    ///
+    /// in-doubt = Received 且无 exchange_order_id（submit 超时 / 5xx，结果未知）；
+    /// 这类订单无法参与按 exchange id 的对账（P1-009 根因），必须单独解析。
+    pub fn snapshot_in_doubt_orders(&self) -> Vec<InDoubtOrder> {
+        self.order_store
+            .in_doubt_orders()
+            .iter()
+            .map(|st| InDoubtOrder {
+                client_order_id: st.client_order_id.clone(),
+                token_id: st.token_id.clone(),
+                side: st.side.clone(),
+                price: st.limit_price,
+                size: st.requested_size,
+                created_at: st.created_at,
+            })
+            .collect()
+    }
+
+    /// B2：应用 in-doubt 解析结果（唯一命中 → Received→Submitted 绑定）。
+    ///
+    /// 幂等：重复应用为 no-op（`bind_remote_order` 对已绑定 / 一对一冲突返回 None），
+    /// 重放对账不产生状态翻转、不改变预留。返回成功绑定数量。
+    pub fn apply_in_doubt_resolution(&self, resolution: &InDoubtResolution) -> usize {
+        let mut bound = 0usize;
+        for b in &resolution.bindings {
+            match self
+                .order_store
+                .bind_remote_order(&b.client_order_id, &b.exchange_order_id)
+            {
+                Some(_) => {
+                    bound += 1;
+                    tracing::info!(
+                        client_order_id = %b.client_order_id,
+                        exchange_order_id = %b.exchange_order_id,
+                        via = ?b.via,
+                        "B2: in-doubt 订单绑定远端 open order（Received → Submitted）"
+                    );
+                }
+                None => tracing::warn!(
+                    client_order_id = %b.client_order_id,
+                    exchange_order_id = %b.exchange_order_id,
+                    "B2: in-doubt 绑定跳过（幂等重放 / 一对一冲突），保持原状态"
+                ),
+            }
+        }
+        for c in &resolution.ambiguous {
+            tracing::warn!(
+                client_order_id = %c,
+                "B2: in-doubt fingerprint 命中不唯一（ambiguous），保持 unresolved"
+            );
+        }
+        for u in &resolution.unresolved {
+            if !resolution.ambiguous.contains(u) {
+                tracing::warn!(
+                    client_order_id = %u,
+                    "B2: in-doubt 无唯一命中，保持 unresolved（保守持有预留，TTL 到期不释放）"
+                );
+            }
+        }
+        bound
+    }
+
     /// 获取当前本地风险状态中的仓位快照。
     ///
     /// 用于 StateSync 启动对账。
@@ -2548,5 +2635,264 @@ mod tests {
         );
         // Filled 终态 → 不得释放：预留仍占用，再要 60 被拒
         assert!(engine.check_and_reserve("tok-c", Side::Buy, 60.0, 60.0, 0).is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // B2 / P1-009 — in-doubt 订单解析（冻结设计 Required Tests）
+    // ------------------------------------------------------------------
+
+    /// B2：gate_after_reconcile 决策表（A2 + B2，fail-closed，可单测）。
+    #[test]
+    fn test_b2_gate_after_reconcile_decision_table() {
+        use crate::fast::trading_gate::TradingGateState;
+
+        // 正常：全部同步 + 预留 OK + 无 unresolved → 双 true（允许进入 READY）
+        assert_eq!(gate_after_reconcile(true, true, true, 0), (true, true));
+        // positions 不同步 → 透传
+        assert_eq!(gate_after_reconcile(false, true, true, 0), (false, true));
+        // A2：预留重建失败 → 强制 (false, false)
+        assert_eq!(gate_after_reconcile(true, true, false, 0), (false, false));
+        assert_eq!(gate_after_reconcile(true, true, false, 3), (false, false));
+        // B2：unresolved>0（in-doubt 未唯一命中 / 消失订单无法分类）→ 订单不进同步
+        assert_eq!(gate_after_reconcile(true, true, true, 1), (true, false));
+        assert_eq!(gate_after_reconcile(false, true, true, 1), (false, false));
+        // 闸门层验证：unresolved → 不得 READY（停新单）
+        let gate = TradingGate::new();
+        let (p, o) = gate_after_reconcile(true, true, true, 2);
+        gate.reconcile_complete(p, o);
+        assert_ne!(gate.state(), TradingGateState::Ready);
+        // 干净时才允许 READY
+        let gate2 = TradingGate::new();
+        let (p2, o2) = gate_after_reconcile(true, true, true, 0);
+        gate2.reconcile_complete(p2, o2);
+        assert_eq!(gate2.state(), TradingGateState::Ready);
+    }
+
+    /// B2：唯一 fingerprint 命中 → Received→Submitted 绑定，进入按 ID 对账集合，预留不变。
+    #[tokio::test]
+    async fn test_b2_unique_remote_match_progresses_to_submitted() {
+        use crate::fast::order_state::OrderStateStatus;
+        use crate::fast::state_sync::resolve_in_doubt_orders;
+
+        let mut service = ExecutionServiceImpl::new_mock();
+        let re = Arc::new(RiskEngine::new(RiskConfig::default()));
+        service.set_risk_engine(re.clone());
+
+        // in-doubt 订单：Received、无 exchange_order_id；预留 60（100 × 0.60）已持有
+        service.order_store.create(
+            "c-b2".to_string(),
+            "tok-b2".to_string(),
+            "BUY".to_string(),
+            100.0,
+        );
+        service.order_store.set_limit_price("c-b2", 0.60);
+        if let Some(mut st) = service.order_store.get("c-b2") {
+            st.created_at = 1748779200;
+            service.order_store.upsert(st);
+        }
+        re.check_and_reserve("tok-b2", Side::Buy, 60.0, 100.0, 50)
+            .unwrap();
+        assert_eq!(re.committed_total(), 60.0);
+
+        let in_doubt = service.snapshot_in_doubt_orders();
+        assert_eq!(in_doubt.len(), 1);
+        // P1-009 根因：in-doubt 不在按 exchange id 的对账集合
+        assert!(service.snapshot_pending_exchange_order_ids().is_empty());
+
+        let remote = vec![serde_json::json!({
+            "id": "ex-b2",
+            "asset_id": "tok-b2",
+            "side": "BUY",
+            "price": "0.60000000",
+            "original_size": "100"
+        })];
+        let known = service.snapshot_pending_exchange_order_ids();
+        let resolution = resolve_in_doubt_orders(&in_doubt, &remote, &known);
+        assert_eq!(resolution.bindings.len(), 1);
+        assert_eq!(resolution.bindings[0].exchange_order_id, "ex-b2");
+        assert!(!resolution.has_unresolved());
+        assert_eq!(service.apply_in_doubt_resolution(&resolution), 1);
+
+        // Received → Submitted + exchange id，此后走正常 ID 对账
+        let st = service.order_store.get("c-b2").unwrap();
+        assert_eq!(st.status, OrderStateStatus::Submitted);
+        assert_eq!(st.exchange_order_id.as_deref(), Some("ex-b2"));
+        assert!(service
+            .snapshot_pending_exchange_order_ids()
+            .contains("ex-b2"));
+        assert!(service.snapshot_in_doubt_orders().is_empty());
+        // 绑定不改变预留（无释放、无累加）
+        assert_eq!(re.committed_total(), 60.0);
+    }
+
+    /// B2：fingerprint 命中 ≥2 → ambiguous → unresolved，绝不自动绑定，闸门不 READY。
+    #[tokio::test]
+    async fn test_b2_ambiguous_fingerprint_stays_unresolved() {
+        use crate::fast::order_state::OrderStateStatus;
+        use crate::fast::state_sync::resolve_in_doubt_orders;
+        use crate::fast::trading_gate::TradingGateState;
+
+        let mut service = ExecutionServiceImpl::new_mock();
+        let re = Arc::new(RiskEngine::new(RiskConfig::default()));
+        service.set_risk_engine(re.clone());
+
+        service.order_store.create(
+            "c-amb".to_string(),
+            "tok-amb".to_string(),
+            "BUY".to_string(),
+            100.0,
+        );
+        service.order_store.set_limit_price("c-amb", 0.60);
+        re.check_and_reserve("tok-amb", Side::Buy, 60.0, 100.0, 50)
+            .unwrap();
+
+        let mk = |id: &str| {
+            serde_json::json!({
+                "id": id, "asset_id": "tok-amb", "side": "BUY",
+                "price": "0.6", "original_size": "100"
+            })
+        };
+        let in_doubt = service.snapshot_in_doubt_orders();
+        let remote = vec![mk("ex-a"), mk("ex-b")];
+        let known = service.snapshot_pending_exchange_order_ids();
+        let resolution = resolve_in_doubt_orders(&in_doubt, &remote, &known);
+
+        assert!(resolution.bindings.is_empty());
+        assert_eq!(resolution.ambiguous, vec!["c-amb".to_string()]);
+        assert!(resolution.has_unresolved());
+        assert_eq!(
+            service.apply_in_doubt_resolution(&resolution),
+            0,
+            "ambiguous 不得绑定"
+        );
+
+        // 仍 in-doubt：Received、无 exchange id
+        let st = service.order_store.get("c-amb").unwrap();
+        assert_eq!(st.status, OrderStateStatus::Received);
+        assert!(st.exchange_order_id.is_none());
+        // 预留保守持有
+        assert_eq!(re.committed_total(), 60.0);
+        // 闸门不 READY
+        let (p, o) = gate_after_reconcile(true, true, true, resolution.unresolved.len());
+        let gate = TradingGate::new();
+        gate.reconcile_complete(p, o);
+        assert_ne!(gate.state(), TradingGateState::Ready);
+    }
+
+    /// B2：无唯一命中 → unresolved 保守持有预留；TTL 到期不构成释放授权
+    ///（实现中不存在任何按时间释放预留的路径），闸门保持非 READY。
+    #[tokio::test]
+    async fn test_b2_unmatched_keeps_reserve_no_ttl_release() {
+        use crate::fast::order_state::OrderStateStatus;
+        use crate::fast::state_sync::resolve_in_doubt_orders;
+        use crate::fast::trading_gate::TradingGateState;
+
+        let mut service = ExecutionServiceImpl::new_mock();
+        let re = Arc::new(RiskEngine::new(RiskConfig::default()));
+        service.set_risk_engine(re.clone());
+
+        service.order_store.create(
+            "c-ttl".to_string(),
+            "tok-ttl".to_string(),
+            "BUY".to_string(),
+            100.0,
+        );
+        service.order_store.set_limit_price("c-ttl", 0.60);
+        if let Some(mut st) = service.order_store.get("c-ttl") {
+            // 远古时间：即使 TTL 已远超任何时限也不释放
+            st.created_at = 1748779200;
+            service.order_store.upsert(st);
+        }
+        re.check_and_reserve("tok-ttl", Side::Buy, 60.0, 100.0, 50)
+            .unwrap();
+
+        let in_doubt = service.snapshot_in_doubt_orders();
+        let known = service.snapshot_pending_exchange_order_ids();
+        let resolution = resolve_in_doubt_orders(&in_doubt, &[], &known);
+        assert!(resolution.bindings.is_empty());
+        assert_eq!(resolution.unresolved, vec!["c-ttl".to_string()]);
+        assert_eq!(service.apply_in_doubt_resolution(&resolution), 0);
+
+        // 预留仍持有：无 TTL 释放路径，unresolved 不动预留
+        assert_eq!(re.committed_total(), 60.0);
+        assert_eq!(
+            service.order_store.get("c-ttl").map(|s| s.status),
+            Some(OrderStateStatus::Received)
+        );
+
+        // 闸门：unresolved → 非 READY（停新单，等待人工/后续对账分类）
+        let (p, o) = gate_after_reconcile(true, true, true, resolution.unresolved.len());
+        assert!(p && !o);
+        let gate = TradingGate::new();
+        gate.reconcile_complete(p, o);
+        assert_ne!(gate.state(), TradingGateState::Ready);
+    }
+
+    /// B2：解析结果重放（重连/重复对账后再应用）为 no-op：
+    /// 不翻转状态、不重复绑定、不改变预留。
+    #[tokio::test]
+    async fn test_b2_resolve_replay_is_noop() {
+        use crate::fast::order_state::OrderStateStatus;
+        use crate::fast::state_sync::resolve_in_doubt_orders;
+
+        let mut service = ExecutionServiceImpl::new_mock();
+        let re = Arc::new(RiskEngine::new(RiskConfig::default()));
+        service.set_risk_engine(re.clone());
+
+        service.order_store.create(
+            "c-replay".to_string(),
+            "tok-r".to_string(),
+            "BUY".to_string(),
+            100.0,
+        );
+        service.order_store.set_limit_price("c-replay", 0.60);
+        if let Some(mut st) = service.order_store.get("c-replay") {
+            st.created_at = 1748779200;
+            service.order_store.upsert(st);
+        }
+        re.check_and_reserve("tok-r", Side::Buy, 60.0, 100.0, 50)
+            .unwrap();
+
+        let remote = vec![serde_json::json!({
+            "id": "ex-r",
+            "asset_id": "tok-r",
+            "side": "BUY",
+            "price": "0.6",
+            "original_size": "100",
+            "created_at": 1748779200u64
+        })];
+
+        // 第一次解析：绑定成功
+        let in_doubt = service.snapshot_in_doubt_orders();
+        let known = service.snapshot_pending_exchange_order_ids();
+        let resolution = resolve_in_doubt_orders(&in_doubt, &remote, &known);
+        assert_eq!(service.apply_in_doubt_resolution(&resolution), 1);
+
+        // 重放同一解析结果 → no-op（已绑定，bind 返回 None）
+        assert_eq!(service.apply_in_doubt_resolution(&resolution), 0);
+
+        // 后续快照：已无 in-doubt → 再解析也是 no-op
+        let in_doubt2 = service.snapshot_in_doubt_orders();
+        assert!(in_doubt2.is_empty());
+        let known2 = service.snapshot_pending_exchange_order_ids();
+        let resolution2 = resolve_in_doubt_orders(&in_doubt2, &remote, &known2);
+        assert!(resolution2.bindings.is_empty());
+        assert!(!resolution2.has_unresolved());
+        assert_eq!(service.apply_in_doubt_resolution(&resolution2), 0);
+
+        // 状态 / 预留稳定
+        let st = service.order_store.get("c-replay").unwrap();
+        assert_eq!(st.status, OrderStateStatus::Submitted);
+        assert_eq!(st.exchange_order_id.as_deref(), Some("ex-r"));
+        assert_eq!(re.committed_total(), 60.0);
+    }
+
+    /// B2 Required Test（显式 DEFERRED，DCR-001 方案 A）：
+    /// durable-restart（进程重启后恢复 in-doubt 订单与预留）不可编写——
+    /// OrderStore/RiskEngine 为内存态，durable persistence 明确不实现（需新 DCR + Human 批准）。
+    #[test]
+    #[ignore = "DEFERRED per DCR-001 方案 A（durable persistence 未实现）"]
+    fn test_b2_durable_restart_recovery_deferred() {
+        panic!("DEFERRED: durable persistence 未实现，需新 DCR + Human 批准后补写");
     }
 }

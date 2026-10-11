@@ -25,6 +25,7 @@ use polymarket_rust::fast::market_events::MarketEventPoller;
 use polymarket_rust::fast::risk_engine::{RiskConfig, RiskEngine};
 use polymarket_rust::fast::state_sync::StateSync;
 use polymarket_rust::fast::trading_gate::{TradingGate, TradingGateState};
+use polymarket_rust::grpc::service::gate_after_reconcile;
 use polymarket_rust::grpc::{consume_trade_events, serve, ExecutionServiceImpl};
 use polymarket_rust::order::OrderFlow;
 use polymarket_rust::types::Chain;
@@ -172,23 +173,62 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // B2 / P1-009：in-doubt（下单结果未知）订单解析 —— 与 P1-031 预留重建共用一次拉取。
+    // 绑定必须先于预留重建：绑定后订单进入 pending 集合，重建才按 exchange id 正确计额。
+    // 启动时 OrderStore 为内存空态，in_doubt 正常为空；非空走同一解析路径（测试可注入）。
+    let in_doubt = service.snapshot_in_doubt_orders();
+    let mut in_doubt_unresolved = 0usize;
+    let fetched_open_orders: Option<Vec<serde_json::Value>> = if !in_doubt.is_empty() {
+        match state_sync.fetch_open_orders().await {
+            Ok(open_orders) => Some(open_orders),
+            Err(e) => {
+                in_doubt_unresolved = in_doubt.len();
+                tracing::error!(
+                    "B2: 拉取 open orders 解析 in-doubt 失败，全部保持 unresolved（FAIL-CLOSED）: {e}"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(open_orders) = &fetched_open_orders {
+        let known = service.snapshot_pending_exchange_order_ids();
+        let resolution = state_sync.resolve_in_doubt_orders(&in_doubt, open_orders, &known);
+        in_doubt_unresolved = resolution.unresolved.len();
+        let bound = service.apply_in_doubt_resolution(&resolution);
+        if bound > 0 {
+            tracing::info!("B2: 启动 in-doubt 订单绑定远端 open order {bound} 项");
+        }
+        if in_doubt_unresolved > 0 {
+            tracing::error!(
+                "B2: 启动有 {in_doubt_unresolved} 个 in-doubt 订单无法唯一匹配，保持 unresolved（FAIL-CLOSED）"
+            );
+        }
+    }
+
     // P1-031 / A2：重建远端仍 open 订单的预留额度（sync_position 清空 reserved 后）。
     // A2：重建失败必须 fail-closed —— 不得在预留不一致时进入 READY。
     let mut reserve_rebuild_ok = true;
-    match state_sync.fetch_open_orders().await {
-        Ok(open_orders) => {
-            service.rebuild_open_order_reserves(&open_orders);
-            tracing::info!(
-                "StateSync 已按 {} 个远端 open 订单重建预留额度",
-                open_orders.len()
-            );
-        }
-        Err(e) => {
-            reserve_rebuild_ok = false;
-            tracing::error!(
-                "StateSync 重建 open 订单预留失败 —— FAIL-CLOSED，保持 TradingGate=Reconciling: {e}"
-            );
-        }
+    let rebuild_open_orders: Option<Vec<serde_json::Value>> = match fetched_open_orders {
+        Some(o) => Some(o),
+        None => match state_sync.fetch_open_orders().await {
+            Ok(o) => Some(o),
+            Err(e) => {
+                reserve_rebuild_ok = false;
+                tracing::error!(
+                    "StateSync 重建 open 订单预留失败 —— FAIL-CLOSED，保持 TradingGate=Reconciling: {e}"
+                );
+                None
+            }
+        },
+    };
+    if let Some(open_orders) = &rebuild_open_orders {
+        service.rebuild_open_order_reserves(open_orders);
+        tracing::info!(
+            "StateSync 已按 {} 个远端 open 订单重建预留额度",
+            open_orders.len()
+        );
     }
 
     // 恢复后再快照并重新对账，得到权威同步结论（驱动 TradingGate）
@@ -208,11 +248,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 );
     // ★ 只有持仓和订单都完全同步，才允许进入 READY（决策逻辑见 TradingGate::reconcile_complete，可单测）。
     // A2：预留重建失败时**强制**不进入 READY（fail-closed）。
+    // B2：存在 unresolved（含 in-doubt 未唯一命中）→ 订单视为未同步，同样不进入 READY。
+    let unresolved_total = recovery.unresolved_orders.len() + in_doubt_unresolved;
+    let (pos_ok, ord_ok) =
+        gate_after_reconcile(pos_report.in_sync, order_report.in_sync, reserve_rebuild_ok, unresolved_total);
+    trading_gate.reconcile_complete(pos_ok, ord_ok);
     if !reserve_rebuild_ok {
-        trading_gate.reconcile_complete(false, false);
         tracing::error!("StateSync 启动预留重建失败，TradingGate 保持 Reconciling（FAIL-CLOSED）");
-    } else {
-        trading_gate.reconcile_complete(pos_report.in_sync, order_report.in_sync);
+    } else if unresolved_total > 0 {
+        tracing::error!(
+            "StateSync 启动存在 {unresolved_total} 个 unresolved 订单（含 in-doubt），TradingGate 保持非 READY（FAIL-CLOSED）"
+        );
     }
     if trading_gate.state() == TradingGateState::Ready {
         tracing::info!("StateSync 启动对账通过，TradingGate -> READY");
@@ -242,14 +288,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .await
                 {
                     Ok((pos, ord, recovery)) => {
+                        // B2 / P1-009：in-doubt（下单结果未知）订单解析 —— 与预留重建共用一次拉取。
+                        // 绑定先于 apply_recovery / 预留重建：绑定不改变预留，重建按 pending 集合计额。
+                        let in_doubt = svc.snapshot_in_doubt_orders();
+                        let mut in_doubt_unresolved = 0usize;
+                        let mut fetched_open_orders: Option<Vec<serde_json::Value>> = None;
+                        if !in_doubt.is_empty() {
+                            match ss.fetch_open_orders().await {
+                                Ok(open_orders) => fetched_open_orders = Some(open_orders),
+                                Err(e) => {
+                                    in_doubt_unresolved = in_doubt.len();
+                                    tracing::error!(
+                                        "B2: 拉取 open orders 解析 in-doubt 失败，全部保持 unresolved（FAIL-CLOSED）: {e}"
+                                    );
+                                }
+                            }
+                        }
+                        if let Some(open_orders) = &fetched_open_orders {
+                            let known = svc.snapshot_pending_exchange_order_ids();
+                            let resolution =
+                                ss.resolve_in_doubt_orders(&in_doubt, open_orders, &known);
+                            in_doubt_unresolved = resolution.unresolved.len();
+                            let bound = svc.apply_in_doubt_resolution(&resolution);
+                            if bound > 0 {
+                                tracing::info!("B2: in-doubt 订单绑定远端 open order {bound} 项");
+                            }
+                            if in_doubt_unresolved > 0 {
+                                tracing::error!(
+                                    "B2: {in_doubt_unresolved} 个 in-doubt 订单无法唯一匹配，保持 unresolved（FAIL-CLOSED）"
+                                );
+                            }
+                        }
+
                         // P1-032：后台对账发现差异 → 先降级 TradingGate 停新单（FAIL-CLOSED）。
                         // reconcile_complete 不会覆盖 Halted（halt 是闩锁），差异时把 Ready→Reconciling。
-                        if !pos.in_sync || !ord.in_sync {
+                        // B2：in-doubt 未唯一命中同样停新单（状态未知不放行新单）。
+                        if !pos.in_sync || !ord.in_sync || in_doubt_unresolved > 0 {
                             tg.reconcile_complete(false, false);
                             tracing::warn!(
-                                "StateSync 后台对账发现差异，TradingGate -> Reconciling（停新单）: positions_in_sync={}, orders_in_sync={}",
+                                "StateSync 后台对账发现差异，TradingGate -> Reconciling（停新单）: positions_in_sync={}, orders_in_sync={}, in_doubt_unresolved={}",
                                 pos.in_sync,
                                 ord.in_sync,
+                                in_doubt_unresolved,
                             );
                         }
 
@@ -283,49 +363,72 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             })
                             .collect();
                         if !rebuilt_tokens.is_empty() {
-                            match ss.fetch_open_orders().await {
-                                Ok(open_orders) => svc.rebuild_open_order_reserves_filtered(
-                                    &open_orders,
+                            // B2：优先复用 in-doubt 解析时拉取的 open orders（同一份远端快照）
+                            let open_orders = match fetched_open_orders.take() {
+                                Some(o) => Some(o),
+                                None => match ss.fetch_open_orders().await {
+                                    Ok(o) => Some(o),
+                                    Err(e) => {
+                                        rebuild_failed = true;
+                                        tracing::error!(
+                                            "StateSync 后台重建 open 订单预留失败 —— FAIL-CLOSED，保持 TradingGate=Reconciling: {e}"
+                                        );
+                                        None
+                                    }
+                                },
+                            };
+                            if let Some(open_orders) = &open_orders {
+                                svc.rebuild_open_order_reserves_filtered(
+                                    open_orders,
                                     Some(&rebuilt_tokens),
-                                ),
-                                Err(e) => {
-                                    rebuild_failed = true;
-                                    tracing::error!(
-                                        "StateSync 后台重建 open 订单预留失败 —— FAIL-CLOSED，保持 TradingGate=Reconciling: {e}"
-                                    );
-                                }
+                                );
                             }
                         }
 
                         // P1-032：发生过差异或恢复动作后，复核对账确认一致才回 Ready。
                         // apply_recovery 改了本地状态，需重新快照后再对账，否则拿的是旧快照。
+                        // B2：in_doubt_unresolved>0 同样触发复核且不得回 Ready。
                         if !pos.in_sync
                             || !ord.in_sync
                             || applied > 0
                             || recovery.has_unresolved()
                             || rebuild_failed
+                            || in_doubt_unresolved > 0
                         {
                             let local_positions = svc.snapshot_positions().await;
                             let local_orders = svc.snapshot_pending_exchange_order_ids();
                             match ss.full_reconcile(&local_positions, &local_orders).await {
                                 Ok((pos2, ord2)) => {
+                                    // A2 + B2 统一闸门决策（fail-closed，可单测）：
+                                    // 预留重建失败 → (false,false)；unresolved>0 → 订单不进 READY。
+                                    let unresolved_total = recovery.unresolved_orders.len()
+                                        + in_doubt_unresolved;
+                                    let (p_ok, o_ok) = gate_after_reconcile(
+                                        pos2.in_sync,
+                                        ord2.in_sync,
+                                        !rebuild_failed,
+                                        unresolved_total,
+                                    );
+                                    tg.reconcile_complete(p_ok, o_ok);
                                     if rebuild_failed {
-                                        tg.reconcile_complete(false, false);
                                         tracing::error!(
                                             "StateSync 后台预留重建失败，TradingGate 保持 Reconciling（FAIL-CLOSED）"
                                         );
-                                    } else {
-                                        tg.reconcile_complete(pos2.in_sync, ord2.in_sync);
+                                    } else if unresolved_total > 0 {
+                                        tracing::warn!(
+                                            "StateSync 后台存在 {unresolved_total} 个 unresolved 订单（含 in-doubt），TradingGate 保持非 READY"
+                                        );
                                     }
-                                    if pos2.in_sync && ord2.in_sync {
+                                    if p_ok && o_ok {
                                         tracing::info!(
                                             "StateSync 后台对账复核一致，TradingGate -> Ready"
                                         );
                                     } else {
                                         tracing::warn!(
-                                            "StateSync 后台对账复核仍不一致，保持 Reconciling: positions_in_sync={}, orders_in_sync={}",
+                                            "StateSync 后台对账复核仍不一致，保持 Reconciling: positions_in_sync={}, orders_in_sync={}, unresolved={}",
                                             pos2.in_sync,
                                             ord2.in_sync,
+                                            unresolved_total,
                                         );
                                     }
                                 }
