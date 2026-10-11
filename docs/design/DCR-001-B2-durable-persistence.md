@@ -1,6 +1,6 @@
 # DCR-001 — B2 (P1-009) 持久化/重启恢复语义冲突
 
-- **状态**：`OPEN — 待 Human 批准`（批准前 B2 实施**冻结**）
+- **状态**：`APPROVED — 方案 A（2026-10-04，Human 批准）`
 - **触发**：`docs/INSTRUCTION_TO_OPENCODE_ROUND05_B_IMPLEMENTATION.md` §B2 vs `docs/design/ROUND05_B_DESIGN_DRAFTS.md`（Design V2）B2 §1
 - **触发规则**：实施指令 §0 L21 / §B2 Stop condition L194（「durable persistence 未冻结 → 停止并提交 DCR」）
 
@@ -41,5 +41,5 @@ B2 / P1-009 Unknown Order Reconciliation。
 - A：`fast/order_state.rs`、`grpc/service.rs`、`bin/server.rs`、`fast/state_sync.rs`（无持久化文件）。
 - B：外加持久化新文件 + 可能的 `proto/polymarket.proto`。
 
-## 10. 请求人工批准
-请批准 **方案 A** 或 **方案 B**。未获批准前，B2 实施保持冻结；B1/B3/B4/B5 不受此冲突影响（可单独推进，待确认）。
+## 10. 批准结果
+**已批准方案 A**（2026-10-04）：维持冻结语义「不支持跨重启」；实施 in-doubt 对账候选 + 匹配优先级 + TTL 不释放 + 进程内幂等；「Durable state survives restart」测试标 `DEFERRED`；**不新增持久化文件**。B2 恢复实施。

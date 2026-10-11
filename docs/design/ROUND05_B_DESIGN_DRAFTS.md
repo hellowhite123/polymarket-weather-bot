@@ -104,7 +104,8 @@ unknown limit → 不声称精确释放；order 进入 UNRESOLVED；reserve 保�
 
 # B2 — P1-009 Unknown Order Reconciliation
 
-**结论：`CHANGES_REQUESTED` → Design V2 冻结如下；`WAITING_AUTHORIZATION`。**
+**结论：`CHANGES_REQUESTED` → Design V2 冻结如下。**
+**状态（2026-10-07）：🔧 FIXED —— 按 DCR-001 方案 A（Human 已批准）实施完毕，见 §9 实施注记；durable-restart 测试 `DEFERRED`。**
 
 ## 1. Durable persistence（冻结：**明确不支持跨重启**）
 当前 `OrderStore` 为**纯内存**（`RwLock<HashMap>`，`fast/order_state.rs`），无持久化。
@@ -151,6 +152,14 @@ unknown limit → 不声称精确释放；order 进入 UNRESOLVED；reserve 保�
 in-doubt 不进入 READY；remote open order 唯一命中→Submitted；ambiguous fingerprint→unresolved；TTL 到期 reserve 不释放；restart/replay no-op；duplicate trade 不重复入账；缺失 trade_id 不产生 fill；durable 恢复后仍可对账（**当前不支持，测试标注 skip/预期不通过**）。
 
 > ⚠️ **冲突声明**：§1 冻结「不支持跨重启」，故 Required Test「durable state 恢复后仍可继续 reconciliation」在**本设计范围内不成立**，标记为 `DEFERRED`（需先立项 durable persistence）。
+
+## 9. 实施注记（B2 FIXED，2026-10-07）
+- **DCR-001 方案 A 已批准**：不新增持久化文件；durable-restart 测试写为 `#[ignore] = "DEFERRED per DCR-001 方案 A"`。
+- **§2 命名适配**：设计中的 `in_doubt_client_order_ids()` 实现为 `OrderStore::in_doubt_orders()`（返回完整 `OrderState` 快照）+ `service.snapshot_in_doubt_orders()`（提取指纹要素 `InDoubtOrder{client_order_id, token_id, side, price, size, created_at}`）——匹配所需字段多于纯 id，语义与设计意图一致。
+- **§3 可选字段比较规则（澄清）**：`token_id` / `side` / `price` / `size` 双方**必须提供且相等**（缺任一 → 不匹配，保守）；`created_at` 归一到秒后，**远端提供时必须相等**、双方缺失则跳过；远端未提供 `clientOrderId`/`client_order_id` 时跳过优先级 2，回落 fingerprint。
+- **§4 互惠唯一（澄清）**：fingerprint 命中要求「本地候选恰 1 **且**该远端仅被本本地命中」；≥2 远端命中或互惠不唯一 → `ambiguous` ⊂ `unresolved`，**绝不自动挑第一个**。
+- **§5 TTL**：实现中**不存在任何按时间释放预留的路径**（unresolved 持有直至人工/后续对账分类）；测试 `test_b2_unmatched_keeps_reserve_no_ttl_release` 用远古 `created_at` 断言不释放。
+- **闸门统一入口**：`grpc::service::gate_after_reconcile(pos_in_sync, orders_in_sync, reserve_rebuild_ok, unresolved_count)` 汇总 A2+B2 fail-closed 决策；`bin/server.rs` 启动与后台对账均改走此入口，unresolved 从「仅日志」升级为**驱动非 READY**。
 
 ---
 
@@ -306,9 +315,9 @@ encrypted keystore (AES-256-GCM)                       keystore.rs
 
 | # | Gap | 证据 | 影响 |
 |---|-----|------|------|
-| G1 | `RiskEngine::on_fill` 无 order_id/limit_price | `risk_engine.rs` `on_fill(token,side,qty,notional)` | B1 order-level release 需上层适配 |
-| G2 | `OrderStore` 纯内存，无持久化 | `fast/order_state.rs` | B2 跨重启恢复不支持 |
-| G3 | `pending_exchange_order_ids()` 排除 `Received` | `order_state.rs:438+` | B2 in-doubt 订单被对账忽略 |
+| G1 | `RiskEngine::on_fill` 无 order_id/limit_price | `risk_engine.rs` `on_fill(token,side,qty,notional)` | B1 order-level release 需上层适配 → **B1 FIXED**（`on_fill(..., reserve_release)` 适配层） |
+| G2 | `OrderStore` 纯内存，无持久化 | `fast/order_state.rs` | B2 跨重启恢复不支持（DCR-001 方案 A：接受并 DEFERRED） |
+| G3 | `pending_exchange_order_ids()` 排除 `Received` | `order_state.rs:438+` | B2 in-doubt 订单被对账忽略 → **B2 FIXED**（`in_doubt_orders()` 独立通道） |
 | G4 | `position_notionals` 无生产写入点 | `aggregator/models.py:170/199-200/219` | B3 生产链未闭合 |
 | G5 | Python `risk_gate` 用 shares 比 USDC 上限 | `risk_gate.py:131-140/151-160` | B3 单位混淆误拒 |
 | G6 | Python/Rust 上限双默认（1000 vs 500） | `aggregator.py` vs `risk_engine.rs:52` | B3 双权威 |
@@ -321,14 +330,15 @@ encrypted keystore (AES-256-GCM)                       keystore.rs
 # 7. 状态与交付
 
 ```
-B1  CHANGES_REQUESTED → Design V2 已冻结  WAITING_AUTHORIZATION
-B2  CHANGES_REQUESTED → Design V2 已冻结  WAITING_AUTHORIZATION（含 DEFERRED: durable recovery）
-B3  CHANGES_REQUESTED → Design V2 已冻结  WAITING_AUTHORIZATION（含 4 份证据）
+B1  CHANGES_REQUESTED → Design V2 已冻结  FIXED（8 测试 + mutation；commit ee839be）
+B2  CHANGES_REQUESTED → Design V2 已冻结  FIXED per DCR-001 方案 A（15 测试 + mutation 2×3 FAILED；durable recovery DEFERRED）
+B3  CHANGES_REQUESTED → Design V2 已冻结  WAITING_AUTHORIZATION（含 4 份证据；需先确认 proto RiskState 配置字段）
 B4  CHANGES_REQUESTED → Design V2 已冻结  WAITING_AUTHORIZATION
 B5  CODE PASS / PENDING_EVIDENCE（trace 已补）
 C1  BLOCKED（环境无 Docker）
 ROUND 05  LIVE NO-GO
 ```
 
-**未做**：未改任何 Rust/Python/proto/配置/部署代码；未将任何 Finding 标 VERIFIED/CLOSED。
-**下一步**：Hermes 独立二审 + Human 授权 → 方可实施（实施后仍需 Hermes 代码审计 → VERIFIED/CLOSED）。
+**已实施**：B1、B2（未改 proto/交易语义/RiskConfig 阈值；B2 未新增持久化文件）。
+**未做**：未将任何 Finding 标 VERIFIED/CLOSED。
+**下一步**：B2 由 Hermes 独立代码审计 → VERIFIED/CLOSED；B3–B5 待 Human 授权（B3 先确认 proto 变更）。

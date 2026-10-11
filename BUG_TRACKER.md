@@ -124,7 +124,7 @@
 
 > 独立审查方另确认：P1-035 维持 `FIXED / Verification Pending`，不得由实施者自证 VERIFIED。
 >
-> **Round 04 P1 实施登记（G4，09-17）**：`P1-RISK-006`（取消不释放预留）🔧 FIXED（G4，待 VERIFIED）；`P1-RISK-007`（后台不重建 open 预留）🔧 FIXED（G4，待 VERIFIED）；`P1-RISK-008`（成交价优于限价的预留残余）、`P1-EXEC-009`（未知结果订单被对账输入集排除）⬜ 需设计/显式授权（涉及 Risk Model 记账 / 对账语义）。
+> **Round 04 P1 实施登记（G4，09-17）**：`P1-RISK-006`（取消不释放预留）🔧 FIXED（G4，待 VERIFIED）；`P1-RISK-007`（后台不重建 open 预留）🔧 FIXED（G4，待 VERIFIED）；`P1-RISK-008`（成交价优于限价的预留残余）⬜→ 已由 Round 05 B1 覆盖（09-17 时需设计授权；2026-10-04 设计 B1 冻结、`ee839be` 实施 FIXED，待 VERIFIED）；`P1-EXEC-009`（未知结果订单被对账输入集排除）⬜→ 已由 Round 05 B2 覆盖（设计 B2 冻结 + DCR-001 方案 A 2026-10-04 批准，2026-10-07 实施 FIXED，待 VERIFIED）。
 
 ---
 
@@ -140,13 +140,15 @@
 
 > 编号沿用 `round 5.md`（P1-006~014）；与既有「三、P1 清单」的 P1-006~010（09-10 批次）**同号不同义**，此处按 Round05 文档口径记录。
 > 实施者仅登记 **FIXED / WAITING_AUTHORIZATION / BLOCKED**；**不写 VERIFIED/CLOSED**。
+>
+> **进度注记（2026-10-07）**：A1–A8 🔧 FIXED（commit `7c75285`）；B1 🔧 FIXED（commit `ee839be`，8 测试 + mutation 7 FAILED）；**B2 🔧 FIXED（2026-10-07，15 测试 + mutation 2×3 FAILED，durable-restart DEFERRED per DCR-001 方案 A，尚未提交）**；B3（P1-RISK-UNIT-001，最高优先）、B4、B5 ⛔ WAITING_AUTHORIZATION（B3 须先确认 proto `RiskState` 配置字段变更）；C1 BLOCKED（无 Docker）。全部 FIXED 项均待独立方三重证据 → VERIFIED，实施者不自证。
 
 | 编号(round5) | 问题 | 状态 | 关键点 |
 |---|---|---|---|
 | P1-006 | Cancel 未释放 reserve / OrderStore 未同步 | 🔧 FIXED | `settle_cancel` 先活动态→Cancelled 成功再释放；client/exchange 两路径；`limit_price≤0` fail-closed；5 测试+mutation |
 | P1-007 | Reconcile 未重建 open-order reserve | 🔧 FIXED（集成测试待 Docker） | 启动+后台重建失败**强制 fail-closed 不进入 READY**；`bin/server.rs` |
 | P1-008 | on_fill 用 filled notional 抵扣 limit×qty reserve | 🔧 FIXED | 订单级释放按 `limit_price×增量`；成交暴露按执行价；身份/限价未知**保守持有**待对账；8 测试+mutation 7 FAILED（`fast/risk_engine.rs`、`grpc/service.rs`） |
-| P1-009 | Unknown Result=Received 被 reconcile 排除 | ⛔ WAITING_AUTHORIZATION | 设计 B2 |
+| P1-009 | Unknown Result=Received 被 reconcile 排除 | 🔧 FIXED | `in_doubt_orders()`（Received 且无 exchange id）+ `resolve_in_doubt_orders` 唯一匹配（clientOrderId→唯一 fingerprint，互惠唯一，≥2 即 ambiguous 绝不自动挑）→ `bind_remote_order` Received→Submitted（幂等）；unresolved 保守持有预留、无 TTL 释放路径；`gate_after_reconcile` unresolved→非 READY；15 测试+mutation 2×3 FAILED（`fast/order_state.rs`、`fast/state_sync.rs`、`grpc/service.rs`、`bin/server.rs`；durable-restart DEFERRED per DCR-001 方案 A） |
 | P1-010 | Snapshot absolute overwrite + event dual-write | ⛔ WAITING_AUTHORIZATION | 设计 B4 |
 | P1-011 | Pagination 未处理 next_cursor | 🔧 FIXED | 三路径游标循环（推进/去重/页数上限/中间页错误）；5 测试 |
 | P1-012 | parse_json_f64 invalid/missing→0.0 | 🔧 FIXED | 改 `Result`；非法恢复成交→`unresolved`；3 测试 |

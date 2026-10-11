@@ -471,7 +471,7 @@
 
 ---
 
-### 阶段五（Round 05 P1 整改，commit `7c75285`）：A1–A8 + B1 已实施 / B2–B5 待授权 / C1 BLOCKED
+### 阶段五（Round 05 P1 整改，commit `7c75285`）：A1–A8 + B1 + B2 已实施 / B3–B5 待授权 / C1 BLOCKED
 
 > 来源：`round 5.md`（Round 05 P1 独立二审）+ `docs/INSTRUCTION_TO_OPENCODE_ROUND05_P1_REMEDIATION.md`。
 > 红线：不得改交易语义 / RiskConfig 阈值 / proto / cold wallet；**不得由实施者写 VERIFIED/CLOSED**。
@@ -488,8 +488,10 @@
 | A7 / R5-001 分子 | 集中度**分子**改用 `committed(filled+reserved)` | `fast/risk_engine.rs` | 🔧 FIXED（1 测试 + mutation FAILED） |
 | A8 / R5-002 | cap 在 **USDC notional** 层（补测试，不改公式） | `test_multi_source.py` | 🔧 FIXED（3 测试） |
 | B1 / P1-008 | on_fill 预留释放改按**订单限价**（成交暴露按执行价；身份/限价未知**保守持有**待对账） | `fast/risk_engine.rs`、`grpc/service.rs` | 🔧 FIXED（8 测试 + mutation 7 FAILED） |
-| B2–B5 | P1-009 / P1-RISK-UNIT-001 / P1-010 / R5-005 | `docs/design/ROUND05_B_DESIGN_DRAFTS.md`；B2 另见 `docs/design/DCR-001-B2-durable-persistence.md` | ⛔ WAITING_AUTHORIZATION（B2 另有 OPEN DCR-001） |
+| B2 / P1-009 | in-doubt（Received 无 exchange id）对账候选：唯一匹配→Submitted；ambiguous/unresolved 保守持有预留（无 TTL 释放）；闸门非 READY；进程内幂等重放 no-op | `fast/order_state.rs`、`grpc/service.rs`、`bin/server.rs`、`fast/state_sync.rs` | 🔧 FIXED（15 测试 + mutation 2×3 FAILED；durable-restart 测试 DEFERRED per DCR-001 方案 A） |
+| B3–B5 | P1-RISK-UNIT-001 / P1-010 / R5-005 | `docs/design/ROUND05_B_DESIGN_DRAFTS.md` | ⛔ WAITING_AUTHORIZATION（B3 需先确认 proto `RiskState` 配置字段变更） |
 | C1 / R5-009 | Docker runtime 验收 | — | ⛔ BLOCKED（环境无 Docker） |
 
-- 验证：`cargo test` **363 + 4 + 18 + 1 = 386 passed**；`pytest` **126 passed**；`cargo clippy --all-targets` **0 error**。
+- 验证（B1 后）：`cargo test` 386 passed；`pytest` 126 passed；`cargo clippy --all-targets` 0 error。
+- 验证（B2 后）：`cargo test` **379 + 4 + 18 + 1 = 402 passed**（另 1 ignored = B2 durable-restart DEFERRED）；`pytest` **126 passed（exit 0）**；`cargo clippy --all-targets` **0 error**（警告均为既有基线）；mutation：ambiguous 自动绑定 → 3 FAILED、gate 忽略 unresolved → 3 FAILED（均已还原）。
 - **未自证 VERIFIED/CLOSED**；状态由独立审查者更新。
