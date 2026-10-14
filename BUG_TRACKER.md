@@ -1,7 +1,33 @@
 # BUG_TRACKER.md — 现有 BUG 清单
 
-**数据源**：GPT 修复进度清单（2026-08-26，16 项）＋ 8/25 第一版 P0 清单（14 项）＋ `docs/CODE_REVIEW_STANDARD.md` ＋ `MASTER_TASKS.md`
+**数据源**：GPT 修复进度清单（2026-08-26，16 项）＋ 8/25 第一版 P0 清单（14 项）＋ `docs/CODE_REVIEW_STANDARD.md` ＋ `MASTER_TASKS.md` ＋ **Round 05 完整源码审查与整改方案（2026-10-13）** ＋ **Round 05 独立终审裁决与 Round 06 双 AI 交叉核验清单（2026-10-14）**
 **状态口径**：按六态状态机，GPT 的「✅已修 / 基本完成」仅等于 `FIXED`（代码已改、未验证），须补三重证据（git diff + 测试 + 调用链）才 `VERIFIED`。
+
+---
+
+## 〇、当前总体裁决（2026-10-14 最新）
+
+> 🔴 **LIVE = NO-GO** ｜ 终审基线 `7c75285` / `a2dde81`
+
+| 阻塞类别 | 编号 | 状态 |
+|---------|------|------|
+| **P0 硬阻塞（新增）** | **P0-BUYNO-001** BUY_NO 概率/市价二次取反 + 限价错位 | 🔴 OPEN（R6-G1） |
+| **P0 硬阻塞（新增）** | **P0-GAMMA-001** Gamma 字段 JSON 字符串解析失败 + 静默 Mock 回退 | 🔴 OPEN（R6-G2） |
+| **P0 硬阻塞（新增）** | **P0-FORECAST-001** 非降水指标返回物理量而非 [0,1] 概率 | 🔴 OPEN（R6-G2） |
+| P0 硬阻塞（延续） | **P0-RISK-001** 日亏熔断生产零调用 | 🔴 OPEN（见二-F） |
+| P0 硬阻塞（延续） | **P0-RISK-002** 结算窗口未注册 + 未知即放行 | 🔴 OPEN（见二-F） |
+| P1 开放 | P1-RISK-UNIT-001（＝B3）风险单位不一致 | 🟠 不能关闭（R6-G1，须 proto 变更授权） |
+| P1 开放（新增） | **P1-RISK-015** 撤单后迟到成交 → 预留二次释放 + 终态倒退 | 🟠 OPEN（R6-G3） |
+| P1 开放（新增） | **P1-CONSIST-016** 已成交 in-doubt 永久锁死 TradingGate + 指纹时间戳过严 + cursor 未编码 | 🟠 OPEN（R6-G3） |
+| P1 开放 | P1-010（＝B4）响应路径非原子 R-M-W | 🟠 开放 |
+| P1 延期 | P1-009（＝B2）跨重启 in-doubt 空转 | ⏸️ PARTIAL（DCR-001 方案 A 已批准延期） |
+| 环境阻塞 | R5-009 Docker 健康检查 | ⛔ BLOCKED（无 Docker Runtime Evidence） |
+
+**✅ Round 05 正式晋升 `VERIFIED`（9 项，🔒 禁止回退）**：R5-001+A7、R5-002+A8、R5-003、R5-004、R5-007/R5-008、A2(P1-007)、A4(P1-012)、A5(P1-013)、A6(P1-014)。详见「二-G」§1。
+
+**测试门禁现状**：Rust `cargo check` 0 error；`cargo test` **401 passed / 0 failed**；Python `pytest` **126 passed / 0 failed**；doctest 因本机 `ERROR_PIPE_BUSY`(231) 环境性失败；`fmt/clippy -D warnings` = **PRE-EXISTING BASELINE FAILURE**（禁止声称 PASS）；Docker 未实机验证。
+
+**详见章节**：**「二-G」＝Round 05 独立终审裁决 + Round 06 双 AI 交叉核验清单（10-14，最新）**；「二-F」＝Round 05 完整源码审查与整改方案（10-13）。
 
 ---
 
@@ -9,9 +35,10 @@
 
 | 级别 | 数量 | GPT 状态分布 | 按标准的状态映射 |
 |------|------|-------------|-----------------|
-| P0 | 7+9 | 6 已修 + 1 基本完成 + 9 新发现 | **7 项 VERIFIED（09-09）+ 9 项实盘阻塞待修（09-13 GPT×Gemini 综合）** |
-| P1 | 10+25 | 4 待修 + 5 待验证 + 1 遗留 + 25 新发现 | **10 项完成（09-10）+ 25 项待修（09-13 综合）** |
+| P0 | 7+9 | 6 已修 + 1 基本完成 + 9 新发现 | **7 项 VERIFIED（09-09）+ 9 项实盘阻塞待修（09-13 GPT×Gemini 综合）**；**10-13 复查 2 项 P0 仍开放（P0-RISK-001/002）**；**10-14 Round 06 新增 3 项 P0（P0-BUYNO-001 / P0-GAMMA-001 / P0-FORECAST-001）** |
+| P1 | 10+25 | 4 待修 + 5 待验证 + 1 遗留 + 25 新发现 | **10 项完成（09-10）+ 25 项待修（09-13 综合）**；**10-13 复查：P1-RISK-UNIT-001 / P1-010 仍开放，P1-009 部分闭环延期**；**10-14 Round 06 新增 2 项（P1-RISK-015 / P1-CONSIST-016）** |
 | **合计** | **17+48** | | |
+
 
 **验证进展**：
 - `VERIFIED`：旧 P0-07/P0-11（TradingGate）+ P0-003（RiskEngine 超仓）+ P0-004（Order Dedup 并发）+ P0-007（full_reconcile 启动）+ P0-001（FastExecutor 初始化，09-08）+ P0-005（StateSync L2 认证）+ P0-006（StateSync JSON Decode）+ **P0-002（Docker Secret，09-09）**
@@ -160,6 +187,180 @@
 
 ---
 
+## 二-F、Round 05 完整源码审查与整改方案（2026-10-13）
+
+> **来源**：外部独立审查《Polymarket Weather Trading Bot — Round 05 完整源码审查与整改方案》
+> **审查日期**：2026-10-13 ｜ **基线 commit**：`99a89f84caa4643779607a0fd13531a8e689c6d6`（＝当前 HEAD）
+> **总体裁决**：🔴 **LIVE = NO-GO**
+> **编号口径**：保留现有 Finding ID，不因重新审查而重复创建同一问题。本节的 P0-RISK-001/002、P1-RISK-UNIT-001、P1-010、P1-009/B2、B1/P1-008、B5/R5-005、R5-009 均为既有 Finding 的**再确认或状态更新**；R5-001~R5-009 为 Round 05 整改批次编号。
+
+### 0. 审查结论摘要
+
+| 编号 | 问题 | 严重度 | 本次裁决 | BUG_TRACKER 既有编号 |
+|------|------|--------|---------|---------------------|
+| P0-RISK-001 | 日亏熔断从未触发（`post_check` 生产零调用） | 🔴 P0 | **CONFIRMED（仍开放）** | 同左（二-C，G1） |
+| P0-RISK-002 | 结算窗口保护未在生产注册（2h 禁开 Buy 未接线，未知即放行） | 🔴 P0 | **CONFIRMED（仍开放）** | 同左（二-C，G1） |
+| P1-RISK-UNIT-001 | Python 风控混用 shares 与 USDC（双权威 1000 vs 500） | 🟠 P1 | **CONFIRMED 开放，不能关闭** | 同左（二-E，B3） |
+| P1-010 | 下单响应状态覆盖风险（非原子 R-M-W） | 🟠 P1 | **PARTIAL（B4 复核：非原子属实，覆盖机制不可达，存在可达隐患）** | 同左（二-E，B4） |
+| P1-009（B2） | 未知订单匹配（in-doubt） | 🟠 P1 | **PARTIAL — 未闭环部分属 DCR-001 方案 A 已批准延期** | 同左（二-E） |
+| B1 / P1-008 | 预留释放口径 | 🟢 — | **已实施 FIXED，待独立 VERIFIED** | 同左（二-E，B1） |
+| B5 / R5-005 | 密钥零化 | 🟢 P1 | **已实施 FIXED，待独立 VERIFIED** | R5-005（本报告 §五） |
+| R5-009 | Docker 健康检查 | 🟢 P2 | **⛔ BLOCKED — ENVIRONMENT（设计通过，待 Docker Runtime Evidence）** | 同左（二-D 关联，二-E 注记） |
+
+**裁决要点**：本次审查为 `LIVE NO-GO`。**两条 P0（日亏熔断 + 结算窗口）仍处于「代码可能存在但生产调用链未接线」状态**，是阻止上线的唯一硬阻塞；P1 层存在风险单位不一致（可能导致误拦截与过宽双向偏差）等开放项。
+
+---
+
+### 一、审查环境及证据限制
+
+| 项 | 说明 |
+|----|------|
+| 审查对象 | 基线 `99a89f84caa4643779607a0fd13531a8e689c6d6`（分支 `p0-blockers-2026-09-13` / `release-2026-10`） |
+| 证据类型 | 源码静态审查（调用链追踪）+ 既有测试清单 + 设计文档比对 |
+| **限制 1** | **本机无 Docker**（`docker` 命令不存在）→ 所有涉及容器的验收**未实机执行**，R5-009 保持 `BLOCKED — ENVIRONMENT` |
+| **限制 2** | **全库 `cargo fmt --check` / `cargo clippy -D warnings` = PRE-EXISTING BASELINE FAILURE**（非本次引入）；**禁止**声称 clippy PASS，**禁止**借整改之名扩大范围清理 baseline lint |
+| **限制 3** | 未做真实外网端到端（CLOB / RPC / Gamma API 实调用）；sandbox 环境只有 mock 降级路径 |
+| 证据分级 | 三重证据（git diff + 测试 + 生产调用链）齐备方判 `VERIFIED`；仅代码可读 → `FIXED`；缺 Docker/外网 → `BLOCKED` |
+
+---
+
+### 二、P0 整改方案
+
+#### P0-RISK-001 — 日亏熔断从未触发（`post_check` 生产零调用）
+
+**源码证据**
+- `RiskEngine::post_check()` 定义存在，但全仓检索**无生产调用点**——`service.rs::place_order` 路径只调 `pre_check` / `check_and_reserve`，成交路径 `on_fill` 亦不触发日亏判定。
+- 结果：`daily_loss` 累计值虽可能被写入，但**没有任何门禁读取它并拒绝新单**。
+
+**修改方案**
+1. 在 `place_order` 的**风控预检阶段**（`check_and_reserve` 之前或之内）调用日亏门禁；
+2. 日亏超限 → **FAIL-CLOSED 直接拒单**（返回 `failed_precondition`），并写 `tracing::error!` 告警；
+3. 熔断状态**不得被后续 reconcile 覆盖**（与 `Halted` 闩锁同级，参照 `TradingGate::reconcile_complete` 不覆盖 Halted 的既有语义）；
+4. 补「日亏超限 → 拒单」正向测试 + mutation 验证（去掉调用后测试必 FAILED）。
+
+**验收标准**
+- `grep -rn "post_check" src/` 显示**至少一处生产调用点**（非 `#[cfg(test)]`）；
+- 新增测试断言：日亏累计超限后 `place_order` 返回错误且 **`FastExecutor` 未被调用**（与 P0-018 同款验证方式）；
+- 三重证据齐备后由**非实施者**判 `VERIFIED`。
+
+---
+
+#### P0-RISK-002 — 结算窗口保护缺少生产注册
+
+**源码证据**
+- 结算窗口守卫（距截止 < 2h 禁开 Buy）逻辑存在于 `RiskEngine`，但**未在 `RiskConfig` / `server.rs` 生产装配中注册或启用**；
+- 关键缺陷：当**结算时间未知**（`None` / 解析失败）时当前实现**放行**（fail-open），而非保守拒绝。
+
+**修改方案**
+1. 在 `server.rs` 生产装配（`RiskEngine::new(RiskConfig::default())` 处）显式注册结算窗口守卫；
+2. 语义改为 **FAIL-CLOSED**：结算时间未知 → **拒绝开 Buy**（而非放行），并在错误文案中区分「已知窗口内」与「结算时间未知」；
+3. 补测试三场景：窗口内拒单 / 窗口外放行 / **结算时间未知拒单**；
+4. mutation 验证：把未知态改回放行 → 第三场景测试必 FAILED。
+
+**验收标准**
+- 生产装配路径可见守卫注册（非仅单测构造）；
+- 三场景测试全绿 + mutation 有鉴别力；
+- 非实施者三重证据判定 `VERIFIED`。
+
+---
+
+### 三、P1 整改方案
+
+| 编号 | 问题 | 修改方案要点 | 前置条件 |
+|------|------|-------------|---------|
+| **P1-RISK-UNIT-001**（＝B3） | Python `risk_gate` 混用 shares 与 USDC；`position_notionals` 生产**从未写入**（`converter.py` 不构造、`proto.PositionEntry` 无该字段）→ 全局暴露恒为 shares 口径；两端双权威 1000（Python）vs 500（Rust） | 方案 C：**Rust 权威**，经 proto `RiskState` 下发限额配置；Python 改为纯消费方，删除本地默认 | ⚠️ **proto `RiskState` 增配置字段属冻结契约变更，须 Human 明确授权** |
+| **P1-010**（＝B4） | `service.rs:1023-1043` 响应路径「`get` → 本地改副本 → `upsert`」非原子（两次取锁） | 新增 `order_state.rs::mark_submitted_and_update_fill`（单写锁原子 + 终态守卫，语义同 `apply_fill_by_exchange_order_id`）；补跨路径并发测试 | 无（但**所述「成交事件被覆盖」机制不可达**，须按下述可达隐患重述） |
+| **P1-009**（＝B2） | in-doubt 解析已实现且有测试，但 `OrderStore` 为内存实现 → 启动 `snapshot_in_doubt_orders()` **恒为空** → in-doubt 约束**仅在进程存活期内成立，跨重启恒为空转** | 无需代码修复（属 DCR-001 方案 A 已批准延期，Human 2026-10-04）；**建议补文档注记**避免被误读为已闭环 | 持久化属 R2-P2 范围 |
+| **B1 / P1-008** | on_fill 用 filled notional 抵扣 limit×qty reserve | 已按 `limit_price×增量` 做订单级释放（commit `ee839be`，8 测试 + mutation 7 FAILED） | 待独立 VERIFIED |
+| **B5 / R5-005** | 私钥/密码未零化 | `Zeroizing<String>` 承载 `EncryptedKey::decrypt` 返回值 + `pk_bytes`/`derived_key`/`plaintext`；`manager::unlock` 作用域清零（`Cargo.toml` + `zeroize="1"`） | 待独立 VERIFIED |
+
+**P1-RISK-UNIT-001 量化后果**（价 0.10：Python 1000 shares ≈ 100 USDC < Rust 500 USDC → **误拦截**；价 0.90：1000 shares ≈ 900 USDC > 500 USDC → **过宽**）
+
+---
+
+### 四、R5-001 ~ R5-009 状态汇总（Round 05 整改批次）
+
+| 编号 | 问题 | 级别 | 状态 | 落地证据 |
+|------|------|------|------|---------|
+| **R5-001** | 集中度检查 TOCTOU：分母漏计 pending 预留；**Sell 分支误传 `already_reserved=true`** | 🔴 P0 | ✅ **CONFIRMED 可关闭**（2026-09-18 独立审查） | `risk_engine.rs`：`already_reserved = matches!(side, Side::Buy)`；测试重做（Test A/B/C + mutation Test D：改回 `true` → A/B 必 FAILED）；Rust `338 + 4 + 18 + 1` 全绿。**冻结语义：Buy 创建 reserve 且计算不重复加；Sell 不创建 reserve 但计算必须加、失败不得释放既有 Buy reserve**。**禁止**再修改 R5-001 代码/测试（除非新 Finding） |
+| R5-002 | `MultiSourceStrategyParams` 增 `kelly_fraction`/`base_capital`，`_calculate_quantity` 改 `kelly_fraction × base_capital × 价差优势系数` | 🟠 P1 | ⏸️ **未实施**（按伯森先生指示跳过） | 「价差优势」定义与 quantity/USDC 单位口径待确认；已从 P1-RISK-UNIT-001 剥离（E4） |
+| **R5-003** | `clean_forecast` 原地修改输入（违反 docstring「不修改原始对象」契约） | 🟡 P1 | 🔧 FIXED | `cleaning.py` 入口 `copy.deepcopy`；新增 `test_cleaning.py`（`cleaned is not fc` + 原对象不变） |
+| **R5-004** | `AdaptiveWeighter` 最小权重语义错误 | 🟡 P1 | 🔧 FIXED | `ensemble_fusion.py`：常规归一化 → `max(w,min_weight)` → 二次归一化（超量仅从高于下限源按比例扣回）；不可行退均匀；2 测试 |
+| **R5-005** | 私钥/密码未零化 | 🟡 P1 | 🔧 **FIXED**（＝B5，待独立 VERIFIED） | `zeroize="1"` + `Zeroizing<String>`；wallet 13 测试全绿 |
+| **R5-006** | clippy 门禁（2 个 `approx_constant` **error**） | 🟢 P2 | 🔧 FIXED | 0 error；警告 82 → 23。⚠️ **行为修正**：`daemon.rs:88` 原 `let _ = rpc.check_health_all();`（非绑定 future，启动健康检查**实际从未执行**）改为 `.await` —— 请独立方确认符合预期。⚠️ `clippy --fix` 曾误删 `service.rs` 中仅测试使用的 `RiskConfig` import，已移入 `mod tests` 修复 |
+| **R5-007** | 权益曲线年化因子硬编码 | 🟢 P2 | 🔧 FIXED | `metrics.py` 新增 `_resolve_periods_per_year`：`interval = total_hours/len(curve)`；口径采伯森先生指定式（非 `/(n-1)`）；信息不足回退 `365×4`；测试断言 6h vs 1h 采样 Sharpe 之比 = √6 |
+| **R5-008** | 持仓时间用 `token_id` 字典匹配（覆盖错配） | 🟢 P2 | 🔧 FIXED | `metrics.py::_calc_avg_hold_time` 改按 token 维护 OPEN 队列 **FIFO** 一一对应；测试（同 token 两次开平 → 平均 11h，旧实现得 2h） |
+| **R5-009** | 假健康检查（`sys.exit(0)` 恒真） | 🟢 P2 | ⛔ **BLOCKED — ENVIRONMENT**（设计通过） | `docker-compose.yml`：`CMD-SHELL` 扫描 `/proc/*/cmdline` **精确匹配 argv 元素** `-m` + `market_discovery`（避免误匹配 healthcheck 自身与 sh 包装）+ `start_period: 20s`。**冻结语义：Container Up ≠ Business Healthy**；entrypoint 只负责「保持容器存活 + 记录 subprocess death」，healthcheck 负责业务健康判断，Docker 负责 healthy/unhealthy。**禁止**改回 `discovery death → entrypoint exit 1 → container restart`；**禁止**在 entrypoint 内自行实现「失败三次」计数。解除需在有 Docker 的主机执行 `docs/DEPLOY_HEALTHCHECK_RUNBOOK.md` §5 五步验收并附证据 |
+
+---
+
+### 五、R5-009 Docker 健康检查整改（详）
+
+```
+market_discovery 正常        → container Up → health healthy
+market_discovery 异常退出    → entrypoint 不立即退出 → container 继续 Up
+                            → healthcheck 检查真实 market_discovery
+                            → 连续失败 3 次 → health unhealthy
+```
+
+**职责划分（保持，不得回退）**
+- **entrypoint**：只负责「保持容器存活 + 记录 subprocess death」
+- **healthcheck**：负责「业务健康判断」
+- **Docker**：负责标定 `healthy / unhealthy`
+
+**解除 BLOCKED 的验收步骤**：在有 Docker 的主机执行 `docs/DEPLOY_HEALTHCHECK_RUNBOOK.md` §5 的 5 步实机验收，留存 `docker inspect` 健康状态证据 + 日志。
+
+---
+
+### 六、统一测试门禁
+
+| 门禁 | 命令 | 期望 | 本次已知状态 |
+|------|------|------|-------------|
+| Rust 编译 | `cargo check --target x86_64-pc-windows-msvc` | **0 error** | ✅ 0 error |
+| Rust 测试 | `cargo test --target x86_64-pc-windows-msvc` | **全绿** | ✅ **401 passed**（lib 379 + server 4 + p0_production_validation 18），0 failed |
+| Rust 文档测试 | `cargo test --doc` | 全绿 | ⚠️ FAILED — `ERROR_PIPE_BUSY`(code 231) spawn `rustc.exe` 失败，**本机环境级管道耗尽，非代码缺陷**（`lib.rs:10` 不在改动范围） |
+| Rust Lint | `cargo fmt --check` / `cargo clippy -D warnings` | — | ⚠️ **PRE-EXISTING BASELINE FAILURE**（非本次引入）；**禁止声称 PASS**，**禁止借整改之名扩大范围清理** |
+| Python 测试 | `python -m pytest` | **全绿** | ✅ **109 passed / 0 failed / 0 error**（基线 103，+6） |
+| Docker | `docker compose config` + 容器内健康探针 | 实机验收 | ⛔ **未执行**（本机无 Docker） |
+
+> 环境：Rust `PROTOC=C:/Users/32389/tools/protoc/bin/protoc.exe` + `--target x86_64-pc-windows-msvc`；Python venv `C:\Users\32389\.workbuddy\binaries\python\envs\default\Scripts\python.exe`
+
+---
+
+### 七、推荐整改顺序
+
+1. **P0-RISK-001**（日亏熔断接线）→ **P0-RISK-002**（结算窗口 FAIL-CLOSED 注册）—— 唯一硬阻塞，先闭环；
+2. **P1-RISK-UNIT-001 / B3**（风险单位统一）—— **须先取得 Human 对 proto 契约变更的授权**；
+3. **P1-010 / B4**（响应路径原子化 + 跨路径并发测试）；
+4. **R5-009**（Docker Runtime Evidence，需有 Docker 主机）；
+5. **B2 / P1-009** 补文档注记（说明启动 in-doubt 约束依赖 R2-P2 持久化、当前空转）；
+6. B1/P1-008、B5/R5-005 补独立三重证据 → VERIFIED。
+
+---
+
+### 八、审计关闭规则
+
+- **六态状态机**：`OPEN → FIXED → VERIFIED → CLOSED`（另 `BLOCKED` / `WAITING_AUTHORIZATION`）。**`FIXED` ≠ 修好**。
+- **三重证据**：`git diff` + 测试（含 mutation 鉴别力验证）+ **生产调用链**，三者齐备且由**非实施者**判定，方可 `VERIFIED`。
+- **实施者不自证**：实施者（OpenCode / 旺财）只登记 `FIXED` / `WAITING_AUTHORIZATION` / `BLOCKED`，**不写 VERIFIED / CLOSED**。
+- **FAIL-CLOSED 优先**：任何「未知 / 解析失败 / 缺字段」场景一律保守拒绝，不得 fail-open。
+- **冻结契约**：R5-001 代码/测试、R5-009 代码不得以任何非新 Finding 的理由改动；proto 契约变更须 Human 授权。
+- **禁止以整改为名扩大范围**：不得为全库 lint 改动 `RiskConfig` 阈值 / 集中度阈值 / Position Limit / Buy-Sell 语义 / 重构 `RiskEngine` / 策略 / Kelly / 资金控制逻辑。
+
+---
+
+### 九、最终裁决
+
+> 🔴 **LIVE = NO-GO**
+>
+> 阻塞项：**P0-RISK-001**（日亏熔断生产零调用）+ **P0-RISK-002**（结算窗口未注册且未知即放行）。
+> 开放 P1：**P1-RISK-UNIT-001**（风险单位不一致，双向偏差）、**P1-010/B4**（响应路径非原子）、**P1-009/B2**（跨重启 in-doubt 空转，已批准延期）。
+> 环境阻塞：**R5-009**（无 Docker Runtime Evidence）。
+>
+> **在 P0 两项闭环并取得独立 VERIFIED 之前，不得上线实盘。**
+
+---
+
 ## 三、P1 清单（10 项，全部完成 09-10）
 
 | 新编号 | 问题 | 处置 | 落地 |
@@ -237,3 +438,65 @@
 2. 编号体系已变（P0-01 → P0-001），`MASTER_TASKS.md` 需对齐重排（待确认后执行）。
 3. 授权后启动 Round 4 验证：对 16 项逐项核 git diff + 测试 + 调用链，产出 `audits/round_04/` 报告。
 4. **P1 项（P1-001~009）明日进行**；P0-004 遗留「claim 占位失败清理」记 P1 一并处理。
+
+---
+
+## 二-G、Round 05 独立终审裁决与 Round 06 双 AI（Gemini × GPT）交叉核验清单（2026-10-14）
+
+> **审查基线**：commit `7c75285` / `a2dde81` + 全仓代码包交叉比对。
+> **状态口径**：由非实施者（独立审查 AI）完成三重证据核验，正式更新 `VERIFIED` 状态，并锁定下一阶段（Round 06）同步修复清单。
+> **编号说明**：本节内容原稿标为「二-F」，因文档已存在 2026-10-13 的「二-F」章节，为**统一编号不冲突**，本节落为 **二-G**（内容未作删改）。
+> **统一编号规则**：沿用既有 `<级别>-<域>-<三位序号>` 约定（如 `P0-RISK-001` / `P0-EXEC-004`）。本轮新增域：**BUYNO**（策略 / 聚合器 / Kelly 仓位）、**GAMMA**（上游市场发现）、**FORECAST**（上游气象映射）。
+> ⚠️ **重要**：`B1` / `B2` **不得单独作为 Finding ID**——它们在本文档中已表示 Round 05 设计批次 B1/B2（B1＝预留释放、B2＝in-doubt 对账）。本轮两项属 B1/B2 的**二审追加发现**，已规范化为 `P1-RISK-015` / `P1-CONSIST-016`，源标签仅作别名保留。
+
+### 1. Round 05 正式晋升 `VERIFIED` 清单（已闭环，🔒 禁止回退）
+
+| 编号 | 模块 | 独立审查裁决 | 核验结论摘要 |
+|------|------|-------------|-------------|
+| **R5-001 + A7** | `fast/risk_engine.rs` | ✅ **VERIFIED** | 集中度检查分子（`market_committed`）与分母（`committed_total`）均统一为 `filled + reserved`，`Sell` 分支 `already_reserved` 判定与回滚保护严密，测试覆盖完整。 |
+| **R5-002 + A8** | `multi_source.py` / `config.py` | ✅ **VERIFIED** | 指数饱和 `edge = 1 - exp(-|dev|/σ)`（采用滚动残差 σ）、USDC 层 `cap` 后除以 `cost` 转 shares、`AGG_*` 单一资本权威注入及 T1–T12 + A8 突变验证全部通过。 |
+| **R5-003** | `weather_data_ingestion/cleaning.py` | ✅ **VERIFIED** | `copy.deepcopy` 兑现不可变输入契约，单测通过。 |
+| **R5-004** | `strategy_engine/ensemble_fusion.py` | ✅ **VERIFIED** | 归一化后抬升最小权重并按比例扣回超量，边界退化处理正确。 |
+| **R5-007 / R5-008** | `strategy_engine/backtest/metrics.py` | ✅ **VERIFIED** | 真实时间戳反推年化因子 `(last-first)/(n-1)` 及同 token FIFO 持仓时间配对均已落地并验证。 |
+| **A2（P1-007）** | `bin/server.rs` / `grpc/service.rs` | ✅ **VERIFIED** | `gate_after_reconcile` 在预留重建失败或 `unresolved > 0` 时强制保持非 `Ready`（Fail-Closed）。 |
+| **A4（P1-012）** | `fast/state_sync.rs` | ✅ **VERIFIED** | `parse_json_f64` 拒绝 `NaN/Inf/非法值`，异常恢复成交进入 `unresolved_orders`。 |
+| **A5（P1-013）** | `clob/signing/hmac_sig.rs` | ✅ **VERIFIED** | 已移除 raw ASCII fallback，空或非法 Base64 secret 严格 Fail-Closed。 |
+| **A6（P1-014）** | `fast/mempool.rs` | ✅ **VERIFIED** | 全局容量仅统计 active 订单，终态订单正确释放容量。 |
+
+> 🔒 **以上 9 项禁止回退**（no-reopen）。任何后续改动若触碰这些文件/行为，须重新走三重证据核验。
+> 📌 **本节同步覆盖「二-F」相关条目状态**：R5-001/002/003/004/007/008 由「已有实现、待测试验收」升为 **VERIFIED**；A2/A4/A5/A6 由「FIXED 待验证」升为 **VERIFIED**。
+
+---
+
+### 2. Round 06 待修清单（双 AI 交叉核验：核心层 + 上游同步解决）
+
+| 统一编号 | 级别 | 问题域 | 问题描述与根因定位 | 状态 | 归属任务组 |
+|---------|------|--------|-------------------|------|-----------|
+| **P0-BUYNO-001** | **P0** | 策略 / 聚合器 / Kelly 仓位 | **BUY_NO 概率、市价二次取反与限价错位（双 AI 共识）**：<br>① `multi_source.py`（及偏差策略）在 `BUY_NO` 时传入 `target_price = P(YES)`，但 `market_price` 传入了 `no_price (1 - P_mkt(YES))`；<br>② `position_sizer.py:_kelly` 在 `BUY_NO` 分支对 `price` 再算一次 `1 - price`（二次取反还原成 YES 价），且未将获胜概率转为 `p_win = 1 - p`，导致真实看空信号算出 `f* < 0`、`quantity = 0`；<br>③ 下游 `AggregatedOrder` 将 `P(YES)` 直接作为 `BUY_NO` 的下单限价发往 Rust，导致挂单价与 USDC 敞口计算失真。 | ⬜ TODO | **R6-G1** |
+| **P1-RISK-UNIT-001（B3）** | **P1** | Python 风控闸门 | **RiskGate 份额（Shares）与名义价值（USDC）单位混淆**：<br>`risk_gate.py` 的 `_check_position_limit` 与 `_check_global_exposure` 直接将 `order.quantity`（shares）与 `max_position_per_market`（USDC）相加比对；且 `RiskState.position_notionals` 缺少按方向成本计算的统一辅助方法。 | ⬜ TODO | **R6-G1** |
+| **P0-GAMMA-001** | **P0** | 上游市场发现（`market_discovery`） | **Gamma API 字段 JSON 字符串解析失败与静默 Mock 回退**：<br>`market_discovery/models.py` 假设 `outcomes` 与 `clobTokenIds` 为原生列表，但官方 API 常返回序列化 JSON 字符串（如 `'["Yes", "No"]'`），且 V2 市场可能使用 `positionIds`；`gamma_client.py` 在解析失败或网络异常时**静默回退到 Mock 假市场**，实盘存在**误交易假 token 风险**。 | ⬜ TODO | **R6-G2** |
+| **P0-FORECAST-001** | **P0** | 上游气象映射（`forecast_utils.py`） | **非降水指标返回物理量而非 [0, 1] 概率**：<br>`forecast_utils.py` 对温度返回摄氏度均值、对风速返回 m/s，后续策略却将其当作 `0~1` 概率与 `market.implied_probability` 相减计算偏差。必须根据市场阈值规则转换为概率，或对未配置阈值的非概率指标**显式跳过（Fail-Closed）**。 | ⬜ TODO | **R6-G2** |
+| **P1-RISK-015**<br><sub>（源标签 `P1-B1-LATEFILL`）</sub> | **P1** | Rust 成交与撤单预留（`service.rs` / `order_state.rs`） | **撤单后迟到成交导致预留二次释放与终态倒退（B1 二审发现）**：<br>订单经 `settle_cancel` 转为 `Cancelled` 并释放全部 `remaining_size * limit_price` 预留后，若收到在途迟到 `TradeEvent`，`on_market_trade` **未检查订单是否已处于终态或剩余可释放额度**，再次按 `trade.size * limit_price` 释放预留（**偷扣同 token 其他挂单预留**），且将 `Cancelled` **倒退回** `PartialFilled/Filled`。 | ⬜ TODO | **R6-G3** |
+| **P1-CONSIST-016**<br><sub>（源标签 `P1-B2-INDOUBT`）</sub> | **P1** | Rust 状态同步（`state_sync.rs` / `server.rs`） | **已立即成交的 In-Doubt 订单永久锁死 TradingGate & 指纹时间戳过严（B2/A3 二审发现）**：<br>① 下单超时处于 `Received`（无 exchange_id）的订单若**已在交易所立即全部成交**，不会出现在 `/data/orders`（open orders）中，`resolve_in_doubt_orders` 仅查 open orders 导致该单**永远 `unresolved`**，`TradingGate` **永久卡死在 `Reconciling`**；<br>② `fingerprint_match` 要求 `created_at` **秒级严格相等**，跨秒延迟即匹配失败；<br>③ `A3` 分页 `next_cursor` 直接拼接**未做 URL 编码**。 | ⬜ TODO | **R6-G3** |
+
+**Round 06 任务组归口**
+
+| 任务组 | 范围 | 含 |
+|--------|------|-----|
+| **R6-G1** | Python 策略 / 风控核心层 | P0-BUYNO-001（P0）、P1-RISK-UNIT-001（P1） |
+| **R6-G2** | 上游数据链路 | P0-GAMMA-001（P0）、P0-FORECAST-001（P0） |
+| **R6-G3** | Rust 执行层后置缺陷 | P1-RISK-015、P1-CONSIST-016 |
+
+> **Round 06 新增 3 项 P0**（P0-BUYNO-001 / P0-GAMMA-001 / P0-FORECAST-001）→ 总体状态维持 🔴 **LIVE = NO-GO**。
+> ⚠️ `P1-RISK-UNIT-001` 为**再登记**（非新建），沿用既有编号，详见「二-E」B3 与「二-F」§三。
+
+---
+
+### 3. 过时审查项防返工声明（Already Verified — 🔒 DO NOT RE-OPEN）
+
+以下由外部早期快照审查提及的问题，在当前分支**均已修复并验证闭环**，实施者（OpenCode）**严禁重复修改**：
+
+1. **Docker 钱包密码文件读取**：已由 `P0-002`（`server.rs:load_wallet_password`）闭环，已优先读取 `WALLET_PASSWORD_FILE`。
+2. **下单前 OrderStore 原子占位去重**：已由 `P0-004` / `P1-010`（`OrderStore::claim_or_retry` 单写锁原子占位）闭环。
+3. **Rust 下单预留与实时成交记账接线**：已由 `P0-008`（`check_and_reserve`）与 `P0-013/014/015`（`on_market_trade -> on_fill` + `claim_trade` 幂等）闭环。
+4. **Python pytest 挂起与 fixture 缺失**：已由 `ENV-001` 与 `TST-001`（`conftest.py` + session loop）闭环，当前基线 **126 passed**。
