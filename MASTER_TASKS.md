@@ -592,6 +592,70 @@
 
 ---
 
+### 阶段七（2026-10-14 派发实施 / 2026-10-15 登记）：数据库预备工程（DB-001 ~ DB-010）
+
+> **授权来源**：伯森先生《数据库预备工程（Trading Database Preparation）》任务书（2026-10-14 派发）。
+> **性质**：**P1 架构准备任务**（⚠️ 不代表已有 Bug 的 P1 等级）；**不改变 🔴 `LIVE NO-GO` 裁决**。
+> **实施背景**：OpenCode Go 额度暂时耗尽，本轮由 **WorkBuddy** 承接；**不代替原有交易代码审计与 Bug 修复任务**（Round 05/06 仍为当前主线）。
+> **目标**：为交易记录持久化、历史回测、Dashboard 与多平台扩展做准备。
+>
+> **任务书原文状态**：待执行 / 未验证。
+> **实际状态（实施者自报，2026-10-14）**：文档 / Migration / 独立测试均已产出，独立 PG 测试 **31 passed / 0 failed**；
+> 按协议 **实施者不得自行标记 `VERIFIED` / `CLOSED`**，故 DB-001~DB-010 一律记为 **`FIXED`（待非实施者判定）**。
+>
+> **通用红线（Forbidden，逐条沿用任务书执行约束）**：
+> 1. 前期以只读审查、设计文档、独立 SQL 和测试为主。
+> 2. 未经单独授权，**不修改交易核心代码**，**不改变交易语义 / `RiskConfig` 阈值 / 既有接口**（含 gRPC `polymarket.proto`）。
+> 3. **不连接生产数据库执行迁移**，**不启用未经验证的实盘持久化**。
+> 4. **数据库不得成为同步下单链路的无限等待依赖**（异步事件总线 + 有界队列 + spill 落盘）。
+> 5. 所有设计假设、未验证事项及发现的问题**必须单独标注**（设计文档 §6/§7/§8）。
+>
+> **状态口径**：本节仅登记 `TODO` / `FIXED`；`VERIFIED` / `CLOSED` 由非实施者判定并回写。
+
+| 编号 | 内容 | 状态 | 证据 / 产出 |
+|---|---|---|---|
+| **DB-001** | 只读审查 `OrderStore` / `FillLedger` / `OrderState` / `RiskEngine` / Settlement-PnL / Python 策略模块 | 🟦 **FIXED** | `docs/design/trading_database_design.md` §1.1（含 file:line 证据表） |
+| **DB-002** | 整理现有数据模型、字段来源与待持久化事件 | 🟦 **FIXED** | `docs/design/trading_database_field_mapping.md`（逐字段追溯） |
+| **DB-003** | 设计 PostgreSQL Schema、主键、外键、唯一约束及索引 | 🟦 **FIXED** | 设计文档 §4 + `db/migrations/0001_init.up.sql` |
+| **DB-004** | 设计 10 张核心表（signals / forecast_runs / markets / orders / fills / positions / settlements / pnl_records / risk_events / system_events） | 🟦 **FIXED** | 16 表（10 核心 + 6 辅助：market_tokens、signal_order_links、order_events、accounting_effects、reconciliation_runs、schema_migrations） |
+| **DB-005** | Rust/Python 字段映射及 `signal_id → order_id → fill_id → settlement_id` 关联机制 | 🟦 **FIXED**（含 1 项缺口已标注） | 映射文档 + 设计文档 §D-3；⚠️ `AggregatedOrder` 当前**不带 signal_id 列表**（C-3） |
+| **DB-006** | 独立 SQL Migration 与回滚方案 | 🟦 **FIXED** | `db/migrations/0001_init.up.sql` / `.down.sql` / `CHECKSUMS.txt` / `README.md` |
+| **DB-007** | 幂等、部分成交、重复事件、故障恢复测试 | 🟦 **FIXED** | `db/tests/test_trading_schema.py`：**31 passed / 0 failed**（嵌入式 PG 17.11） |
+| **DB-008** | 异步持久化、重试、重启恢复与状态对账方案 | 🟦 **FIXED**（仅设计，未实施） | 设计文档 §D-5 + `docs/design/trading_database_integration_plan.md` §4 |
+| **DB-009** | 审查数据库设计与现有交易架构的兼容性 | 🟦 **FIXED**（待独立审核确认） | 设计文档 §D-5b（与 G1-001 v7 对齐）+ §6 C-1~C-6 + §7 V-1~V-5 |
+| **DB-010** | 后续 Rust/Python 集成计划 | 🟦 **FIXED**（未实施，需另行授权） | `docs/design/trading_database_integration_plan.md`（I-0 ~ I-5） |
+
+**Allowed Files（本轮仅新增，未改动任何既有文件）**：
+`docs/design/trading_database_design.md`、`docs/design/trading_database_field_mapping.md`、
+`docs/design/trading_database_integration_plan.md`、`db/**`（migrations + tests）。
+
+**Required Tests（DB-007，已执行）**：
+```
+C:\Users\32389\.workbuddy\binaries\python\envs\default\Scripts\python.exe -m pytest db/tests -v
+→ 31 passed in ~32s（一次性嵌入式 PostgreSQL 17.11，数据落系统临时目录，不连真实库）
+```
+覆盖：16 表齐全 / 全部时间列 `TIMESTAMPTZ` / down 回滚干净 / 订单 claim 唯一 / `exchange_order_id` 部分唯一 /
+`trade_id` 幂等（含空 `trade_id` 放行口径）/ 预报重复拉取 / 事件重放 / signal→order→fill→settlement→effect→pnl 全链 /
+部分成交→全成 / 撤单 / CHECK 约束 / **I2 恰一笔 effect** / **D1 crash-before-COMMIT 回滚后重试** /
+冲突拒绝不改写 / **I1 按日可重建** / 迟到结算归属 `settlement_ts` 日 / PnL 幂等 / 本地+远端持仓共存 / 熔断事件 / 对账告警 / 恢复扫描。
+
+**Acceptance（对照任务书完成标准）**：
+- ✅ 设计与现有代码兼容：`OrderStateStatus` / `FillStatus` / `compute_pnl` 口径 / `PositionEntry` 逐字段核对；与 G1-001 v7 `SettlementRecord`+`AccountingEffect` 逐字段对齐。
+- ✅ 唯一性、幂等、关联、恢复机制有明确方案（与内存机制一一对应，见设计文档 §D-4）。
+- ✅ SQL 已在独立测试环境验证（31 passed）。
+- ✅ 未实现功能均标注状态：`settlement_id` 未经 POC-3 前**禁止生产写入**；DB 定位为**审计副本**，不参与重启恢复。
+- ⚠️ **诚实声明**：完成设计 ≠ 完成数据库集成，更 ≠ 交易记录已实现持久化。**当前无任何生产写入路径。**
+
+**依赖与优先级**：优先级 **P1（架构准备）**；前置 = DB-001（已完成）；后续依赖 = 数据库接入、持久化故障恢复、对账、Dashboard 数据接口（见 integration_plan I-0~I-5）。
+
+**⚠️ 两项待决冲突（需伯森先生裁决，本轮未擅自处理）**：
+1. **`DCR-001` 方案 A 冲突**：方案 A 冻结「B2 不支持跨重启、不新增持久化文件」；本数据库为新的独立持久层。若未来让 DB 参与重启恢复（方案 B 化），须**先立 DCR 修订案并经 Human 批准**（设计文档 C-4）。
+2. **`HA-006` 持久化选型未冻结**：G1-001 v7 倾向 SQLite（未正式冻结），本轮按 **PostgreSQL** 出 Schema。两套表结构与状态机已设计为逐字段一致，降级 SQLite 仅需方言微调（设计文档 §D-5b）。
+
+**与既有编号体系的关系**：本组为**独立架构准备任务**，不占用 `P0-*` / `P1-*` Finding 编号；发现的既有问题已在设计文档 §6 登记为 `C-1 ~ C-6`（不自行进入 `BUG_TRACKER.md`，遵循「不得擅自处理或重写已有 P0/P1 Bug」约束）。
+
+---
+
 ## 已闭环任务（历史）
 
 ### P0-02 Docker Secret 与环境变量一致性
